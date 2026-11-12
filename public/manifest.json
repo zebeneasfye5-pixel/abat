@@ -1,0 +1,32 @@
+{
+  "id": "/",
+  "name": "ቀሲስ ሄኖክ - የንስሐ እና የመንፈሳዊ አገልግሎት",
+  "short_name": "ቀሲስ ሄኖክ",
+  "description": "የንስሐ አባትና ልጅ ግንኙነት፣ የታላቁ ጉባኤ የድምፅና ቪዲዮ አዳራሽ፣ የሚስጥር ቤት፣ የኤአይ መንፈሳዊ እውቀት መረጃ ቋት እና ዘመናዊ ዋሌት",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#120B0A",
+  "theme_color": "#800020",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

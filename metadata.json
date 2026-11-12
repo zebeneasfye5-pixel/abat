@@ -1,0 +1,6 @@
+{
+  "name": "ቀሲስ ሄኖክ - የንስሐ እና የመንፈሳዊ አገልግሎት ሥርዓት",
+  "description": "ቀሲስ ሄኖክ - የንስሐ አባትና ልጅ ግንኙነት፣ የታላቁ ጉባኤ የድምፅና ቪዲዮ አዳራሽ፣ የሚስጥር ቤት፣ የኤአይ መንፈሳዊ እውቀት መረጃ ቋት፣ ዘመናዊ ዋሌትና ኦፍላይን አገልግሎት ማዕከል",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

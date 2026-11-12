@@ -1,0 +1,56 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-amharic: 'Noto Sans Ethiopic', 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    --font-heading: 'Cinzel', 'Noto Sans Ethiopic', serif;
+  }
+
+  body {
+    font-family: var(--font-amharic);
+    overflow-x: hidden;
+  }
+
+  h1, h2, h3, .font-heading {
+    font-family: var(--font-heading);
+  }
+}
+
+/* Custom scrollbar for ecclesiastical dark theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #140d0c;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #4a2228;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #800020;
+}
+
+/* Subtle glow animations for spiritual candles and blessing crosses */
+@keyframes candleFlicker {
+  0%, 100% { opacity: 0.85; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.03); }
+}
+
+.animate-candle {
+  animation: candleFlicker 3s infinite ease-in-out;
+}
+
+@keyframes pulseGold {
+  0%, 100% { box-shadow: 0 0 15px rgba(217, 119, 6, 0.2); }
+  50% { box-shadow: 0 0 25px rgba(245, 158, 11, 0.45); }
+}
+
+.glow-gold {
+  animation: pulseGold 4s infinite ease-in-out;
+}

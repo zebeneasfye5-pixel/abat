@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Shield, Lock, Video, VideoOff, Mic, MicOff, PhoneOff, Check, Sparkles, KeyRound, Flame, Volume2, RefreshCw } from 'lucide-react';
+import { Shield, Lock, Video, VideoOff, Mic, MicOff, PhoneOff, Check, Sparkles, KeyRound, Flame, Volume2, RefreshCw, Users } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { UserProfile, ConfessionBooking } from '../types';
 import { playChurchBell, speakBlessingPrayer } from '../utils/audio';
@@ -23,8 +23,12 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const [isVideoOn, setIsVideoOn] = useState(true);
   const [isMicOn, setIsMicOn] = useState(true);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
-  const [micVolumeLevel, setMicVolumeLevel] = useState(0); // 0 to 100
-  const [isPriestSpeaking, setIsPriestSpeaking] = useState(false);
+  const [micVolumeLevel, setMicVolumeLevel] = useState(0);
+  
+  // Real WebRTC & Multi-User Peer State
+  const [remoteUserConnected, setRemoteUserConnected] = useState(false);
+  const [remoteUserName, setRemoteUserName] = useState<string>('ቀሲስ ሄኖክ');
+  const [connectedUsersCount, setConnectedUsersCount] = useState(1);
 
   // Confession Ritual Steps (1: ጸሎት, 2: መናዘዝ, 3: ቀኖና, 4: ፍትሐት)
   const [activeStep, setActiveStep] = useState<1 | 2 | 3 | 4>(1);
@@ -32,32 +36,40 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const [isBlessed, setIsBlessed] = useState(false);
   const [penancePrescription, setPenancePrescription] = useState('40 ጊዜ አቡነ ዘበሰማያት፣ ጾም በጸሎት፣ ከቂምና ቁጣ መራቅ');
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const iceCandidatesQueue = useRef<RTCIceCandidateInit[]>([]);
 
-  // Start real camera & microphone stream
-  const startCameraAndMic = async () => {
+  // Keep remote video element synced whenever remoteUserConnected changes
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStreamRef.current) {
+      remoteVideoRef.current.srcObject = remoteStreamRef.current;
+      remoteVideoRef.current.play().catch(() => {});
+    }
+  }, [remoteUserConnected]);
+
+  // Initialize WebRTC and Real MediaStream
+  const setupRealTimeCall = async () => {
     try {
-      // Stop any existing stream
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
-      }
-
+      // 1. Get user camera and mic
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode },
         audio: { echoCancellation: true, noiseSuppression: true },
       });
-
       streamRef.current = stream;
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
       }
 
-      // Set up real AudioContext Analyser to read mic volume level
+      // 2. Real Audio Meter Analyser
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const ctx = new AudioCtx();
       audioContextRef.current = ctx;
@@ -73,9 +85,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         if (analyserRef.current && isMicOn) {
           analyserRef.current.getByteFrequencyData(dataArray);
           let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i];
-          }
+          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
           const avg = sum / dataArray.length;
           setMicVolumeLevel(Math.min(100, Math.round((avg / 128) * 100)));
         } else {
@@ -84,18 +94,122 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         animationFrameRef.current = requestAnimationFrame(updateVolume);
       };
       updateVolume();
+
+      // 3. Setup RTCPeerConnection with Google Public STUN servers
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+        ],
+      });
+      pcRef.current = pc;
+
+      // Add local stream tracks to peer connection
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      // Handle remote incoming stream from other user
+      pc.ontrack = (event) => {
+        if (event.streams && event.streams[0]) {
+          remoteStreamRef.current = event.streams[0];
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = event.streams[0];
+            remoteVideoRef.current.play().catch(() => {});
+          }
+          setRemoteUserConnected(true);
+        }
+      };
+
+      // 4. Connect WebSocket Signaling for real multi-user communication
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws/realtime`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'webrtc-signal',
+            roomId: passcode || '777',
+            signal: { candidate: event.candidate },
+          }));
+        }
+      };
+
+      ws.onopen = () => {
+        // Join the secret room with current passcode
+        ws.send(JSON.stringify({
+          type: 'join-room',
+          roomId: passcode || '777',
+          userId: user.id || 'usr-' + Math.random().toString(36).substring(7),
+          userName: user.baptismalName || user.fullName,
+          role: user.role === 'priest' ? 'priest' : 'child',
+        }));
+      };
+
+      ws.onmessage = async (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.type === 'peer-joined') {
+            setConnectedUsersCount(data.clientCount || 2);
+            if (data.userName) setRemoteUserName(data.userName);
+            // Initiate WebRTC Call Offer to the other user
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({
+              type: 'webrtc-signal',
+              roomId: passcode || '777',
+              signal: { sdp: offer },
+            }));
+          }
+
+          else if (data.type === 'webrtc-signal' && data.signal) {
+            const { signal } = data;
+            if (signal.sdp) {
+              await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+              if (signal.sdp.type === 'offer') {
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                ws.send(JSON.stringify({
+                  type: 'webrtc-signal',
+                  roomId: passcode || '777',
+                  signal: { sdp: answer },
+                }));
+                setRemoteUserConnected(true);
+              }
+            } else if (signal.candidate) {
+              await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+            }
+          }
+
+          else if (data.type === 'peer-left') {
+            setRemoteUserConnected(false);
+            setConnectedUsersCount((prev) => Math.max(1, prev - 1));
+          }
+        } catch (err) {
+          console.warn('Signaling error:', err);
+        }
+      };
+
     } catch (err) {
-      console.warn('Real camera/mic capture notice:', err);
+      console.warn('Real camera/mic setup notice:', err);
     }
   };
 
   useEffect(() => {
     if (isAuthenticated) {
-      startCameraAndMic();
+      setupRealTimeCall();
     }
     return () => {
       if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+      if (pcRef.current) {
+        pcRef.current.close();
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
       }
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
         audioContextRef.current.close().catch(() => {});
@@ -129,7 +243,6 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     if (!newState) setMicVolumeLevel(0);
   };
 
-  // Switch Camera (Mobile front / back)
   const handleSwitchCamera = () => {
     setFacingMode((prev) => (prev === 'user' ? 'environment' : 'user'));
   };
@@ -147,15 +260,11 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
 
   const handleGrantAbsolution = () => {
     setIsBlessed(true);
-    // 1. Play real sacred church bell
     playChurchBell();
-
-    // 2. Play Priest Henok's Absolution Voice Blessing
     speakBlessingPrayer(
       `በስመ አብ ወወልድ ወመንፈስ ቅዱስ አሐዱ አምላክ አሜን። ልጄ ${user.baptismalName || ''}፣ እግዚአብሔር አምላክ ኃጢአትህን ይደምስስልህ። በሰላም ሂድ፤ በረከቱ ይደርብህ!`
     );
 
-    // 3. Trigger Confetti
     try {
       confetti({
         particleCount: 140,
@@ -196,7 +305,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
           <div className="p-4 rounded-xl bg-stone-950/80 border border-amber-900/40 text-xs text-amber-200/90 max-w-md mx-auto space-y-1">
             <div className="flex items-center justify-center gap-1.5 font-semibold text-amber-300">
               <Shield className="w-4 h-4 text-emerald-400" />
-              <span>የቀኖና እና የመጽሐፈ ንስሐ ጥብቅ ሚስጥር (End-to-End Encrypted)</span>
+              <span>የቀኖና እና የመጽሐፈ ንስሐ ጥብቅ ሚስጥር (WebRTC P2P Encrypted)</span>
             </div>
           </div>
 
@@ -266,15 +375,21 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
             <span className="font-mono text-stone-400 text-[10px]">{micVolumeLevel}%</span>
           </div>
 
-          <span className="px-2.5 py-1 rounded-md bg-emerald-950/70 border border-emerald-700/50 text-emerald-300 text-xs font-mono flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span>ጥበቃው የጸና ነው</span>
+          {/* Real Peer-to-Peer Connection Status */}
+          <span className={`px-2.5 py-1 rounded-md border text-xs font-mono flex items-center gap-1.5 ${
+            remoteUserConnected
+              ? 'bg-emerald-950/80 border-emerald-500 text-emerald-200'
+              : 'bg-amber-950/60 border-amber-700/50 text-amber-300'
+          }`}>
+            <span className={`w-2 h-2 rounded-full ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+            <span>{remoteUserConnected ? `ቀጥታ ከ${remoteUserName} ጋር ተገናኝቷል` : 'የሌላ ሰው መግቢያ በመጠባበቅ ላይ...'}</span>
           </span>
+
           <button
             onClick={() => {
-              if (streamRef.current) {
-                streamRef.current.getTracks().forEach((t) => t.stop());
-              }
+              if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+              if (pcRef.current) pcRef.current.close();
+              if (wsRef.current) wsRef.current.close();
               setIsAuthenticated(false);
             }}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-950/70 border border-red-700/60 text-red-200 text-xs hover:bg-red-900 transition"
@@ -288,17 +403,32 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       {/* Video & Ritual Workspace Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
-        {/* Left: 1-on-1 Video Interface */}
+        {/* Left: 1-on-1 Real Video Interface */}
         <div className="lg:col-span-7 space-y-4">
           
           <div className="relative rounded-2xl overflow-hidden bg-black border-2 border-amber-700/40 shadow-2xl h-[380px] sm:h-[480px]">
-            {/* Priest Main Sanctuary Video Feed */}
-            <img
-              src="/src/assets/images/sacred_confession_sanctuary_1794468348510.jpg"
-              alt="የንስሐ አባት ቀሲስ ሄኖክ በሚስጥር ቤቱ"
-              referrerPolicy="no-referrer"
-              className="w-full h-full object-cover filter brightness-95"
+            
+            {/* Always keep remote video element in DOM so WebRTC stream attaches with zero latency */}
+            <video
+              ref={remoteVideoRef}
+              autoPlay
+              playsInline
+              className={`w-full h-full object-cover ${remoteUserConnected ? 'block' : 'hidden'}`}
             />
+            {!remoteUserConnected && (
+              <img
+                src="/src/assets/images/sacred_confession_sanctuary_1794468348510.jpg"
+                alt="የንስሐ አባት ቀሲስ ሄኖክ በሚስጥር ቤቱ"
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-cover filter brightness-95"
+              />
+            )}
+
+            {/* Remote User Label */}
+            <div className="absolute top-3 left-3 bg-stone-950/80 px-2.5 py-1 rounded-lg border border-amber-700/40 text-xs text-amber-200 flex items-center gap-1.5 z-10">
+              <span className={`w-2 h-2 rounded-full ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-500 animate-pulse'}`} />
+              <span>{remoteUserConnected ? `${remoteUserName} (በቀጥታ ቪዲዮ)` : 'ቀሲስ ሄኖክ (የንስሐ አባት)'}</span>
+            </div>
 
             {/* Radiant Blessing Overlay when Priest Absolves */}
             {isBlessed && (
@@ -316,7 +446,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
             <div className="absolute bottom-16 right-4 w-36 sm:w-48 h-26 sm:h-34 rounded-xl overflow-hidden border-2 border-amber-400/70 shadow-2xl bg-stone-900 z-10">
               {isVideoOn ? (
                 <video
-                  ref={videoRef}
+                  ref={localVideoRef}
                   autoPlay
                   playsInline
                   muted
@@ -329,7 +459,6 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                 </div>
               )}
               
-              {/* Mic Activity Badge */}
               <div className="absolute bottom-1.5 left-1.5 right-1.5 flex items-center justify-between bg-stone-950/80 px-2 py-0.5 rounded text-[10px] text-amber-200">
                 <span>{user.baptismalName} (እኔ)</span>
                 {isMicOn ? (
@@ -363,7 +492,6 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                   {isVideoOn ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
                 </button>
 
-                {/* Flip camera on mobile */}
                 <button
                   onClick={handleSwitchCamera}
                   className="p-2.5 rounded-lg bg-stone-900 border border-stone-700 text-stone-300 hover:text-amber-200 transition"
@@ -374,7 +502,6 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
 
                 <button
                   onClick={() => {
-                    setIsPriestSpeaking(true);
                     speakBlessingPrayer('በእግዚአብሔር ስም ሰላም ለእናንተ ይሁን። ልጄ ኃጢአትህን ያለመደበቅ ተናዘዝ፤ እግዚአብሔር መሐሪና ይቅር ባይ ነው።');
                   }}
                   className="px-2.5 py-1.5 rounded-lg bg-stone-900 border border-stone-700 text-xs text-amber-300 hover:bg-stone-800 transition flex items-center gap-1.5"

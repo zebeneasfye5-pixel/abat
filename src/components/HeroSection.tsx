@@ -42,7 +42,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({ onNavigate }) => {
                 className="flex items-center gap-2 px-5 py-3 rounded-xl bg-stone-900 border border-stone-700/80 text-amber-200 font-medium text-sm hover:bg-stone-800 hover:border-amber-600/50 transition-all"
               >
                 <Users className="w-4 h-4 text-amber-400" />
-                <span>ታላቁን ጉባኤ ተሳተፍ</span>
+                <span>የቀጥታ ዙም ጉባኤ ግባ (Live Zoom)</span>
               </button>
 
               <button

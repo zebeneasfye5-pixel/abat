@@ -155,7 +155,7 @@ export default function App() {
                     <div className="w-11 h-11 rounded-xl bg-amber-950/70 border border-amber-600/40 flex items-center justify-center text-amber-400 group-hover:scale-105 transition-transform shrink-0">
                       <Users className="w-5 h-5" />
                     </div>
-                    <h4 className="text-sm font-heading font-bold text-amber-200">ታላቁ ጉባኤና አዳራሽ</h4>
+                    <h4 className="text-sm font-heading font-bold text-amber-200">የቀጥታ ዙም ጉባኤ (Zoom Meeting)</h4>
                   </div>
                   <span className="text-amber-400 font-bold group-hover:translate-x-1 transition-transform">→</span>
                 </div>

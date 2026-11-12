@@ -66,7 +66,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                   : 'text-stone-300 hover:text-amber-200'
               }`}
             >
-              ታላቁ ጉባኤና አዳራሽ
+              ቀጥታ የዙም ጉባኤ (Zoom Meeting)
             </button>
 
             <button

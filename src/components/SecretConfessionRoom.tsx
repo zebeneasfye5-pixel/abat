@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Shield, Lock, Video, VideoOff, Mic, MicOff, PhoneOff, Check, Sparkles, KeyRound, Flame, Volume2, RefreshCw, Users } from 'lucide-react';
+import { Shield, Lock, Video, VideoOff, Mic, MicOff, PhoneOff, Check, Sparkles, KeyRound, Flame, Volume2, RefreshCw } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { UserProfile, ConfessionBooking } from '../types';
+import { fetchWebRTCConfig, verifySecretRoomPasscode, getRealtimeWsUrl } from '../services/api';
 import { playChurchBell, speakBlessingPrayer } from '../utils/audio';
 
 interface SecretConfessionRoomProps {
@@ -16,19 +17,20 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   onCompleteConfession,
 }) => {
   const [passcode, setPasscode] = useState('');
+  const [roomId, setRoomId] = useState('');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
-  
+
   // Real MediaStream & Audio Meters
   const [isVideoOn, setIsVideoOn] = useState(true);
   const [isMicOn, setIsMicOn] = useState(true);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [micVolumeLevel, setMicVolumeLevel] = useState(0);
-  
-  // Real WebRTC & Multi-User Peer State
+
+  // Real WebRTC & Peer State
   const [remoteUserConnected, setRemoteUserConnected] = useState(false);
-  const [remoteUserName, setRemoteUserName] = useState<string>('ቀሲስ ሄኖክ');
-  const [connectedUsersCount, setConnectedUsersCount] = useState(1);
+  const [remoteUserName, setRemoteUserName] = useState<string>('');
+  const [iceState, setIceState] = useState<string>('waiting');
 
   // Confession Ritual Steps (1: ጸሎት, 2: መናዘዝ, 3: ቀኖና, 4: ፍትሐት)
   const [activeStep, setActiveStep] = useState<1 | 2 | 3 | 4>(1);
@@ -46,8 +48,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const iceCandidatesQueue = useRef<RTCIceCandidateInit[]>([]);
+  const remotePeerIdRef = useRef<string | null>(null);
+  const isMicOnRef = useRef(isMicOn);
+  isMicOnRef.current = isMicOn;
 
-  // Keep remote video element synced whenever remoteUserConnected changes
   useEffect(() => {
     if (remoteVideoRef.current && remoteStreamRef.current) {
       remoteVideoRef.current.srcObject = remoteStreamRef.current;
@@ -55,161 +59,240 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     }
   }, [remoteUserConnected]);
 
-  // Initialize WebRTC and Real MediaStream
-  const setupRealTimeCall = async () => {
-    try {
-      // 1. Get user camera and mic
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode },
-        audio: { echoCancellation: true, noiseSuppression: true },
-      });
-      streamRef.current = stream;
+  useEffect(() => {
+    if (!isAuthenticated || !roomId) return;
+    let isCancelled = false;
 
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
+    const createPC = (rtcConfig: RTCConfiguration, ws: WebSocket, targetPeerId: string | null) => {
+      if (pcRef.current) {
+        pcRef.current.close();
       }
-
-      // 2. Real Audio Meter Analyser
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioCtx();
-      audioContextRef.current = ctx;
-
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 64;
-      analyserRef.current = analyser;
-      source.connect(analyser);
-
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      const updateVolume = () => {
-        if (analyserRef.current && isMicOn) {
-          analyserRef.current.getByteFrequencyData(dataArray);
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-          const avg = sum / dataArray.length;
-          setMicVolumeLevel(Math.min(100, Math.round((avg / 128) * 100)));
-        } else {
-          setMicVolumeLevel(0);
-        }
-        animationFrameRef.current = requestAnimationFrame(updateVolume);
-      };
-      updateVolume();
-
-      // 3. Setup RTCPeerConnection with Google Public STUN servers
-      const pc = new RTCPeerConnection({
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun2.l.google.com:19302' },
-        ],
-      });
+      const pc = new RTCPeerConnection(rtcConfig);
       pcRef.current = pc;
 
-      // Add local stream tracks to peer connection
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-
-      // Handle remote incoming stream from other user
-      pc.ontrack = (event) => {
-        if (event.streams && event.streams[0]) {
-          remoteStreamRef.current = event.streams[0];
-          if (remoteVideoRef.current) {
-            remoteVideoRef.current.srcObject = event.streams[0];
-            remoteVideoRef.current.play().catch(() => {});
-          }
-          setRemoteUserConnected(true);
+      const stream = streamRef.current;
+      if (stream && stream.getTracks().length > 0) {
+        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+        if (stream.getVideoTracks().length === 0) {
+          pc.addTransceiver('video', { direction: 'recvonly' });
         }
-      };
+        if (stream.getAudioTracks().length === 0) {
+          pc.addTransceiver('audio', { direction: 'recvonly' });
+        }
+      } else {
+        pc.addTransceiver('video', { direction: 'recvonly' });
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+      }
 
-      // 4. Connect WebSocket Signaling for real multi-user communication
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws/realtime`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+      pc.ontrack = (event) => {
+        const remStream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+        remoteStreamRef.current = remStream;
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = remStream;
+          remoteVideoRef.current.play().catch(() => {});
+        }
+        setRemoteUserConnected(true);
+      };
 
       pc.onicecandidate = (event) => {
         if (event.candidate && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: 'webrtc-signal',
-            roomId: passcode || '777',
-            signal: { candidate: event.candidate },
-          }));
+          ws.send(
+            JSON.stringify({
+              type: 'webrtc-signal',
+              roomId,
+              targetPeerId: remotePeerIdRef.current || targetPeerId,
+              signal: { candidate: event.candidate },
+            })
+          );
         }
       };
 
+      pc.oniceconnectionstatechange = () => {
+        setIceState(pc.iceConnectionState);
+        if (pc.iceConnectionState === 'failed') {
+          try {
+            pc.restartIce();
+          } catch {}
+        }
+      };
+
+      return pc;
+    };
+
+    const flushIce = async (pc: RTCPeerConnection) => {
+      const q = iceCandidatesQueue.current;
+      iceCandidatesQueue.current = [];
+      for (const c of q) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c));
+        } catch {}
+      }
+    };
+
+    const bootSecretCall = async () => {
+      const rtcConfig = await fetchWebRTCConfig();
+
+      let stream: MediaStream | null = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      } catch {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          setIsVideoOn(false);
+        } catch {
+          setIsVideoOn(false);
+          setIsMicOn(false);
+        }
+      }
+
+      if (isCancelled) {
+        stream?.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      if (stream) {
+        streamRef.current = stream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+          localVideoRef.current.play().catch(() => {});
+        }
+
+        try {
+          const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+          const ctx = new AudioCtx();
+          audioContextRef.current = ctx;
+          const source = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 64;
+          analyserRef.current = analyser;
+          source.connect(analyser);
+
+          const dataArray = new Uint8Array(analyser.frequencyBinCount);
+          const updateVolume = () => {
+            if (isCancelled) return;
+            if (analyserRef.current && isMicOnRef.current) {
+              analyserRef.current.getByteFrequencyData(dataArray);
+              let sum = 0;
+              for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+              setMicVolumeLevel(Math.min(100, Math.round((sum / dataArray.length / 128) * 100)));
+            } else {
+              setMicVolumeLevel(0);
+            }
+            animationFrameRef.current = requestAnimationFrame(updateVolume);
+          };
+          updateVolume();
+        } catch {}
+      }
+
+      const ws = new WebSocket(getRealtimeWsUrl());
+      wsRef.current = ws;
+
       ws.onopen = () => {
-        // Join the secret room with current passcode
-        ws.send(JSON.stringify({
-          type: 'join-room',
-          roomId: passcode || '777',
-          userId: user.id || 'usr-' + Math.random().toString(36).substring(7),
-          userName: user.baptismalName || user.fullName,
-          role: user.role === 'priest' ? 'priest' : 'child',
-        }));
+        ws.send(
+          JSON.stringify({
+            type: 'join-room',
+            roomId,
+            userId: user.id || `secret-${Math.random().toString(36).slice(2, 8)}`,
+            userName: user.fullName,
+            baptismalName: user.baptismalName || user.fullName,
+            role: user.role === 'priest' ? 'priest' : 'child',
+            isMicOn: true,
+            isVideoOn: Boolean(stream?.getVideoTracks().length),
+          })
+        );
       };
 
       ws.onmessage = async (event) => {
         try {
           const data = JSON.parse(event.data);
 
-          if (data.type === 'peer-joined') {
-            setConnectedUsersCount(data.clientCount || 2);
-            if (data.userName) setRemoteUserName(data.userName);
-            // Initiate WebRTC Call Offer to the other user
+          if (data.type === 'room-state' && Array.isArray(data.existingPeers) && data.existingPeers.length > 0) {
+            const target = data.existingPeers[0];
+            remotePeerIdRef.current = target.peerId;
+            setRemoteUserName(target.baptismalName || target.userName);
+            const pc = createPC(rtcConfig, ws, target.peerId);
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-            ws.send(JSON.stringify({
-              type: 'webrtc-signal',
-              roomId: passcode || '777',
-              signal: { sdp: offer },
-            }));
-          }
+            ws.send(
+              JSON.stringify({
+                type: 'webrtc-signal',
+                roomId,
+                targetPeerId: target.peerId,
+                signal: { sdp: offer },
+              })
+            );
+          } else if (data.type === 'peer-joined' && data.peer) {
+            remotePeerIdRef.current = data.peer.peerId;
+            setRemoteUserName(data.peer.baptismalName || data.peer.userName);
+          } else if (data.type === 'webrtc-signal' && data.signal) {
+            if (data.senderPeerId) {
+              remotePeerIdRef.current = data.senderPeerId;
+            }
+            if (data.senderName) {
+              setRemoteUserName(data.senderName);
+            }
 
-          else if (data.type === 'webrtc-signal' && data.signal) {
+            let pc = pcRef.current;
+            if (!pc) {
+              pc = createPC(rtcConfig, ws, data.senderPeerId || null);
+            }
+
             const { signal } = data;
             if (signal.sdp) {
               await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+              await flushIce(pc);
               if (signal.sdp.type === 'offer') {
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                ws.send(JSON.stringify({
-                  type: 'webrtc-signal',
-                  roomId: passcode || '777',
-                  signal: { sdp: answer },
-                }));
-                setRemoteUserConnected(true);
+                ws.send(
+                  JSON.stringify({
+                    type: 'webrtc-signal',
+                    roomId,
+                    targetPeerId: data.senderPeerId,
+                    signal: { sdp: answer },
+                  })
+                );
               }
             } else if (signal.candidate) {
-              await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+              if (pc.remoteDescription && pc.remoteDescription.type) {
+                await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+              } else {
+                iceCandidatesQueue.current.push(signal.candidate);
+              }
+            }
+          } else if (data.type === 'peer-left') {
+            setRemoteUserConnected(false);
+            setRemoteUserName('');
+            remotePeerIdRef.current = null;
+            remoteStreamRef.current = null;
+            if (pcRef.current) {
+              pcRef.current.close();
+              pcRef.current = null;
             }
           }
-
-          else if (data.type === 'peer-left') {
-            setRemoteUserConnected(false);
-            setConnectedUsersCount((prev) => Math.max(1, prev - 1));
-          }
         } catch (err) {
-          console.warn('Signaling error:', err);
+          console.warn('Secret room signaling error:', err);
         }
       };
+    };
 
-    } catch (err) {
-      console.warn('Real camera/mic setup notice:', err);
-    }
-  };
+    bootSecretCall();
 
-  useEffect(() => {
-    if (isAuthenticated) {
-      setupRealTimeCall();
-    }
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
+      isCancelled = true;
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'leave-room' }));
+        wsRef.current.close();
       }
       if (pcRef.current) {
         pcRef.current.close();
+        pcRef.current = null;
       }
-      if (wsRef.current) {
-        wsRef.current.close();
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
       }
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
         audioContextRef.current.close().catch(() => {});
@@ -218,7 +301,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [isAuthenticated, facingMode]);
+  }, [isAuthenticated, roomId, user.id, user.fullName, user.baptismalName, user.role]);
 
   // Toggle Video Track
   const handleToggleVideo = () => {
@@ -243,18 +326,47 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     if (!newState) setMicVolumeLevel(0);
   };
 
-  const handleSwitchCamera = () => {
-    setFacingMode((prev) => (prev === 'user' ? 'environment' : 'user'));
+  // Seamless camera flip without tearing down call
+  const handleSwitchCamera = async () => {
+    const nextFacing = facingMode === 'user' ? 'environment' : 'user';
+    try {
+      const newCamStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: nextFacing } });
+      const newTrack = newCamStream.getVideoTracks()[0];
+      const oldTrack = streamRef.current?.getVideoTracks()[0];
+      if (streamRef.current && newTrack) {
+        if (oldTrack) {
+          streamRef.current.removeTrack(oldTrack);
+          oldTrack.stop();
+        }
+        streamRef.current.addTrack(newTrack);
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = streamRef.current;
+        }
+        const sender = pcRef.current?.getSenders().find((s) => s.track?.kind === 'video');
+        if (sender) {
+          sender.replaceTrack(newTrack).catch(() => {});
+        }
+        setFacingMode(nextFacing);
+      }
+    } catch {
+      alert('ካሜራ መቀየር አልተቻለም።');
+    }
   };
 
-  const handleUnlockRoom = (e: React.FormEvent) => {
+  const handleUnlockRoom = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (passcode === '777' || passcode === '1234' || passcode === '7729' || passcode.length === 4) {
-      setIsAuthenticated(true);
-      setErrorMsg('');
-      playChurchBell();
-    } else {
-      setErrorMsg('የተሳሳተ የሚስጥር ቁጥር! እባክዎ ከቀሲስ ሄኖክ የተሰጠዎትን ባለ 4 ድጅት ቁጥር ያስገቡ (ለምሳሌ 777 ወይም 7729)።');
+    setErrorMsg('');
+    try {
+      const result = await verifySecretRoomPasscode(passcode);
+      if (result.authorized && result.roomId) {
+        setRoomId(result.roomId);
+        setIsAuthenticated(true);
+        playChurchBell();
+      } else {
+        setErrorMsg(result.error || 'የተሳሳተ የሚስጥር ቁጥር! ቢያንስ 3 አሃዝ የጋራ ኮድ ያስገቡ (ለምሳሌ፡ 777)።');
+      }
+    } catch {
+      setErrorMsg('ከሰርቨር ጋር መገናኘት አልተቻለም።');
     }
   };
 
@@ -382,7 +494,11 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               : 'bg-amber-950/60 border-amber-700/50 text-amber-300'
           }`}>
             <span className={`w-2 h-2 rounded-full ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
-            <span>{remoteUserConnected ? `ቀጥታ ከ${remoteUserName} ጋር ተገናኝቷል` : 'የሌላ ሰው መግቢያ በመጠባበቅ ላይ...'}</span>
+            <span>
+              {remoteUserConnected
+                ? `ቀጥታ ከ${remoteUserName} ጋር ተገናኝቷል (${iceState})`
+                : 'ሌላኛውን ሰው በተመሳሳይ ኮድ በመጠባበቅ ላይ...'}
+            </span>
           </span>
 
           <button
@@ -416,18 +532,29 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               className={`w-full h-full object-cover ${remoteUserConnected ? 'block' : 'hidden'}`}
             />
             {!remoteUserConnected && (
-              <img
-                src="/src/assets/images/sacred_confession_sanctuary_1794468348510.jpg"
-                alt="የንስሐ አባት ቀሲስ ሄኖክ በሚስጥር ቤቱ"
-                referrerPolicy="no-referrer"
-                className="w-full h-full object-cover filter brightness-95"
-              />
+              <div className="relative w-full h-full">
+                <img
+                  src="/src/assets/images/sacred_confession_sanctuary_1794468348510.jpg"
+                  alt="የንስሐ ሚስጥር ቤት"
+                  referrerPolicy="no-referrer"
+                  className="w-full h-full object-cover filter brightness-50"
+                />
+                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center space-y-2">
+                  <Lock className="w-10 h-10 text-amber-400 animate-pulse" />
+                  <p className="text-sm font-heading font-bold text-amber-100">
+                    የክፍል ኮድ #{passcode} ተከፍቷል
+                  </p>
+                  <p className="text-xs text-stone-300 max-w-sm">
+                    የንስሐ አባትዎ (ወይም የንስሐ ልጅዎ) በሌላ ስልክ ተመሳሳዩን ኮድ (#{passcode}) አስገብተው ሲገቡ ቪዲዮና ድምፃቸው እዚህ በቀጥታ ይመጣል።
+                  </p>
+                </div>
+              </div>
             )}
 
             {/* Remote User Label */}
             <div className="absolute top-3 left-3 bg-stone-950/80 px-2.5 py-1 rounded-lg border border-amber-700/40 text-xs text-amber-200 flex items-center gap-1.5 z-10">
-              <span className={`w-2 h-2 rounded-full ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-500 animate-pulse'}`} />
-              <span>{remoteUserConnected ? `${remoteUserName} (በቀጥታ ቪዲዮ)` : 'ቀሲስ ሄኖክ (የንስሐ አባት)'}</span>
+              <span className={`w-2 h-2 rounded-full ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-500 animate-pulse'}`} />
+              <span>{remoteUserConnected ? `${remoteUserName} (በቀጥታ ቪዲዮ)` : `ሚስጥር ቤት #${passcode}`}</span>
             </div>
 
             {/* Radiant Blessing Overlay when Priest Absolves */}

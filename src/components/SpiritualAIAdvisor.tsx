@@ -44,12 +44,12 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
     try {
       const response = await askSpiritualCounsel(q, topic, user.baptismalName);
       setConversation((prev) => [...prev, { role: 'priest_ai', text: response }]);
-    } catch {
+    } catch (err: any) {
       setConversation((prev) => [
         ...prev,
         {
           role: 'priest_ai',
-          text: 'ይቅርታ፤ በአሁኑ ወቅት የኔትወርክ ግንኙነት የለም። ሆኖም በልብህ ወደ ፈጣሪ ተማፀን፤ እግዚአብሔር የልብን ጸሎት ይሰማል።',
+          text: `⚠️ ${err?.message || 'ከኤአይ ሰርቨር ጋር መገናኘት አልተቻለም። እባክዎ የGEMINI_API_KEY እና የኢንተርኔት ግንኙነትዎን ያረጋግጡ።'}`,
         },
       ]);
     } finally {
@@ -64,8 +64,8 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
     try {
       const res = await searchScripture(scriptureQuery);
       setScriptureResult(res);
-    } catch {
-      setScriptureResult('ጥቅሱን ለማግኘት አልተቻለም። እባክዎ እንደገና ይሞክሩ።');
+    } catch (err: any) {
+      setScriptureResult(`⚠️ ${err?.message || 'ጥቅሱን ከኤአይ ሰርቨር ማምጣት አልተቻለም። እባክዎ የGEMINI_API_KEY ትክክለኛ መሆኑን ያረጋግጡ።'}`);
     } finally {
       setScriptureLoading(false);
     }

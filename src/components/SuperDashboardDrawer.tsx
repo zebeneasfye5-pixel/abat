@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
-import { X, Users, Calendar, Mic, Wallet, Shield, KeyRound, User, LogOut, CheckCircle2, Save } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, Users, Calendar, Mic, Wallet, Shield, KeyRound, User, Save } from 'lucide-react';
 import { ConfessionBooking, WalletState, WalletTransaction, UserProfile, UserRole } from '../types';
+import { fetchRegisteredUsers, updateUserProfile } from '../services/api';
 
 interface SuperDashboardDrawerProps {
   isOpen: boolean;
@@ -27,40 +28,53 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'profile' | 'children' | 'confessions' | 'assembly_control' | 'wallet_audit' | 'system'>('profile');
 
-  // Profile edit form state
   const [profileForm, setProfileForm] = useState({
     fullName: currentUser.fullName || '',
     baptismalName: currentUser.baptismalName || '',
     phone: currentUser.phone || '',
     email: currentUser.email || '',
     confessorPriest: currentUser.confessorPriest || 'ቀሲስ ሄኖክ',
-    confessionStage: currentUser.confessionStage || 'መካከለኛ',
+    confessionStage: currentUser.confessionStage || 'ጀማሪ',
     role: currentUser.role || 'child',
   });
   const [profileSaved, setProfileSaved] = useState(false);
 
-  // Registered spiritual children list
-  const [registeredChildren] = useState([
-    { id: 'usr-1', name: 'ዮሐንስ ተስፋዬ', baptismalName: 'ወልደ ዮሐንስ', phone: '+251911223344', stage: 'መካከለኛ', lastConfession: '2026-10-28', status: 'ንቁ' },
-    { id: 'usr-2', name: 'ማርታ በቀለ', baptismalName: 'ወለተ ማርያም', phone: '+251922334455', stage: 'ጀማሪ', lastConfession: '2026-11-02', status: 'ንቁ' },
-    { id: 'usr-3', name: 'ዳዊት ግርማ', baptismalName: 'ኃይለ ሚካኤል', phone: '+251933445566', stage: 'የቆረበ/የበረታ', lastConfession: '2026-11-09', status: 'ንቁ' },
-    { id: 'usr-4', name: 'ሰሎሜ ተፈራ', baptismalName: 'ወለተ ሰማዕት', phone: '+251944556677', stage: 'መካከለኛ', lastConfession: '2026-10-15', status: 'ንቁ' },
-    { id: 'usr-5', name: 'ተክለ ሃይማኖት ካሳ', baptismalName: 'ኃይለ ማርያም', phone: '+251955667788', stage: 'የቆረበ/የበረታ', lastConfession: '2026-11-05', status: 'ንቁ' },
-  ]);
+  // Real registered users loaded from server
+  const [registeredUsers, setRegisteredUsers] = useState<UserProfile[]>([]);
+
+  useEffect(() => {
+    if (isOpen) {
+      fetchRegisteredUsers().then(setRegisteredUsers);
+      setProfileForm({
+        fullName: currentUser.fullName || '',
+        baptismalName: currentUser.baptismalName || '',
+        phone: currentUser.phone || '',
+        email: currentUser.email || '',
+        confessorPriest: currentUser.confessorPriest || 'ቀሲስ ሄኖክ',
+        confessionStage: currentUser.confessionStage || 'ጀማሪ',
+        role: currentUser.role || 'child',
+      });
+    }
+  }, [isOpen, currentUser]);
 
   if (!isOpen) return null;
 
-  const handleSaveProfile = (e: React.FormEvent) => {
+  const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (onUpdateUser) {
-      onUpdateUser({
-        ...currentUser,
-        ...profileForm,
+    try {
+      const updated = await updateUserProfile({
+        fullName: profileForm.fullName,
+        baptismalName: profileForm.baptismalName,
+        phone: profileForm.phone,
+        email: profileForm.email,
+        confessorPriest: profileForm.confessorPriest,
         confessionStage: profileForm.confessionStage as any,
-        role: profileForm.role as UserRole,
       });
+      if (onUpdateUser) onUpdateUser(updated);
       setProfileSaved(true);
       setTimeout(() => setProfileSaved(false), 2000);
+    } catch {
+      if (onOpenAuthModal) onOpenAuthModal();
     }
   };
 
@@ -224,41 +238,44 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
             </div>
           )}
 
-          {/* TAB 1: Spiritual Children Management */}
+          {/* TAB 1: Real Registered Users Management */}
           {activeTab === 'children' && (
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-sm font-semibold text-amber-200">የተመዘገቡ የንስሐ ልጆች ዝርዝር ({registeredChildren.length})</h3>
-                  <p className="text-xs text-stone-400">የመንፈሳዊ ደረጃ እና የቅርብ ጊዜ የንስሐ ታሪክ</p>
+                  <h3 className="text-sm font-semibold text-amber-200">የተመዘገቡ ተጠቃሚዎች ዝርዝር ({registeredUsers.length})</h3>
+                  <p className="text-xs text-stone-400">በድህረገጹ አካውንት ከፍተው የተመዘገቡ እውነተኛ አባላት</p>
                 </div>
-                <span className="text-xs text-emerald-400 font-mono">ሁሉም በስርዓት ተመዝግበዋል</span>
+                <span className="text-xs text-emerald-400 font-mono">ከሰርቨር የተጫነ</span>
               </div>
 
-              <div className="divide-y divide-stone-800 rounded-xl border border-stone-800 bg-stone-900/50 overflow-hidden">
-                {registeredChildren.map((child) => (
-                  <div key={child.id} className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-full bg-amber-950/80 border border-amber-700/40 flex items-center justify-center text-amber-300 font-bold">
-                        {child.baptismalName.charAt(0)}
+              {registeredUsers.length === 0 ? (
+                <div className="p-6 rounded-xl border border-stone-800 bg-stone-900/40 text-center text-xs text-stone-400">
+                  እስካሁን የተመዘገበ ተጠቃሚ የለም። አዳዲስ ተጠቃሚዎች በ"ግባ / ተመዝገብ" ሲመዘገቡ እዚህ በቀጥታ ይታያሉ።
+                </div>
+              ) : (
+                <div className="divide-y divide-stone-800 rounded-xl border border-stone-800 bg-stone-900/50 overflow-hidden">
+                  {registeredUsers.map((member) => (
+                    <div key={member.id} className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-full bg-amber-950/80 border border-amber-700/40 flex items-center justify-center text-amber-300 font-bold">
+                          {(member.baptismalName || member.fullName).charAt(0)}
+                        </div>
+                        <div>
+                          <p className="font-semibold text-stone-200">{member.fullName} ({member.baptismalName})</p>
+                          <p className="text-stone-400">{member.phone}</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="font-semibold text-stone-200">{child.name} ({child.baptismalName})</p>
-                        <p className="text-stone-400">{child.phone}</p>
-                      </div>
-                    </div>
 
-                    <div className="flex items-center gap-4 text-right">
-                      <div>
+                      <div className="flex items-center gap-2 text-right">
                         <span className="px-2 py-0.5 rounded bg-stone-950 border border-stone-700 text-amber-300 font-medium">
-                          {child.stage}
+                          {member.role === 'priest' ? 'ቀሲስ' : member.role === 'deacon' ? 'ዲያቆን' : member.confessionStage}
                         </span>
-                        <p className="text-[11px] text-stone-500 mt-1">የመጨረሻ ንስሐ፡ {child.lastConfession}</p>
                       </div>
                     </div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -427,7 +444,7 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
                 </div>
                 <div className="flex justify-between items-center">
                   <span className="text-stone-300">የኤአይ ረዳት ሞዴል፡</span>
-                  <span className="text-amber-200">Gemini 3.8 Flash (Server-Side)</span>
+                  <span className="text-amber-200">Gemini 4 Hydrogen (Server-Side)</span>
                 </div>
 
                 <div className="pt-3 border-t border-stone-800 flex gap-2">

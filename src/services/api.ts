@@ -1,66 +1,197 @@
-import { ConfessionBooking, AssemblySeat, WalletState, WalletTransaction } from '../types';
+import { ConfessionBooking, WalletState, WalletTransaction, UserProfile } from '../types';
 
-export async function askSpiritualCounsel(prompt: string, topic?: string, baptismalName?: string): Promise<string> {
-  try {
-    const res = await fetch('/api/gemini/spiritual-counsel', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, topic, baptismalName }),
-    });
-    if (!res.ok) throw new Error('Network response error');
-    const data = await res.json();
-    return data.reply;
-  } catch (err) {
-    console.warn('Using offline spiritual counsel fallback:', err);
-    return `በእግዚአብሔር ስም ሰላም ለእናንተ ይሁን። ጌታችን በማቴዎስ ወንጌል "እናንተ ሸክማችሁ የከበደ ሁሉ፥ ወደ እኔ ኑ፥ እኔም አሳርፋችኋለሁ" እንዳለ ንስሐ ወደ አምላክ የመመለሻ የሕይወት ጎዳና ነው። ኃጢአትህን ያለመደበቅ ለንስሐ አባትህ በዕንባ ተናዘዝ፤ ንጹሕ ሕሊናን ታገኛለህ። ጾምና ጸሎትህ እንደ ዕጣን ያርግልህ።`;
+const AUTH_TOKEN_KEY = 'qh_auth_token';
+
+// Optional external backend URL (used if frontend is on Vercel and backend is on Render)
+const RAW_API_BASE = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
+
+export function apiUrl(path: string): string {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return RAW_API_BASE ? `${RAW_API_BASE}${normalizedPath}` : normalizedPath;
+}
+
+export function getRealtimeWsUrl(): string {
+  if (RAW_API_BASE) {
+    try {
+      const parsed = new URL(RAW_API_BASE);
+      const wsProto = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${wsProto}//${parsed.host}/ws/realtime`;
+    } catch {}
   }
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws/realtime`;
+}
+
+export function getAuthToken(): string | null {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setAuthToken(token: string | null) {
+  try {
+    if (token) {
+      localStorage.setItem(AUTH_TOKEN_KEY, token);
+    } else {
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+    }
+  } catch {}
+}
+
+// --- 1. REAL AUTHENTICATION API ---
+export async function registerUser(payload: {
+  fullName: string;
+  baptismalName: string;
+  phone: string;
+  email?: string;
+  password: string;
+  role?: 'child' | 'priest' | 'deacon';
+  confessorPriest?: string;
+  confessionStage?: string;
+  priestCode?: string;
+}): Promise<{ user: UserProfile; token: string }> {
+  const res = await fetch(apiUrl('/api/auth/register'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'ምዝገባው አልተሳካም');
+  }
+  setAuthToken(data.token);
+  return data;
+}
+
+export async function loginUser(identifier: string, password: string): Promise<{ user: UserProfile; token: string }> {
+  const res = await fetch(apiUrl('/api/auth/login'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ identifier, password }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'መግባት አልተቻለም');
+  }
+  setAuthToken(data.token);
+  return data;
+}
+
+export async function fetchCurrentUser(): Promise<UserProfile | null> {
+  const token = getAuthToken();
+  if (!token) return null;
+  try {
+    const res = await fetch(apiUrl('/api/auth/me'), {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      setAuthToken(null);
+      return null;
+    }
+    const data = await res.json();
+    return data.user;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateUserProfile(payload: Partial<UserProfile>): Promise<UserProfile> {
+  const token = getAuthToken();
+  const res = await fetch(apiUrl('/api/auth/profile'), {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error || 'ፕሮፋይሉን ማደስ አልተቻለም');
+  }
+  return data.user;
+}
+
+export async function logoutUser(): Promise<void> {
+  const token = getAuthToken();
+  if (token) {
+    fetch(apiUrl('/api/auth/logout'), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+  setAuthToken(null);
+}
+
+export async function fetchRegisteredUsers(): Promise<UserProfile[]> {
+  try {
+    const res = await fetch(apiUrl('/api/users'));
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.users || [];
+  } catch {
+    return [];
+  }
+}
+
+// --- 2. REAL GEMINI AI SPIRITUAL COUNSEL & SCRIPTURE SEARCH ---
+export async function askSpiritualCounsel(prompt: string, topic?: string, baptismalName?: string): Promise<string> {
+  const res = await fetch(apiUrl('/api/gemini/spiritual-counsel'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt, topic, baptismalName }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || 'የኤአይ አገልግሎት ችግር አጋጥሞታል');
+  }
+  return data.reply;
 }
 
 export async function searchScripture(query: string): Promise<string> {
-  try {
-    const res = await fetch('/api/gemini/scripture-search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
-    });
-    if (!res.ok) throw new Error('Network error');
-    const data = await res.json();
-    return data.result;
-  } catch (err) {
-    return `1. መዝሙረ ዳዊት 51:1 - "አቤቱ፥ እንደ ቸርነትህ መጠን ማረኝ፤ እንደ ምሕረትህም ብዛት መተላለፌን ደምስስ።"\n2. 1 ዮሐንስ 1:9 - "በኃጢአታችን ብንናዘዝ ኃጢአታችንን ይቅር ሊለን ከአመፃም ሁሉ ሊያነጻን የታመነና ጻድቅ ነው።"\n3. ምሳሌ 28:13 - "ኃጢአቱን የሚሰውር አይለማም፤ የሚናዘዝባትና የሚተዋት ግን ምሕረትን ያገኛል።"`;
+  const res = await fetch(apiUrl('/api/gemini/scripture-search'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || 'የመጽሐፍ ቅዱስ ፍለጋው አልተሳካም');
   }
+  return data.result;
 }
 
+// --- 3. WEBRTC ICE / TURN CONFIG ---
+export async function fetchWebRTCConfig(): Promise<RTCConfiguration> {
+  try {
+    const res = await fetch(apiUrl('/api/webrtc-config'));
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.iceServers)) {
+        return { iceServers: data.iceServers };
+      }
+    }
+  } catch {}
+  return {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+    ],
+  };
+}
+
+// --- 4. CONFESSIONS & SECRET ROOM API ---
 export async function fetchConfessions(): Promise<ConfessionBooking[]> {
   try {
-    const res = await fetch('/api/confessions');
-    if (!res.ok) throw new Error();
+    const res = await fetch(apiUrl('/api/confessions'));
+    if (!res.ok) return [];
     const data = await res.json();
-    return data.bookings;
+    return data.bookings || [];
   } catch {
-    return [
-      {
-        id: 'cnf-101',
-        childName: 'ዮሐንስ ተስፋዬ',
-        baptismalName: 'ወልደ ዮሐንስ',
-        phone: '+251911223344',
-        date: '2026-11-13',
-        time: '14:30',
-        status: 'confirmed',
-        penanceNotes: 'የንስሐ ጸሎት 40 ጊዜ አቡነ ዘበሰማያት፣ የጾም ጥንካሬ',
-        secretPasscode: '7729',
-      },
-      {
-        id: 'cnf-102',
-        childName: 'ማርታ በቀለ',
-        baptismalName: 'ወለተ ማርያም',
-        phone: '+251922334455',
-        date: '2026-11-14',
-        time: '16:00',
-        status: 'pending',
-        secretPasscode: '4183',
-      },
-    ];
+    return [];
   }
 }
 
@@ -70,103 +201,74 @@ export async function bookConfessionSlot(payload: {
   phone: string;
   date: string;
   time: string;
+  secretPasscode?: string;
 }): Promise<ConfessionBooking> {
-  const res = await fetch('/api/confessions/book', {
+  const res = await fetch(apiUrl('/api/confessions/book'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
   const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'ቀጠሮ ማስያዝ አልተቻለም');
   return data.booking;
 }
 
-export async function verifySecretRoomPasscode(bookingId: string, passcode: string): Promise<boolean> {
-  try {
-    const res = await fetch('/api/confessions/verify-secret-room', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bookingId, passcode }),
-    });
-    const data = await res.json();
-    return !!data.authorized;
-  } catch {
-    return passcode === '777' || passcode === '1234' || passcode.length === 4;
-  }
+export async function updateConfessionStatus(
+  id: string,
+  status: 'confirmed' | 'completed' | 'cancelled',
+  penanceNotes?: string
+): Promise<ConfessionBooking> {
+  const res = await fetch(apiUrl('/api/confessions/update-status'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, status, penanceNotes }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'ቀጠሮውን ማደስ አልተቻለም');
+  return data.booking;
 }
 
-export async function fetchAssemblyData(): Promise<{
-  activeAttendeesCount: number;
-  capacity: number;
-  seats: AssemblySeat[];
-  lectureTitle: string;
-  lecturer: string;
-  isLive: boolean;
-}> {
-  try {
-    const res = await fetch('/api/assembly/seats');
-    if (!res.ok) throw new Error();
-    return await res.json();
-  } catch {
-    return {
-      activeAttendeesCount: 12480,
-      capacity: 50000,
-      lectureTitle: 'የንስሐ ሕይወት እና የልብ ንጽሕና በዘመነ ተስፋ',
-      lecturer: 'ቀሲስ ሄኖክ (የንስሐ አባት)',
-      isLive: true,
-      seats: [
-        { seatNumber: 1, userName: 'ቀሲስ ሄኖክ (የጉባኤው መሪ)', baptismalName: 'ገብረ ክርስቶስ', isMicActive: true, handRaised: false, avatarSeed: 'priest1', role: 'priest' },
-        { seatNumber: 2, userName: 'ዲ/ን አማኑኤል', baptismalName: 'ወልደ ሩፋኤል', isMicActive: false, handRaised: false, avatarSeed: 'deacon1', role: 'deacon' },
-        { seatNumber: 3, userName: 'መ/ር ታደሰ ወርቁ', baptismalName: 'ገብረ መድኅን', isMicActive: false, handRaised: true, avatarSeed: 'teacher1', role: 'cantor' },
-      ],
-    };
-  }
+export async function verifySecretRoomPasscode(passcode: string): Promise<{ authorized: boolean; roomId?: string; error?: string }> {
+  const res = await fetch(apiUrl('/api/confessions/verify-secret-room'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ passcode }),
+  });
+  const data = await res.json();
+  return data;
 }
 
+// --- 5. SPIRITUAL WALLET API ---
 export async function fetchWalletData(): Promise<{
   balance: WalletState;
   transactions: WalletTransaction[];
 }> {
   try {
-    const res = await fetch('/api/wallet');
+    const res = await fetch(apiUrl('/api/wallet'));
     if (!res.ok) throw new Error();
     return await res.json();
   } catch {
     return {
-      balance: {
-        totalBalance: 486500.00,
-        tithes: 215400.00,
-        charity: 182300.00,
-        churchSupport: 88800.00,
-      },
-      transactions: [
-        {
-          id: 'tx-881',
-          userId: 'usr-1',
-          userName: 'ዮሐንስ ተስፋዬ (ወልደ ዮሐንስ)',
-          type: 'tithe',
-          amount: 5000,
-          timestamp: '2026-11-11 16:45',
-          paymentMethod: 'telebirr',
-          status: 'completed',
-          receiptNumber: 'QH-TITHE-2026-0881',
-          purposeNote: 'የወር አስራት ስጦታ',
-        },
-      ],
+      balance: { totalBalance: 0, tithes: 0, charity: 0, churchSupport: 0 },
+      transactions: [],
     };
   }
 }
 
 export async function submitWalletGiving(payload: {
+  userId?: string;
   userName: string;
   type: string;
   amount: number;
   paymentMethod: string;
   purposeNote: string;
 }): Promise<{ transaction: WalletTransaction; newBalance: WalletState }> {
-  const res = await fetch('/api/wallet/give', {
+  const res = await fetch(apiUrl('/api/wallet/give'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  return await res.json();
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'ክፍያው አልተሳካም');
+  return data;
 }

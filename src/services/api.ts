@@ -1,6 +1,17 @@
-import { ConfessionBooking, WalletState, WalletTransaction, UserProfile } from '../types';
+import {
+  ConfessionBooking,
+  WalletState,
+  WalletTransaction,
+  UserProfile,
+  BankAccountInfo,
+  MinistryBankAccounts,
+} from '../types';
 
 const AUTH_TOKEN_KEY = 'qh_auth_token';
+const SAVED_USER_KEY = 'qh_saved_user_v1';
+const RECOVERY_RECORDS_KEY = 'qh_recovery_records_v1';
+const WALLET_BACKUP_KEY = 'qh_wallet_backup_v1';
+const BANK_BACKUP_KEY = 'qh_bank_backup_v1';
 
 // Optional external backend URL (used if frontend is on Vercel and backend is on Render)
 const RAW_API_BASE = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
@@ -40,6 +51,52 @@ export function setAuthToken(token: string | null) {
   } catch {}
 }
 
+export function getSavedUserSnapshot(): UserProfile | null {
+  try {
+    const token = getAuthToken();
+    const raw = localStorage.getItem(SAVED_USER_KEY);
+    if (!token || !raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.isAuthenticated && parsed.id) {
+      return parsed as UserProfile;
+    }
+  } catch {}
+  return null;
+}
+
+function saveUserSnapshot(user: UserProfile | null, recoveryRecord?: string) {
+  try {
+    if (user && user.isAuthenticated) {
+      localStorage.setItem(SAVED_USER_KEY, JSON.stringify(user));
+      if (recoveryRecord) {
+        const mapRaw = localStorage.getItem(RECOVERY_RECORDS_KEY);
+        const map: Record<string, string> = mapRaw ? JSON.parse(mapRaw) : {};
+        if (user.phone) map[user.phone.trim()] = recoveryRecord;
+        if (user.email) map[user.email.trim().toLowerCase()] = recoveryRecord;
+        map.__latest__ = recoveryRecord;
+        localStorage.setItem(RECOVERY_RECORDS_KEY, JSON.stringify(map));
+      }
+    } else {
+      localStorage.removeItem(SAVED_USER_KEY);
+    }
+  } catch {}
+}
+
+function findRecoveryRecord(identifier?: string): string | null {
+  try {
+    const mapRaw = localStorage.getItem(RECOVERY_RECORDS_KEY);
+    if (!mapRaw) return null;
+    const map: Record<string, string> = JSON.parse(mapRaw);
+    if (identifier) {
+      const key = identifier.trim();
+      return map[key] || map[key.toLowerCase()] || map.__latest__ || null;
+    }
+    return map.__latest__ || null;
+  } catch {
+    return null;
+  }
+}
+
 async function safeFetchJson<T = any>(
   path: string,
   options: RequestInit = {},
@@ -68,7 +125,6 @@ async function safeFetchJson<T = any>(
   try {
     data = rawText ? JSON.parse(rawText) : {};
   } catch {
-    // Non-JSON response (e.g., Vercel 404 "The page could not be found" or Render HTML error page)
     const isVercelHost =
       typeof window !== 'undefined' && window.location.hostname.includes('vercel.app');
     if (res.status === 404 || rawText.includes('The page could not be found')) {
@@ -86,13 +142,16 @@ async function safeFetchJson<T = any>(
   }
 
   if (!res.ok) {
-    throw new Error(data?.message || data?.error || `የሰርቨር ስህተት (${res.status})`);
+    const errorObj: any = new Error(data?.message || data?.error || `የሰርቨር ስህተት (${res.status})`);
+    errorObj.status = res.status;
+    errorObj.code = data?.code;
+    throw errorObj;
   }
 
   return data as T;
 }
 
-// --- 1. REAL AUTHENTICATION API ---
+// --- 1. REAL PERMANENT AUTHENTICATION API ---
 export async function registerUser(payload: {
   fullName: string;
   baptismalName: string;
@@ -104,50 +163,105 @@ export async function registerUser(payload: {
   confessionStage?: string;
   priestCode?: string;
 }): Promise<{ user: UserProfile; token: string }> {
-  const data = await safeFetchJson<{ user: UserProfile; token: string }>('/api/auth/register', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  const data = await safeFetchJson<{ user: UserProfile; token: string; recoveryRecord?: string }>(
+    '/api/auth/register',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }
+  );
   setAuthToken(data.token);
+  saveUserSnapshot(data.user, data.recoveryRecord);
   return data;
 }
 
 export async function loginUser(identifier: string, password: string): Promise<{ user: UserProfile; token: string }> {
-  const data = await safeFetchJson<{ user: UserProfile; token: string }>('/api/auth/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ identifier, password }),
-  });
-  setAuthToken(data.token);
-  return data;
+  try {
+    const data = await safeFetchJson<{ user: UserProfile; token: string; recoveryRecord?: string }>(
+      '/api/auth/login',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier, password }),
+      }
+    );
+    setAuthToken(data.token);
+    saveUserSnapshot(data.user, data.recoveryRecord);
+    return data;
+  } catch (err: any) {
+    // If server disk reset on Render Free Tier, automatically restore from signed recovery record
+    if (err?.status === 404 || err?.code === 'USER_NOT_FOUND') {
+      const rec = findRecoveryRecord(identifier);
+      if (rec) {
+        const restored = await safeFetchJson<{ user: UserProfile; token: string; recoveryRecord?: string }>(
+          '/api/auth/restore',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ recoveryRecord: rec, identifier, password }),
+          }
+        );
+        setAuthToken(restored.token);
+        saveUserSnapshot(restored.user, restored.recoveryRecord);
+        return restored;
+      }
+    }
+    throw err;
+  }
 }
 
 export async function fetchCurrentUser(): Promise<UserProfile | null> {
   const token = getAuthToken();
   if (!token) return null;
   try {
-    const data = await safeFetchJson<{ user: UserProfile }>(
+    const data = await safeFetchJson<{ user: UserProfile; token?: string; recoveryRecord?: string }>(
       '/api/auth/me',
       { headers: { Authorization: `Bearer ${token}` } },
       12000
     );
+    if (data.token) setAuthToken(data.token);
+    saveUserSnapshot(data.user, data.recoveryRecord);
     return data.user;
-  } catch {
-    return null;
+  } catch (err: any) {
+    // If Render restarted and token was legacy or expired, try auto-restoring using signed recoveryRecord
+    const rec = findRecoveryRecord();
+    if (rec && (err?.status === 401 || err?.status === 404)) {
+      try {
+        const restored = await safeFetchJson<{ user: UserProfile; token: string; recoveryRecord?: string }>(
+          '/api/auth/restore',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ recoveryRecord: rec }),
+          },
+          12000
+        );
+        setAuthToken(restored.token);
+        saveUserSnapshot(restored.user, restored.recoveryRecord);
+        return restored.user;
+      } catch {}
+    }
+    // Keep saved local snapshot intact on offline/transient network errors so user is NEVER kicked out
+    return getSavedUserSnapshot();
   }
 }
 
 export async function updateUserProfile(payload: Partial<UserProfile>): Promise<UserProfile> {
   const token = getAuthToken();
-  const data = await safeFetchJson<{ user: UserProfile }>('/api/auth/profile', {
-    method: 'PUT',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify(payload),
-  });
+  const data = await safeFetchJson<{ user: UserProfile; token?: string; recoveryRecord?: string }>(
+    '/api/auth/profile',
+    {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+  if (data.token) setAuthToken(data.token);
+  saveUserSnapshot(data.user, data.recoveryRecord);
   return data.user;
 }
 
@@ -160,6 +274,7 @@ export async function logoutUser(): Promise<void> {
     }).catch(() => {});
   }
   setAuthToken(null);
+  saveUserSnapshot(null);
 }
 
 export async function fetchRegisteredUsers(): Promise<UserProfile[]> {
@@ -269,18 +384,67 @@ export async function verifySecretRoomPasscode(passcode: string): Promise<{ auth
   }
 }
 
-// --- 5. SPIRITUAL WALLET API ---
-export async function fetchWalletData(): Promise<{
+// --- 5. SPIRITUAL WALLET & BANKING API ---
+export interface WalletDashboardPayload {
   balance: WalletState;
   transactions: WalletTransaction[];
-}> {
+  ministryBanks?: MinistryBankAccounts;
+  userBankAccount?: BankAccountInfo | null;
+}
+
+function saveWalletLocalBackup(data: Partial<WalletDashboardPayload>) {
   try {
-    return await safeFetchJson<{ balance: WalletState; transactions: WalletTransaction[] }>('/api/wallet', {}, 12000);
+    if (data.balance || data.transactions) {
+      const prevRaw = localStorage.getItem(WALLET_BACKUP_KEY);
+      const prev = prevRaw ? JSON.parse(prevRaw) : {};
+      localStorage.setItem(
+        WALLET_BACKUP_KEY,
+        JSON.stringify({
+          balance: data.balance || prev.balance,
+          transactions: data.transactions || prev.transactions || [],
+        })
+      );
+    }
+    if (data.ministryBanks || data.userBankAccount) {
+      const prevRaw = localStorage.getItem(BANK_BACKUP_KEY);
+      const prev = prevRaw ? JSON.parse(prevRaw) : {};
+      localStorage.setItem(
+        BANK_BACKUP_KEY,
+        JSON.stringify({
+          ministryBanks: data.ministryBanks || prev.ministryBanks,
+          userBankAccount: data.userBankAccount !== undefined ? data.userBankAccount : prev.userBankAccount,
+        })
+      );
+    }
+  } catch {}
+}
+
+export async function fetchWalletData(): Promise<WalletDashboardPayload> {
+  const token = getAuthToken();
+  try {
+    const data = await safeFetchJson<WalletDashboardPayload>(
+      '/api/wallet',
+      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+      12000
+    );
+    saveWalletLocalBackup(data);
+    return data;
   } catch {
-    return {
-      balance: { totalBalance: 0, tithes: 0, charity: 0, churchSupport: 0 },
-      transactions: [],
-    };
+    try {
+      const w = JSON.parse(localStorage.getItem(WALLET_BACKUP_KEY) || '{}');
+      const b = JSON.parse(localStorage.getItem(BANK_BACKUP_KEY) || '{}');
+      return {
+        balance: w.balance || { totalBalance: 0, tithes: 0, charity: 0, churchSupport: 0, withdrawnTotal: 0 },
+        transactions: w.transactions || [],
+        ministryBanks: b.ministryBanks,
+        userBankAccount: b.userBankAccount || null,
+      };
+    } catch {
+      return {
+        balance: { totalBalance: 0, tithes: 0, charity: 0, churchSupport: 0, withdrawnTotal: 0 },
+        transactions: [],
+      };
+    }
   }
 }
 
@@ -291,10 +455,71 @@ export async function submitWalletGiving(payload: {
   amount: number;
   paymentMethod: string;
   purposeNote: string;
+  bankName?: string;
+  accountNumber?: string;
+  accountHolderName?: string;
+  referenceNumber?: string;
 }): Promise<{ transaction: WalletTransaction; newBalance: WalletState }> {
-  return safeFetchJson<{ transaction: WalletTransaction; newBalance: WalletState }>('/api/wallet/give', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+  const token = getAuthToken();
+  const res = await safeFetchJson<{ transaction: WalletTransaction; newBalance: WalletState }>(
+    '/api/wallet/give',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+  saveWalletLocalBackup({ balance: res.newBalance });
+  return res;
+}
+
+export async function submitWalletWithdrawal(payload: {
+  userName: string;
+  amount: number;
+  bankName: string;
+  accountNumber: string;
+  accountHolderName: string;
+  purposeNote?: string;
+  paymentMethod?: string;
+}): Promise<{ transaction: WalletTransaction; newBalance: WalletState }> {
+  const token = getAuthToken();
+  const res = await safeFetchJson<{ transaction: WalletTransaction; newBalance: WalletState }>(
+    '/api/wallet/withdraw',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+  saveWalletLocalBackup({ balance: res.newBalance });
+  return res;
+}
+
+export async function saveBankAccountConfig(payload: {
+  userBankAccount?: BankAccountInfo;
+  ministryBanks?: MinistryBankAccounts;
+}): Promise<{ ministryBanks: MinistryBankAccounts; userBankAccount: BankAccountInfo | null }> {
+  const token = getAuthToken();
+  const res = await safeFetchJson<{ ministryBanks: MinistryBankAccounts; userBankAccount: BankAccountInfo | null }>(
+    '/api/wallet/bank-accounts',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+  saveWalletLocalBackup({
+    ministryBanks: res.ministryBanks,
+    userBankAccount: res.userBankAccount,
   });
+  return res;
 }

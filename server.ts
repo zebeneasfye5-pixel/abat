@@ -73,6 +73,28 @@ interface WalletTx {
   status: 'completed' | 'pending';
   receiptNumber: string;
   purposeNote: string;
+  bankName?: string;
+  accountNumber?: string;
+  accountHolderName?: string;
+  referenceNumber?: string;
+}
+
+interface BankAccountRecord {
+  bankName: string;
+  accountHolderName: string;
+  accountNumber: string;
+  branchName?: string;
+  telebirrPhone?: string;
+}
+
+interface MinistryBanksRecord {
+  cbeAccount: string;
+  cbeHolder: string;
+  telebirrPhone: string;
+  telebirrName: string;
+  awashAccount: string;
+  dashenAccount: string;
+  abyssiniaAccount: string;
 }
 
 interface DatabaseSchema {
@@ -84,9 +106,22 @@ interface DatabaseSchema {
     tithes: number;
     charity: number;
     churchSupport: number;
+    withdrawnTotal: number;
   };
   walletTransactions: WalletTx[];
+  userBankAccounts: Record<string, BankAccountRecord>;
+  ministryBanks: MinistryBanksRecord;
 }
+
+const DEFAULT_MINISTRY_BANKS: MinistryBanksRecord = {
+  cbeAccount: '1000-xxxx-xxxx-xx (በዋሌት ቅንብር ያስገቡ)',
+  cbeHolder: 'ቀሲስ ሄኖክ የመንፈሳዊ አገልግሎት',
+  telebirrPhone: '09-xxxx-xxxx',
+  telebirrName: 'ቀሲስ ሄኖክ',
+  awashAccount: '',
+  dashenAccount: '',
+  abyssiniaAccount: '',
+};
 
 function loadDatabase(): DatabaseSchema {
   try {
@@ -100,8 +135,16 @@ function loadDatabase(): DatabaseSchema {
         users: Array.isArray(parsed.users) ? parsed.users : [],
         sessions: parsed.sessions || {},
         confessionBookings: Array.isArray(parsed.confessionBookings) ? parsed.confessionBookings : [],
-        walletBalance: parsed.walletBalance || { totalBalance: 0, tithes: 0, charity: 0, churchSupport: 0 },
+        walletBalance: {
+          totalBalance: Number(parsed.walletBalance?.totalBalance || 0),
+          tithes: Number(parsed.walletBalance?.tithes || 0),
+          charity: Number(parsed.walletBalance?.charity || 0),
+          churchSupport: Number(parsed.walletBalance?.churchSupport || 0),
+          withdrawnTotal: Number(parsed.walletBalance?.withdrawnTotal || 0),
+        },
         walletTransactions: Array.isArray(parsed.walletTransactions) ? parsed.walletTransactions : [],
+        userBankAccounts: parsed.userBankAccounts || {},
+        ministryBanks: { ...DEFAULT_MINISTRY_BANKS, ...(parsed.ministryBanks || {}) },
       };
     }
   } catch (err) {
@@ -117,8 +160,11 @@ function loadDatabase(): DatabaseSchema {
       tithes: 0,
       charity: 0,
       churchSupport: 0,
+      withdrawnTotal: 0,
     },
     walletTransactions: [],
+    userBankAccounts: {},
+    ministryBanks: { ...DEFAULT_MINISTRY_BANKS },
   };
 }
 
@@ -133,6 +179,58 @@ function saveDatabase() {
   } catch (err) {
     console.error('Failed to persist database:', err);
   }
+}
+
+// Deterministic server signing secret so tokens & account recovery tokens survive Render restarts/redeploys
+function getSessionSecret(): string {
+  const seed = process.env.SESSION_SECRET || process.env.PRIEST_SECRET_CODE || 'qesis-henok-orthodox-permanent-seed';
+  return crypto.createHash('sha256').update(`qh-auth-v1:${seed}`).digest('hex');
+}
+
+function signPayload(payloadObj: object): string {
+  const body = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
+  const sig = crypto.createHmac('sha256', getSessionSecret()).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function verifySignedPayload<T = any>(token: string): T | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const [body, sig] = parts;
+    const expected = crypto.createHmac('sha256', getSessionSecret()).update(body).digest('base64url');
+    const sigBuf = Buffer.from(sig);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return null;
+    }
+    return JSON.parse(Buffer.from(body, 'base64url').toString('utf-8')) as T;
+  } catch {
+    return null;
+  }
+}
+
+function createSignedSessionToken(user: StoredUser): string {
+  return signPayload({
+    typ: 'sess',
+    id: user.id,
+    fullName: user.fullName,
+    baptismalName: user.baptismalName,
+    phone: user.phone,
+    email: user.email,
+    role: user.role,
+    confessorPriest: user.confessorPriest,
+    confessionStage: user.confessionStage,
+    avatarSeed: user.avatarSeed,
+    createdAt: user.createdAt,
+  });
+}
+
+function createSignedRecoveryRecord(user: StoredUser): string {
+  return signPayload({
+    typ: 'rec',
+    user,
+  });
 }
 
 function hashPassword(password: string, salt?: string) {
@@ -168,9 +266,43 @@ function getAuthenticatedUser(req: Request): StoredUser | null {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
   const token = authHeader.slice(7).trim();
+
+  // 1. Check active server session map first
   const userId = db.sessions[token];
-  if (!userId) return null;
-  return db.users.find((u) => u.id === userId) || null;
+  if (userId) {
+    const existing = db.users.find((u) => u.id === userId);
+    if (existing) return existing;
+  }
+
+  // 2. Fallback: verify stateless HMAC-signed session token (survives Render restarts/disk resets!)
+  const verified = verifySignedPayload<any>(token);
+  if (verified && verified.typ === 'sess' && verified.id) {
+    let user = db.users.find((u) => u.id === verified.id || (verified.phone && u.phone === verified.phone));
+    if (!user) {
+      // Automatically re-hydrate user profile onto server memory/disk
+      const fallbackCred = hashPassword(crypto.randomBytes(12).toString('hex'));
+      user = {
+        id: verified.id,
+        fullName: verified.fullName || 'ተጠቃሚ',
+        baptismalName: verified.baptismalName || verified.fullName || 'ተጠቃሚ',
+        phone: verified.phone || '',
+        email: verified.email || '',
+        passwordHash: fallbackCred.hash,
+        passwordSalt: fallbackCred.salt,
+        role: verified.role || 'child',
+        confessorPriest: verified.confessorPriest || 'ቀሲስ ሄኖክ',
+        confessionStage: verified.confessionStage || 'ጀማሪ',
+        avatarSeed: verified.avatarSeed || verified.baptismalName || 'QH',
+        createdAt: verified.createdAt || new Date().toISOString(),
+      };
+      db.users.push(user);
+    }
+    db.sessions[token] = user.id;
+    saveDatabase();
+    return user;
+  }
+
+  return null;
 }
 
 // --- GEMINI AI INITIALIZATION ---
@@ -310,12 +442,14 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
   };
 
   db.users.push(newUser);
-  const token = crypto.randomBytes(32).toString('hex');
+  const token = createSignedSessionToken(newUser);
+  const recoveryRecord = createSignedRecoveryRecord(newUser);
   db.sessions[token] = newUser.id;
   saveDatabase();
 
   res.status(201).json({
     token,
+    recoveryRecord,
     user: sanitizeUser(newUser),
   });
 });
@@ -332,18 +466,68 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
     (u) => u.phone === cleanId || (u.email && u.email.toLowerCase() === cleanId.toLowerCase())
   );
 
-  if (!user || !verifyPassword(String(password), user.passwordHash, user.passwordSalt)) {
+  if (!user) {
+    res.status(404).json({ code: 'USER_NOT_FOUND', error: 'ስልክ ቁጥር/ኢሜይል ወይም የይለፍ ቃል የተሳሳተ ነው።' });
+    return;
+  }
+
+  if (!verifyPassword(String(password), user.passwordHash, user.passwordSalt)) {
     res.status(401).json({ error: 'ስልክ ቁጥር/ኢሜይል ወይም የይለፍ ቃል የተሳሳተ ነው።' });
     return;
   }
 
-  const token = crypto.randomBytes(32).toString('hex');
+  const token = createSignedSessionToken(user);
+  const recoveryRecord = createSignedRecoveryRecord(user);
   db.sessions[token] = user.id;
   saveDatabase();
 
   res.json({
     token,
+    recoveryRecord,
     user: sanitizeUser(user),
+  });
+});
+
+// Automatic server-side account restoration from signed recovery record if Render Free Tier disk reset
+app.post('/api/auth/restore', (req: Request, res: Response) => {
+  const { recoveryRecord, identifier, password } = req.body;
+  if (!recoveryRecord || typeof recoveryRecord !== 'string') {
+    res.status(400).json({ error: 'የመልሶ ማግኛ ማረጋገጫ አልተገኘም።' });
+    return;
+  }
+  const verified = verifySignedPayload<{ typ: string; user: StoredUser }>(recoveryRecord);
+  if (!verified || verified.typ !== 'rec' || !verified.user) {
+    res.status(401).json({ error: 'የመልሶ ማግኛ ማረጋገጫው ትክክለኛ አይደለም።' });
+    return;
+  }
+
+  const savedUser = verified.user;
+  // If logging in manually with password, verify password against restored hash
+  if (password !== undefined) {
+    const cleanId = String(identifier || '').trim();
+    const idMatches =
+      savedUser.phone === cleanId ||
+      (savedUser.email && savedUser.email.toLowerCase() === cleanId.toLowerCase());
+    if (!idMatches || !verifyPassword(String(password), savedUser.passwordHash, savedUser.passwordSalt)) {
+      res.status(401).json({ error: 'ስልክ ቁጥር/ኢሜይል ወይም የይለፍ ቃል የተሳሳተ ነው።' });
+      return;
+    }
+  }
+
+  let existing = db.users.find((u) => u.id === savedUser.id || u.phone === savedUser.phone);
+  if (!existing) {
+    db.users.push(savedUser);
+    existing = savedUser;
+  }
+  const token = createSignedSessionToken(existing);
+  const updatedRecovery = createSignedRecoveryRecord(existing);
+  db.sessions[token] = existing.id;
+  saveDatabase();
+
+  res.json({
+    token,
+    recoveryRecord: updatedRecovery,
+    user: sanitizeUser(existing),
   });
 });
 
@@ -353,7 +537,11 @@ app.get('/api/auth/me', (req: Request, res: Response) => {
     res.status(401).json({ error: 'ያልተረጋገጠ ክፍለ ጊዜ (Unauthenticated)' });
     return;
   }
-  res.json({ user: sanitizeUser(user) });
+  res.json({
+    user: sanitizeUser(user),
+    token: createSignedSessionToken(user),
+    recoveryRecord: createSignedRecoveryRecord(user),
+  });
 });
 
 app.put('/api/auth/profile', (req: Request, res: Response) => {
@@ -371,8 +559,16 @@ app.put('/api/auth/profile', (req: Request, res: Response) => {
   if (confessorPriest) user.confessorPriest = String(confessorPriest).trim();
   if (confessionStage) user.confessionStage = confessionStage;
 
+  const token = createSignedSessionToken(user);
+  const recoveryRecord = createSignedRecoveryRecord(user);
+  db.sessions[token] = user.id;
   saveDatabase();
-  res.json({ user: sanitizeUser(user) });
+
+  res.json({
+    user: sanitizeUser(user),
+    token,
+    recoveryRecord,
+  });
 });
 
 app.post('/api/auth/logout', (req: Request, res: Response) => {
@@ -512,34 +708,88 @@ app.post('/api/confessions/verify-secret-room', (req: Request, res: Response) =>
   });
 });
 
-// --- 4. SPIRITUAL WALLET ENDPOINTS ---
-app.get('/api/wallet', (_req: Request, res: Response) => {
+// --- 4. SPIRITUAL WALLET & BANKING ENDPOINTS ---
+app.get('/api/wallet', (req: Request, res: Response) => {
+  const user = getAuthenticatedUser(req);
+  const userBankAccount = user ? db.userBankAccounts[user.id] || null : null;
   res.json({
     balance: db.walletBalance,
     transactions: db.walletTransactions,
+    ministryBanks: db.ministryBanks,
+    userBankAccount,
+  });
+});
+
+app.post('/api/wallet/bank-accounts', (req: Request, res: Response) => {
+  const user = getAuthenticatedUser(req);
+  const { userBankAccount, ministryBanks } = req.body;
+
+  if (userBankAccount && typeof userBankAccount === 'object') {
+    const targetId = user?.id || 'default-member';
+    db.userBankAccounts[targetId] = {
+      bankName: String(userBankAccount.bankName || 'CBE (የኢትዮጵያ ንግድ ባንክ)').trim(),
+      accountHolderName: String(userBankAccount.accountHolderName || '').trim(),
+      accountNumber: String(userBankAccount.accountNumber || '').trim(),
+      branchName: String(userBankAccount.branchName || '').trim(),
+      telebirrPhone: String(userBankAccount.telebirrPhone || '').trim(),
+    };
+  }
+
+  if (ministryBanks && typeof ministryBanks === 'object') {
+    db.ministryBanks = {
+      cbeAccount: String(ministryBanks.cbeAccount ?? db.ministryBanks.cbeAccount).trim(),
+      cbeHolder: String(ministryBanks.cbeHolder ?? db.ministryBanks.cbeHolder).trim(),
+      telebirrPhone: String(ministryBanks.telebirrPhone ?? db.ministryBanks.telebirrPhone).trim(),
+      telebirrName: String(ministryBanks.telebirrName ?? db.ministryBanks.telebirrName).trim(),
+      awashAccount: String(ministryBanks.awashAccount ?? db.ministryBanks.awashAccount).trim(),
+      dashenAccount: String(ministryBanks.dashenAccount ?? db.ministryBanks.dashenAccount).trim(),
+      abyssiniaAccount: String(ministryBanks.abyssiniaAccount ?? db.ministryBanks.abyssiniaAccount).trim(),
+    };
+  }
+
+  saveDatabase();
+  res.json({
+    success: true,
+    ministryBanks: db.ministryBanks,
+    userBankAccount: user ? db.userBankAccounts[user.id] || null : db.userBankAccounts['default-member'] || null,
   });
 });
 
 app.post('/api/wallet/give', (req: Request, res: Response) => {
-  const { userId, userName, type, amount, paymentMethod, purposeNote } = req.body;
+  const {
+    userId,
+    userName,
+    type,
+    amount,
+    paymentMethod,
+    purposeNote,
+    bankName,
+    accountNumber,
+    accountHolderName,
+    referenceNumber,
+  } = req.body;
   const numericAmount = Number(amount);
   if (!numericAmount || numericAmount <= 0) {
     res.status(400).json({ error: 'ትክክለኛ የገንዘብ መጠን ያስገቡ።' });
     return;
   }
 
-  const receiptNumber = `QH-${String(type || 'DON').toUpperCase()}-${Date.now().toString().slice(-6)}`;
+  const receiptNumber = `QH-DEP-${Date.now().toString().slice(-6)}`;
   const newTx: WalletTx = {
-    id: `tx-${Date.now().toString().slice(-4)}`,
+    id: `tx-${Date.now().toString().slice(-5)}`,
     userId: userId || 'usr-member',
     userName: userName || 'የንስሐ ልጅ',
-    type: type || 'tithe',
+    type: type || 'deposit',
     amount: numericAmount,
     timestamp: new Date().toISOString().replace('T', ' ').slice(0, 16),
-    paymentMethod: paymentMethod || 'telebirr',
+    paymentMethod: paymentMethod || 'bank_transfer',
     status: 'completed',
     receiptNumber,
-    purposeNote: purposeNote || 'መንፈሳዊ በረከት እና አስራት',
+    purposeNote: purposeNote || 'የባንክ ገቢ / መንፈሳዊ በረከት',
+    bankName: bankName ? String(bankName).trim() : undefined,
+    accountNumber: accountNumber ? String(accountNumber).trim() : undefined,
+    accountHolderName: accountHolderName ? String(accountHolderName).trim() : undefined,
+    referenceNumber: referenceNumber ? String(referenceNumber).trim() : receiptNumber,
   };
 
   db.walletTransactions.unshift(newTx);
@@ -547,6 +797,62 @@ app.post('/api/wallet/give', (req: Request, res: Response) => {
   if (type === 'tithe') db.walletBalance.tithes += numericAmount;
   else if (type === 'charity') db.walletBalance.charity += numericAmount;
   else if (type === 'service_support') db.walletBalance.churchSupport += numericAmount;
+  saveDatabase();
+
+  res.status(201).json({ success: true, transaction: newTx, newBalance: db.walletBalance });
+});
+
+app.post('/api/wallet/withdraw', (req: Request, res: Response) => {
+  const user = getAuthenticatedUser(req);
+  const {
+    userName,
+    amount,
+    bankName,
+    accountNumber,
+    accountHolderName,
+    purposeNote,
+    paymentMethod,
+  } = req.body;
+
+  const numericAmount = Number(amount);
+  if (!numericAmount || numericAmount <= 0) {
+    res.status(400).json({ error: 'ትክክለኛ የሚወጣ የገንዘብ መጠን ያስገቡ።' });
+    return;
+  }
+
+  if (numericAmount > db.walletBalance.totalBalance) {
+    res.status(400).json({
+      error: `በቂ ቀሪ ሂሳብ የለም። አሁን ያለው ቀሪ ሂሳብ ${db.walletBalance.totalBalance.toLocaleString()} ብር ብቻ ነው።`,
+    });
+    return;
+  }
+
+  if (!bankName || !accountNumber || !accountHolderName) {
+    res.status(400).json({ error: 'ለባንክ ወጪ የባንኩን ስም፣ የአካውንት ቁጥር እና የተቀባዩን ሙሉ ስም መሙላት ግዴታ ነው።' });
+    return;
+  }
+
+  const receiptNumber = `QH-WDR-${Date.now().toString().slice(-6)}`;
+  const newTx: WalletTx = {
+    id: `tx-${Date.now().toString().slice(-5)}`,
+    userId: user?.id || 'usr-member',
+    userName: userName || user?.fullName || 'የንስሐ አገልግሎት',
+    type: 'withdrawal',
+    amount: numericAmount,
+    timestamp: new Date().toISOString().replace('T', ' ').slice(0, 16),
+    paymentMethod: paymentMethod || (String(bankName).toLowerCase().includes('telebirr') ? 'telebirr' : 'bank_transfer'),
+    status: 'completed',
+    receiptNumber,
+    purposeNote: purposeNote || `ወደ ${bankName} የተላከ የባንክ ወጪ`,
+    bankName: String(bankName).trim(),
+    accountNumber: String(accountNumber).trim(),
+    accountHolderName: String(accountHolderName).trim(),
+    referenceNumber: receiptNumber,
+  };
+
+  db.walletTransactions.unshift(newTx);
+  db.walletBalance.totalBalance = Math.max(0, db.walletBalance.totalBalance - numericAmount);
+  db.walletBalance.withdrawnTotal = (db.walletBalance.withdrawnTotal || 0) + numericAmount;
   saveDatabase();
 
   res.status(201).json({ success: true, transaction: newTx, newBalance: db.walletBalance });
@@ -815,6 +1121,16 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(__dirname, 'dist');
+    app.get('/sw.js', (_req: Request, res: Response) => {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.type('application/javascript; charset=utf-8');
+      res.sendFile(path.join(distDir, 'sw.js'));
+    });
+    app.get(['/manifest.webmanifest', '/manifest.json'], (_req: Request, res: Response) => {
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.type('application/manifest+json; charset=utf-8');
+      res.sendFile(path.join(distDir, 'manifest.webmanifest'));
+    });
     app.use('/assets', express.static(path.join(distDir, 'assets'), { maxAge: '30d', immutable: true }));
     app.use(express.static(distDir, { maxAge: '1h' }));
     app.use('/api', (_req: Request, res: Response) => {

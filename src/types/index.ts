@@ -47,6 +47,10 @@ export interface WalletTransaction {
   status: 'completed' | 'pending';
   receiptNumber: string;
   purposeNote: string;
+  bankName?: string;
+  accountNumber?: string;
+  accountHolderName?: string;
+  referenceNumber?: string;
 }
 
 export interface WalletState {
@@ -54,6 +58,25 @@ export interface WalletState {
   tithes: number;
   charity: number;
   churchSupport: number;
+  withdrawnTotal?: number;
+}
+
+export interface BankAccountInfo {
+  bankName: string;
+  accountHolderName: string;
+  accountNumber: string;
+  branchName?: string;
+  telebirrPhone?: string;
+}
+
+export interface MinistryBankAccounts {
+  cbeAccount: string;
+  cbeHolder: string;
+  telebirrPhone: string;
+  telebirrName: string;
+  awashAccount: string;
+  dashenAccount: string;
+  abyssiniaAccount: string;
 }
 
 export interface OfflinePrayer {

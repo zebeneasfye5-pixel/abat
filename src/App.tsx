@@ -1,10 +1,36 @@
-import React, { useState, useEffect, Suspense, lazy } from 'react';
+import React, { useState, useEffect, Suspense, lazy, useCallback } from 'react';
 import { Navbar } from './components/Navbar';
 import { HeroSection } from './components/HeroSection';
-import { UserProfile, ConfessionBooking, WalletState, WalletTransaction } from './types';
-import { fetchConfessions, fetchWalletData, fetchCurrentUser, updateConfessionStatus } from './services/api';
+import {
+  UserProfile,
+  ConfessionBooking,
+  WalletState,
+  WalletTransaction,
+  BankAccountInfo,
+  MinistryBankAccounts,
+} from './types';
+import {
+  fetchConfessions,
+  fetchWalletData,
+  fetchCurrentUser,
+  getSavedUserSnapshot,
+  updateConfessionStatus,
+} from './services/api';
 import { usePWAInstall } from './hooks/usePWAInstall';
-import { Shield, Users, Sparkles, Wallet, BookOpen, Flame, WifiOff, Smartphone, Lock, LogIn } from 'lucide-react';
+import {
+  Shield,
+  Users,
+  Sparkles,
+  Wallet,
+  BookOpen,
+  Flame,
+  WifiOff,
+  Smartphone,
+  Lock,
+  LogIn,
+  ArrowLeft,
+  Home,
+} from 'lucide-react';
 
 // Lazy-load secondary views & modals so the initial Home bundle loads fast on mobile networks
 const AssemblyHall = lazy(() => import('./components/AssemblyHall').then((m) => ({ default: m.AssemblyHall })));
@@ -29,6 +55,14 @@ const EMPTY_GUEST_USER: UserProfile = {
   isAuthenticated: false,
 };
 
+const TAB_TITLES: Record<string, string> = {
+  assembly: 'የቀጥታ ዙም ጉባኤ (Zoom Meeting)',
+  'secret-room': 'የንስሐ ሚስጥር ቤት',
+  'ai-advisor': 'የኤአይ መንፈሳዊ ጭንቅላት',
+  wallet: 'መንፈሳዊ ዋሌት እና ባንክ',
+  'offline-books': 'የኦፍላይን ጸሎትና መጻሕፍት',
+};
+
 const TabLoader = () => (
   <div className="max-w-4xl mx-auto px-4 py-16 flex flex-col items-center justify-center text-amber-300 space-y-3">
     <div className="w-8 h-8 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
@@ -38,26 +72,31 @@ const TabLoader = () => (
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>('home');
+  const [tabHistory, setTabHistory] = useState<string[]>(['home']);
   const [isDashboardOpen, setIsDashboardOpen] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isInstallModalOpen, setIsInstallModalOpen] = useState(false);
+  const [installBannerDismissed, setInstallBannerDismissed] = useState(false);
   const [isOnline, setIsOnline] = useState<boolean>(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const [authChecked, setAuthChecked] = useState(false);
 
-  // User starts unauthenticated until verified with real server session
-  const [user, setUser] = useState<UserProfile>(EMPTY_GUEST_USER);
+  // Immediately hydrate saved authenticated user synchronously so closing & reopening NEVER asks to re-register
+  const [user, setUser] = useState<UserProfile>(() => getSavedUserSnapshot() || EMPTY_GUEST_USER);
 
   // Confession bookings
   const [bookings, setBookings] = useState<ConfessionBooking[]>([]);
 
-  // Wallet
+  // Wallet & Bank Accounts
   const [walletState, setWalletState] = useState<WalletState>({
     totalBalance: 0,
     tithes: 0,
     charity: 0,
     churchSupport: 0,
+    withdrawnTotal: 0,
   });
   const [transactions, setTransactions] = useState<WalletTransaction[]>([]);
+  const [ministryBanks, setMinistryBanks] = useState<MinistryBankAccounts | undefined>(undefined);
+  const [userBankAccount, setUserBankAccount] = useState<BankAccountInfo | null>(null);
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
@@ -66,11 +105,7 @@ export default function App() {
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js').catch(() => {});
-    }
-
-    // Verify existing session token from server (never fake auto-login)
+    // Sync/re-hydrate verified user with backend without erasing local session on Render cold restarts
     fetchCurrentUser()
       .then((loggedInUser) => {
         if (loggedInUser) {
@@ -85,35 +120,108 @@ export default function App() {
     };
   }, []);
 
-  // Only load bookings and wallet data when the user is signed in or opens the dashboard/wallet/secret room
+  // Only load bookings and wallet data when the user is signed in
   useEffect(() => {
     if (!user.isAuthenticated) return;
     fetchConfessions().then(setBookings);
     fetchWalletData().then((data) => {
       if (data.balance) setWalletState(data.balance);
       if (data.transactions) setTransactions(data.transactions);
+      if (data.ministryBanks) setMinistryBanks(data.ministryBanks);
+      if (data.userBankAccount !== undefined) setUserBankAccount(data.userBankAccount);
     });
   }, [user.isAuthenticated]);
+
+  // Browser Hardware/Chrome Back Button (`popstate`) Integration
+  useEffect(() => {
+    const onPopState = (event: PopStateEvent) => {
+      // Close open overlays first before popping main tab
+      if (isDashboardOpen) {
+        setIsDashboardOpen(false);
+        return;
+      }
+      if (isAuthModalOpen) {
+        setIsAuthModalOpen(false);
+        return;
+      }
+      if (isInstallModalOpen) {
+        setIsInstallModalOpen(false);
+        return;
+      }
+      const targetTab = event.state?.tab;
+      if (targetTab && typeof targetTab === 'string') {
+        setActiveTab(targetTab);
+        setTabHistory((prev) => (prev.length > 1 ? prev.slice(0, -1) : ['home']));
+      } else {
+        setActiveTab('home');
+        setTabHistory(['home']);
+      }
+    };
+
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [isDashboardOpen, isAuthModalOpen, isInstallModalOpen]);
 
   const handleUpdateUser = (updated: UserProfile) => {
     setUser(updated);
   };
 
+  const navigateToTab = useCallback(
+    (tab: string) => {
+      if (tab === activeTab) return;
+      setTabHistory((prev) => [...prev, tab]);
+      setActiveTab(tab);
+      try {
+        window.history.pushState({ tab }, '', `#${tab}`);
+      } catch {}
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    },
+    [activeTab]
+  );
+
   const handleNavigate = (tab: string) => {
     const protectedTabs = ['assembly', 'secret-room', 'wallet'];
     if (protectedTabs.includes(tab) && !user.isAuthenticated) {
-      setActiveTab(tab);
+      navigateToTab(tab);
       setIsAuthModalOpen(true);
       return;
     }
-    setActiveTab(tab);
+    navigateToTab(tab);
   };
+
+  const handleGoBack = useCallback(() => {
+    if (isDashboardOpen) {
+      setIsDashboardOpen(false);
+      return;
+    }
+    if (isAuthModalOpen) {
+      setIsAuthModalOpen(false);
+      return;
+    }
+    if (isInstallModalOpen) {
+      setIsInstallModalOpen(false);
+      return;
+    }
+    if (tabHistory.length > 1) {
+      const nextHistory = tabHistory.slice(0, -1);
+      const prevTab = nextHistory[nextHistory.length - 1] || 'home';
+      setTabHistory(nextHistory);
+      setActiveTab(prevTab);
+    } else {
+      setTabHistory(['home']);
+      setActiveTab('home');
+    }
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [isDashboardOpen, isAuthModalOpen, isInstallModalOpen, tabHistory]);
 
   const handleOpenDashboard = () => {
     if (!user.isAuthenticated) {
       setIsAuthModalOpen(true);
       return;
     }
+    try {
+      window.history.pushState({ tab: activeTab, modal: 'dashboard' }, '');
+    } catch {}
     setIsDashboardOpen(true);
   };
 
@@ -129,7 +237,20 @@ export default function App() {
     setWalletState(newBal);
   };
 
-  const { isInstalled } = usePWAInstall();
+  const handleBankConfigUpdated = (mBanks: MinistryBankAccounts, uBank: BankAccountInfo | null) => {
+    setMinistryBanks(mBanks);
+    setUserBankAccount(uBank);
+  };
+
+  const { isInstalled, isInstallable, install } = usePWAInstall();
+
+  const handleQuickInstall = async () => {
+    if (isInstallable) {
+      const outcome = await install();
+      if (outcome === 'accepted') return;
+    }
+    setIsInstallModalOpen(true);
+  };
 
   const renderAuthGate = (title: string) => (
     <div className="max-w-xl mx-auto px-4 py-16">
@@ -141,13 +262,22 @@ export default function App() {
         <p className="text-xs text-stone-300 leading-relaxed">
           እያንዳንዱ ተጠቃሚ በራሱ ስም እና ማንነት እንዲገባ በቅድሚያ ወደ አካውንትዎ ይግቡ ወይም አዲስ ይመዝገቡ።
         </p>
-        <button
-          onClick={() => setIsAuthModalOpen(true)}
-          className="px-6 py-3 rounded-xl bg-gradient-to-r from-red-900 via-amber-900 to-red-900 border border-amber-500/60 text-white font-bold text-sm inline-flex items-center gap-2 hover:scale-[1.02] transition"
-        >
-          <LogIn className="w-4 h-4" />
-          <span>ግባ / አዲስ ተመዝገብ (Sign In / Sign Up)</span>
-        </button>
+        <div className="flex flex-wrap justify-center gap-3">
+          <button
+            onClick={() => setIsAuthModalOpen(true)}
+            className="px-6 py-3 rounded-xl bg-gradient-to-r from-red-900 via-amber-900 to-red-900 border border-amber-500/60 text-white font-bold text-sm inline-flex items-center gap-2 hover:scale-[1.02] transition"
+          >
+            <LogIn className="w-4 h-4" />
+            <span>ግባ / አዲስ ተመዝገብ</span>
+          </button>
+          <button
+            onClick={handleGoBack}
+            className="px-5 py-3 rounded-xl bg-stone-900 border border-stone-700 text-stone-200 font-bold text-sm inline-flex items-center gap-2 hover:bg-stone-800 transition"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            <span>ወደ ኋላ ተመለስ</span>
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -170,20 +300,60 @@ export default function App() {
         onOpenDashboard={handleOpenDashboard}
         onOpenInstall={() => setIsInstallModalOpen(true)}
         isOnline={isOnline}
+        canGoBack={activeTab !== 'home'}
+        onGoBack={handleGoBack}
       />
 
-      {!isInstalled && (
-        <div className="sm:hidden bg-gradient-to-r from-red-950 via-stone-900 to-amber-950 border-b border-amber-800/40 px-4 py-2 flex items-center justify-between text-xs">
-          <div className="flex items-center gap-2 text-stone-200">
-            <Smartphone className="w-4 h-4 text-amber-400 shrink-0" />
-            <span className="font-semibold text-[11px]">ቀሲስ ሄኖክ አፕን ወደ ስልክ ጫን</span>
+      {/* Sticky In-App Back Bar whenever user enters ANY sub-page */}
+      {activeTab !== 'home' && (
+        <div className="sticky top-16 sm:top-18 z-30 bg-stone-900/95 backdrop-blur-md border-b border-amber-800/30 px-3 sm:px-6 py-2">
+          <div className="max-w-7xl mx-auto flex items-center justify-between gap-2">
+            <button
+              onClick={handleGoBack}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-950/80 hover:bg-amber-900 border border-amber-600/50 text-amber-200 text-xs font-bold transition shadow-sm"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>ወደ ኋላ ተመለስ (Back)</span>
+            </button>
+
+            <span className="text-xs font-heading font-semibold text-amber-300 truncate">
+              {TAB_TITLES[activeTab] || ''}
+            </span>
+
+            <button
+              onClick={() => navigateToTab('home')}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-stone-950 hover:bg-stone-800 border border-stone-700 text-stone-300 text-xs font-medium transition shrink-0"
+              title="ወደ ዋና መነሻ"
+            >
+              <Home className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline">ዋና መነሻ</span>
+            </button>
           </div>
-          <button
-            onClick={() => setIsInstallModalOpen(true)}
-            className="px-2.5 py-1 rounded-md bg-amber-500 hover:bg-amber-400 text-stone-950 font-bold text-[11px] shadow transition"
-          >
-            አሁን ጫን
-          </button>
+        </div>
+      )}
+
+      {!isInstalled && !installBannerDismissed && activeTab === 'home' && (
+        <div className="sm:hidden bg-gradient-to-r from-red-950 via-stone-900 to-amber-950 border-b border-amber-800/40 px-3 py-2 flex items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-2 text-stone-200 min-w-0">
+            <img src="/pwa-192x192.png" alt="ቀሲስ ሄኖክ" className="w-6 h-6 rounded-md border border-amber-500/50 shrink-0" />
+            <span className="font-semibold text-[11px] truncate">ቀሲስ ሄኖክ አፕን ወደ ስልክ ጫን</span>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              onClick={handleQuickInstall}
+              className="px-2.5 py-1 rounded-md bg-amber-500 hover:bg-amber-400 text-stone-950 font-bold text-[11px] shadow transition inline-flex items-center gap-1"
+            >
+              <Smartphone className="w-3 h-3" />
+              <span>{isInstallable ? 'አሁን ጫን' : 'መጫኛ'}</span>
+            </button>
+            <button
+              onClick={() => setInstallBannerDismissed(true)}
+              aria-label="Dismiss install banner"
+              className="p-1 text-stone-400 hover:text-stone-200 text-xs leading-none"
+            >
+              ✕
+            </button>
+          </div>
         </div>
       )}
 
@@ -255,7 +425,7 @@ export default function App() {
         <Suspense fallback={<TabLoader />}>
           {activeTab === 'assembly' &&
             (user.isAuthenticated ? (
-              <AssemblyHall user={user} onLeaveMeeting={() => setActiveTab('home')} />
+              <AssemblyHall user={user} onLeaveMeeting={handleGoBack} />
             ) : authChecked ? (
               renderAuthGate('ወደ ቀጥታ የዙም ጉባኤ ለመግባት ይግቡ')
             ) : <TabLoader />)}
@@ -279,7 +449,10 @@ export default function App() {
                 user={user}
                 walletState={walletState}
                 transactions={transactions}
+                ministryBanks={ministryBanks}
+                userBankAccount={userBankAccount}
                 onGivingSuccess={handleGivingSuccess}
+                onBankConfigUpdated={handleBankConfigUpdated}
               />
             ) : authChecked ? (
               renderAuthGate('መንፈሳዊ ዋሌት ለመጠቀም ይግቡ')

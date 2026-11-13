@@ -1,5 +1,5 @@
 import React from 'react';
-import { Shield, Sparkles, Smartphone, Menu, User, Flame, Wifi, WifiOff } from 'lucide-react';
+import { Shield, Sparkles, Smartphone, Menu, User, Flame, Wifi, WifiOff, ArrowLeft } from 'lucide-react';
 import { UserProfile } from '../types';
 
 interface NavbarProps {
@@ -10,6 +10,8 @@ interface NavbarProps {
   onOpenDashboard: () => void;
   onOpenInstall: () => void;
   isOnline: boolean;
+  canGoBack?: boolean;
+  onGoBack?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -20,14 +22,26 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenDashboard,
   onOpenInstall,
   isOnline,
+  canGoBack,
+  onGoBack,
 }) => {
   return (
     <header className="sticky top-0 z-40 bg-stone-950/90 backdrop-blur-md border-b border-amber-900/30 transition-all">
       <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8">
         <div className="flex items-center justify-between h-16 sm:h-18 gap-2 sm:gap-4">
           
-          {/* Zone 1: Brand Wordmark with 3-bars Dashboard trigger */}
-          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+          {/* Zone 1: Brand Wordmark with Back + 3-bars Dashboard trigger */}
+          <div className="flex items-center gap-1.5 sm:gap-3 min-w-0">
+            {canGoBack && onGoBack && (
+              <button
+                onClick={onGoBack}
+                title="ወደ ኋላ ተመለስ (Back)"
+                className="p-2 shrink-0 rounded-lg bg-amber-950/70 border border-amber-600/50 text-amber-200 hover:bg-amber-900 hover:text-white transition-colors"
+              >
+                <ArrowLeft className="w-4 h-4 sm:w-5 sm:h-5" />
+              </button>
+            )}
+
             {/* 3-Horizontal Bars (የ3 ሰረዞች ምልክት - Super Dashboard) */}
             <button
               onClick={onOpenDashboard}

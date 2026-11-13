@@ -149,7 +149,12 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      className="fixed inset-0 z-50 overflow-y-auto bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+    >
       <div className="w-full max-w-lg rounded-3xl bg-stone-950 border-2 border-amber-700/50 shadow-2xl p-6 sm:p-8 space-y-5 animate-scale-up relative">
         
         <button

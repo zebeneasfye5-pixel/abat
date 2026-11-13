@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, Users, Calendar, Mic, Wallet, Shield, KeyRound, User, Save } from 'lucide-react';
+import { X, ArrowLeft, Users, Calendar, Mic, Wallet, Shield, KeyRound, User, Save } from 'lucide-react';
 import { ConfessionBooking, WalletState, WalletTransaction, UserProfile, UserRole } from '../types';
 import { fetchRegisteredUsers, updateUserProfile } from '../services/api';
 
@@ -79,22 +79,32 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 overflow-hidden bg-black/80 backdrop-blur-sm flex justify-end">
+    <div
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      className="fixed inset-0 z-50 overflow-hidden bg-black/80 backdrop-blur-sm flex justify-end"
+    >
       
       {/* Sliding Drawer Container */}
       <div className="w-full max-w-3xl bg-stone-950 border-l border-amber-800/40 h-full flex flex-col shadow-2xl animate-slide-left">
         
         {/* Drawer Header */}
-        <div className="p-5 border-b border-stone-800 bg-gradient-to-r from-stone-950 via-red-950/30 to-amber-950/30 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-amber-950/80 border border-amber-600/50 flex items-center justify-center text-amber-300 font-bold text-lg">
-              ☰
-            </div>
-            <div>
-              <h2 className="text-lg font-heading font-bold text-amber-100">
-                የጀርባው ሙሉ መቆጣጠሪያ ዳሽቦርድ (Master Control)
+        <div className="p-4 sm:p-5 border-b border-stone-800 bg-gradient-to-r from-stone-950 via-red-950/30 to-amber-950/30 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+            <button
+              onClick={onClose}
+              className="flex items-center gap-1.5 px-2.5 py-2 rounded-xl bg-stone-900 hover:bg-amber-950/70 border border-amber-700/50 text-amber-200 text-xs font-bold shrink-0 transition"
+              title="ወደ ኋላ ተመለስ"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <span>ተመለስ</span>
+            </button>
+            <div className="min-w-0">
+              <h2 className="text-base sm:text-lg font-heading font-bold text-amber-100 truncate">
+                የጀርባው ሙሉ መቆጣጠሪያ ዳሽቦርድ
               </h2>
-              <p className="text-xs text-stone-400">
+              <p className="text-[11px] text-stone-400 truncate">
                 የተጠቃሚ ፕሮፋይል፣ የገንዘብ ዋሌት፣ የንስሐ ልጆችና የስርዓቱ መቆጣጠሪያ
               </p>
             </div>
@@ -102,7 +112,8 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
 
           <button
             onClick={onClose}
-            className="p-2 rounded-lg bg-stone-900 hover:bg-stone-800 text-stone-400 hover:text-stone-100 transition"
+            aria-label="ዝጋ"
+            className="p-2 rounded-lg bg-stone-900 hover:bg-stone-800 text-stone-400 hover:text-stone-100 shrink-0 transition"
           >
             <X className="w-5 h-5" />
           </button>
@@ -407,15 +418,22 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
               <div className="space-y-2">
                 <p className="text-xs font-semibold text-stone-300">የቅርብ ጊዜ ዝውውሮች፡</p>
                 <div className="divide-y divide-stone-800 border border-stone-800 rounded-xl bg-stone-900/40 text-xs">
-                  {transactions.slice(0, 5).map((t) => (
-                    <div key={t.id} className="p-3 flex justify-between items-center">
-                      <div>
-                        <span className="font-semibold text-stone-200">{t.userName}</span>
-                        <span className="text-stone-400 text-[11px] block">{t.purposeNote}</span>
+                  {transactions.slice(0, 8).map((t) => {
+                    const isWithdrawal = t.type === 'withdrawal';
+                    return (
+                      <div key={t.id} className="p-3 flex justify-between items-center">
+                        <div>
+                          <span className="font-semibold text-stone-200">{t.userName}</span>
+                          <span className="text-stone-400 text-[11px] block">
+                            {t.purposeNote} {t.bankName ? `· ${t.bankName}` : ''}
+                          </span>
+                        </div>
+                        <span className={`font-mono font-bold ${isWithdrawal ? 'text-red-400' : 'text-emerald-400'}`}>
+                          {isWithdrawal ? '-' : '+'}{t.amount.toLocaleString()} ብር
+                        </span>
                       </div>
-                      <span className="font-mono text-amber-300">+{t.amount.toLocaleString()} ብር</span>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </div>

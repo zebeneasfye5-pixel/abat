@@ -159,19 +159,19 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
           <X className="w-5 h-5" />
         </button>
 
-        <div className="flex items-center gap-3">
-          <div className="w-12 h-12 rounded-2xl bg-amber-950/80 border border-amber-500/50 flex items-center justify-center text-amber-300 font-bold">
-            <Flame className="w-6 h-6 animate-candle text-amber-400" />
+        <div className="flex items-center gap-3 pr-10">
+          <div className="w-11 h-11 shrink-0 rounded-2xl bg-amber-950/80 border border-amber-500/50 flex items-center justify-center text-amber-300 font-bold">
+            <Flame className="w-5 h-5 animate-candle text-amber-400" />
           </div>
-          <div>
-            <h2 className="text-xl font-heading font-bold text-amber-100">
+          <div className="min-w-0">
+            <h2 className="text-lg sm:text-xl font-heading font-bold text-amber-100 leading-snug">
               {mode === 'profile'
                 ? 'የተጠቃሚ መንፈሳዊ ፕሮፋይል'
                 : mode === 'signin'
-                ? 'ወደ አካውንትዎ ይግቡ (Sign In)'
-                : 'አዲስ አካውንት ይፍጠሩ (Sign Up)'}
+                ? 'ወደ አካውንትዎ ይግቡ'
+                : 'አዲስ አካውንት ይፍጠሩ'}
             </h2>
-            <p className="text-xs text-stone-400">ቀሲስ ሄኖክ - የንስሐና የጉባኤ አገልግሎት</p>
+            <p className="text-xs text-stone-400 truncate">ቀሲስ ሄኖክ - የንስሐና የጉባኤ አገልግሎት</p>
           </div>
         </div>
 

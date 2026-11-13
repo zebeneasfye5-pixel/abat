@@ -814,9 +814,15 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
+    const distDir = path.resolve(__dirname, 'dist');
+    app.use('/assets', express.static(path.join(distDir, 'assets'), { maxAge: '30d', immutable: true }));
+    app.use(express.static(distDir, { maxAge: '1h' }));
+    app.use('/api', (_req: Request, res: Response) => {
+      res.status(404).json({ error: 'API endpoint not found' });
+    });
     app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+      res.setHeader('Cache-Control', 'no-cache');
+      res.sendFile(path.join(distDir, 'index.html'));
     });
   }
 

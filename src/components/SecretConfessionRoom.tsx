@@ -4,6 +4,7 @@ import confetti from 'canvas-confetti';
 import { UserProfile, ConfessionBooking } from '../types';
 import { fetchWebRTCConfig, verifySecretRoomPasscode, getRealtimeWsUrl } from '../services/api';
 import { playChurchBell, speakBlessingPrayer } from '../utils/audio';
+import sacredSanctuaryImg from '../assets/images/sacred_confession_sanctuary_1794468348510.jpg';
 
 interface SecretConfessionRoomProps {
   user: UserProfile;
@@ -534,9 +535,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
             {!remoteUserConnected && (
               <div className="relative w-full h-full">
                 <img
-                  src="/src/assets/images/sacred_confession_sanctuary_1794468348510.jpg"
+                  src={sacredSanctuaryImg}
                   alt="የንስሐ ሚስጥር ቤት"
-                  referrerPolicy="no-referrer"
+                  decoding="async"
                   className="w-full h-full object-cover filter brightness-50"
                 />
                 <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center space-y-2">

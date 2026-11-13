@@ -1,5 +1,6 @@
 import React from 'react';
 import { Shield, Users, Sparkles, BookOpen, HeartHandshake, CheckCircle2 } from 'lucide-react';
+import priestHeroImg from '../assets/images/priest_blessing_hero_1794468346711.jpg';
 
 interface HeroSectionProps {
   onNavigate: (tab: string) => void;
@@ -16,7 +17,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({ onNavigate }) => {
           {/* Column 1: Headings & Direct CTAs (Zero long description paragraphs) */}
           <div className="lg:col-span-7 space-y-6">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-950/60 border border-amber-700/40 text-amber-300 text-xs font-medium">
-              <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+              <span className="w-2 h-2 rounded-full bg-amber-400" />
               <span>ቀሲስ ሄኖክ — ይፋዊ የመንፈሳዊ አገልግሎት መድረክ</span>
             </div>
 
@@ -75,9 +76,9 @@ export const HeroSection: React.FC<HeroSectionProps> = ({ onNavigate }) => {
           <div className="lg:col-span-5 relative">
             <div className="relative rounded-2xl overflow-hidden border-2 border-amber-600/40 shadow-2xl bg-stone-900 group">
               <img
-                src="/src/assets/images/priest_blessing_hero_1794468346711.jpg"
+                src={priestHeroImg}
                 alt="ቀሲስ ሄኖክ በመስቀል ሲባርኩ"
-                referrerPolicy="no-referrer"
+                decoding="async"
                 className="w-full h-[380px] sm:h-[460px] object-cover object-top filter brightness-95 group-hover:scale-102 transition-transform duration-700"
               />
               <div className="absolute inset-0 bg-gradient-to-t from-stone-950 via-stone-950/20 to-transparent" />

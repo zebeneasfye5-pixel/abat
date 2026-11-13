@@ -1,4 +1,4 @@
-const CACHE_NAME = 'qesis-henok-cache-v1';
+const CACHE_NAME = 'qesis-henok-cache-v2';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
@@ -31,12 +31,21 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  // Pass non-GET or API calls to network with offline fallback
   if (event.request.method !== 'GET') {
     return;
   }
 
-  // Network-first with cache fallback strategy
+  const url = new URL(event.request.url);
+  // Never intercept or cache API calls, WebSockets, or third-party requests
+  if (
+    url.origin !== self.location.origin ||
+    url.pathname.startsWith('/api/') ||
+    url.pathname.startsWith('/ws/')
+  ) {
+    return;
+  }
+
+  // Network-first with cache fallback for same-origin static assets & pages
   event.respondWith(
     fetch(event.request)
       .then((networkResponse) => {
@@ -53,7 +62,6 @@ self.addEventListener('fetch', (event) => {
         if (cachedResponse) {
           return cachedResponse;
         }
-        // Fallback to cached index.html for navigation requests
         if (event.request.mode === 'navigate') {
           return caches.match('/index.html');
         }

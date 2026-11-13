@@ -1,18 +1,20 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
 import { Navbar } from './components/Navbar';
 import { HeroSection } from './components/HeroSection';
-import { AssemblyHall } from './components/AssemblyHall';
-import { SecretConfessionRoom } from './components/SecretConfessionRoom';
-import { SpiritualAIAdvisor } from './components/SpiritualAIAdvisor';
-import { SpiritualWallet } from './components/SpiritualWallet';
-import { OfflineLibrary } from './components/OfflineLibrary';
-import { SuperDashboardDrawer } from './components/SuperDashboardDrawer';
-import { AuthProfileModal } from './components/AuthProfileModal';
-import { PWAInstallModal } from './components/PWAInstallModal';
 import { UserProfile, ConfessionBooking, WalletState, WalletTransaction } from './types';
 import { fetchConfessions, fetchWalletData, fetchCurrentUser, updateConfessionStatus } from './services/api';
 import { usePWAInstall } from './hooks/usePWAInstall';
 import { Shield, Users, Sparkles, Wallet, BookOpen, Flame, WifiOff, Smartphone, Lock, LogIn } from 'lucide-react';
+
+// Lazy-load secondary views & modals so the initial Home bundle loads fast on mobile networks
+const AssemblyHall = lazy(() => import('./components/AssemblyHall').then((m) => ({ default: m.AssemblyHall })));
+const SecretConfessionRoom = lazy(() => import('./components/SecretConfessionRoom').then((m) => ({ default: m.SecretConfessionRoom })));
+const SpiritualAIAdvisor = lazy(() => import('./components/SpiritualAIAdvisor').then((m) => ({ default: m.SpiritualAIAdvisor })));
+const SpiritualWallet = lazy(() => import('./components/SpiritualWallet').then((m) => ({ default: m.SpiritualWallet })));
+const OfflineLibrary = lazy(() => import('./components/OfflineLibrary').then((m) => ({ default: m.OfflineLibrary })));
+const SuperDashboardDrawer = lazy(() => import('./components/SuperDashboardDrawer').then((m) => ({ default: m.SuperDashboardDrawer })));
+const AuthProfileModal = lazy(() => import('./components/AuthProfileModal').then((m) => ({ default: m.AuthProfileModal })));
+const PWAInstallModal = lazy(() => import('./components/PWAInstallModal').then((m) => ({ default: m.PWAInstallModal })));
 
 const EMPTY_GUEST_USER: UserProfile = {
   id: '',
@@ -26,6 +28,13 @@ const EMPTY_GUEST_USER: UserProfile = {
   avatarSeed: '',
   isAuthenticated: false,
 };
+
+const TabLoader = () => (
+  <div className="max-w-4xl mx-auto px-4 py-16 flex flex-col items-center justify-center text-amber-300 space-y-3">
+    <div className="w-8 h-8 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+    <p className="text-xs text-stone-400">በመክፈት ላይ...</p>
+  </div>
+);
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>('home');
@@ -70,17 +79,21 @@ export default function App() {
       })
       .finally(() => setAuthChecked(true));
 
-    fetchConfessions().then(setBookings);
-    fetchWalletData().then((data) => {
-      if (data.balance) setWalletState(data.balance);
-      if (data.transactions) setTransactions(data.transactions);
-    });
-
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
+
+  // Only load bookings and wallet data when the user is signed in or opens the dashboard/wallet/secret room
+  useEffect(() => {
+    if (!user.isAuthenticated) return;
+    fetchConfessions().then(setBookings);
+    fetchWalletData().then((data) => {
+      if (data.balance) setWalletState(data.balance);
+      if (data.transactions) setTransactions(data.transactions);
+    });
+  }, [user.isAuthenticated]);
 
   const handleUpdateUser = (updated: UserProfile) => {
     setUser(updated);
@@ -239,39 +252,41 @@ export default function App() {
           </>
         )}
 
-        {activeTab === 'assembly' &&
-          (user.isAuthenticated ? (
-            <AssemblyHall user={user} onLeaveMeeting={() => setActiveTab('home')} />
-          ) : authChecked ? (
-            renderAuthGate('ወደ ቀጥታ የዙም ጉባኤ ለመግባት ይግቡ')
-          ) : null)}
+        <Suspense fallback={<TabLoader />}>
+          {activeTab === 'assembly' &&
+            (user.isAuthenticated ? (
+              <AssemblyHall user={user} onLeaveMeeting={() => setActiveTab('home')} />
+            ) : authChecked ? (
+              renderAuthGate('ወደ ቀጥታ የዙም ጉባኤ ለመግባት ይግቡ')
+            ) : <TabLoader />)}
 
-        {activeTab === 'secret-room' &&
-          (user.isAuthenticated ? (
-            <SecretConfessionRoom
-              user={user}
-              bookings={bookings}
-              onCompleteConfession={(id) => handleUpdateBookingStatus(id, 'completed')}
-            />
-          ) : authChecked ? (
-            renderAuthGate('ወደ ንስሐ ሚስጥር ቤት ለመግባት ይግቡ')
-          ) : null)}
+          {activeTab === 'secret-room' &&
+            (user.isAuthenticated ? (
+              <SecretConfessionRoom
+                user={user}
+                bookings={bookings}
+                onCompleteConfession={(id) => handleUpdateBookingStatus(id, 'completed')}
+              />
+            ) : authChecked ? (
+              renderAuthGate('ወደ ንስሐ ሚስጥር ቤት ለመግባት ይግቡ')
+            ) : <TabLoader />)}
 
-        {activeTab === 'ai-advisor' && <SpiritualAIAdvisor user={user} />}
+          {activeTab === 'ai-advisor' && <SpiritualAIAdvisor user={user} />}
 
-        {activeTab === 'wallet' &&
-          (user.isAuthenticated ? (
-            <SpiritualWallet
-              user={user}
-              walletState={walletState}
-              transactions={transactions}
-              onGivingSuccess={handleGivingSuccess}
-            />
-          ) : authChecked ? (
-            renderAuthGate('መንፈሳዊ ዋሌት ለመጠቀም ይግቡ')
-          ) : null)}
+          {activeTab === 'wallet' &&
+            (user.isAuthenticated ? (
+              <SpiritualWallet
+                user={user}
+                walletState={walletState}
+                transactions={transactions}
+                onGivingSuccess={handleGivingSuccess}
+              />
+            ) : authChecked ? (
+              renderAuthGate('መንፈሳዊ ዋሌት ለመጠቀም ይግቡ')
+            ) : <TabLoader />)}
 
-        {activeTab === 'offline-books' && <OfflineLibrary />}
+          {activeTab === 'offline-books' && <OfflineLibrary />}
+        </Suspense>
       </main>
 
       <div className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-stone-950/95 backdrop-blur-md border-t border-amber-900/30 px-3 py-2 flex items-center justify-around text-[10px]">
@@ -337,29 +352,37 @@ export default function App() {
         </p>
       </footer>
 
-      <SuperDashboardDrawer
-        isOpen={isDashboardOpen}
-        onClose={() => setIsDashboardOpen(false)}
-        bookings={bookings}
-        onUpdateBookingStatus={handleUpdateBookingStatus}
-        walletState={walletState}
-        transactions={transactions}
-        currentUser={user}
-        onUpdateUser={handleUpdateUser}
-        onOpenAuthModal={() => setIsAuthModalOpen(true)}
-      />
+      <Suspense fallback={null}>
+        {isDashboardOpen && (
+          <SuperDashboardDrawer
+            isOpen={isDashboardOpen}
+            onClose={() => setIsDashboardOpen(false)}
+            bookings={bookings}
+            onUpdateBookingStatus={handleUpdateBookingStatus}
+            walletState={walletState}
+            transactions={transactions}
+            currentUser={user}
+            onUpdateUser={handleUpdateUser}
+            onOpenAuthModal={() => setIsAuthModalOpen(true)}
+          />
+        )}
 
-      <AuthProfileModal
-        isOpen={isAuthModalOpen}
-        onClose={() => setIsAuthModalOpen(false)}
-        currentUser={user}
-        onUpdateUser={handleUpdateUser}
-      />
+        {isAuthModalOpen && (
+          <AuthProfileModal
+            isOpen={isAuthModalOpen}
+            onClose={() => setIsAuthModalOpen(false)}
+            currentUser={user}
+            onUpdateUser={handleUpdateUser}
+          />
+        )}
 
-      <PWAInstallModal
-        isOpen={isInstallModalOpen}
-        onClose={() => setIsInstallModalOpen(false)}
-      />
+        {isInstallModalOpen && (
+          <PWAInstallModal
+            isOpen={isInstallModalOpen}
+            onClose={() => setIsInstallModalOpen(false)}
+          />
+        )}
+      </Suspense>
 
     </div>
   );

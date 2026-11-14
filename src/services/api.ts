@@ -5,6 +5,8 @@ import {
   UserProfile,
   BankAccountInfo,
   MinistryBankAccounts,
+  CommunityEngagement,
+  PhoneContactRecord,
 } from '../types';
 
 const AUTH_TOKEN_KEY = 'qh_auth_token';
@@ -286,7 +288,103 @@ export async function fetchRegisteredUsers(): Promise<UserProfile[]> {
   }
 }
 
-// --- 2. REAL GEMINI AI SPIRITUAL COUNSEL & SCRIPTURE SEARCH ---
+// --- 2. REAL GEMINI AI SPIRITUAL COUNSEL & ORTHODOX SEARCH (STREAMING + FAST CACHE) ---
+async function readSseStream(
+  path: string,
+  body: object,
+  onChunk: (accumulatedText: string) => void,
+  signal?: AbortSignal
+): Promise<string> {
+  const res = await fetch(apiUrl(path), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = `የኤአይ ሰርቨር ስህተት (${res.status})`;
+    try {
+      const parsed = JSON.parse(text);
+      msg = parsed.message || parsed.error || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('text/event-stream') || !res.body) {
+    const json = await res.json();
+    const full = json.reply || json.result || '';
+    onChunk(full);
+    return full;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let accumulated = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split('\n\n');
+    buffer = events.pop() || '';
+
+    for (const evt of events) {
+      for (const line of evt.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const raw = line.slice(5).trim();
+        if (!raw) continue;
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed.error) throw new Error(parsed.error);
+          if (parsed.chunk) {
+            accumulated += parsed.chunk;
+            onChunk(accumulated);
+          }
+        } catch (err: any) {
+          if (err instanceof Error && err.message && !err.message.includes('JSON')) {
+            throw err;
+          }
+        }
+      }
+    }
+  }
+
+  return accumulated;
+}
+
+export async function streamSpiritualCounsel(
+  prompt: string,
+  topic: string,
+  baptismalName: string | undefined,
+  onChunk: (accumulatedText: string) => void,
+  signal?: AbortSignal
+): Promise<string> {
+  return readSseStream(
+    '/api/gemini/spiritual-counsel-stream',
+    { prompt, topic, baptismalName },
+    onChunk,
+    signal
+  );
+}
+
+export async function streamOrthodoxSearch(
+  query: string,
+  category: string,
+  onChunk: (accumulatedText: string) => void,
+  signal?: AbortSignal
+): Promise<string> {
+  return readSseStream(
+    '/api/gemini/scripture-search-stream',
+    { query, category },
+    onChunk,
+    signal
+  );
+}
+
 export async function askSpiritualCounsel(prompt: string, topic?: string, baptismalName?: string): Promise<string> {
   const data = await safeFetchJson<{ reply: string }>(
     '/api/gemini/spiritual-counsel',
@@ -300,25 +398,93 @@ export async function askSpiritualCounsel(prompt: string, topic?: string, baptis
   return data.reply;
 }
 
-export async function searchScripture(query: string): Promise<string> {
+export async function searchScripture(query: string, category?: string): Promise<string> {
   const data = await safeFetchJson<{ result: string }>(
     '/api/gemini/scripture-search',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query }),
+      body: JSON.stringify({ query, category }),
     },
     35000
   );
   return data.result;
 }
 
-// --- 3. WEBRTC ICE / TURN CONFIG ---
-export async function fetchWebRTCConfig(): Promise<RTCConfiguration> {
+// --- 2B. COMMUNITY ENGAGEMENT (LIKE, SHARE & PHONE CONTACTS) ---
+export async function fetchCommunityEngagement(): Promise<CommunityEngagement> {
   try {
-    const data = await safeFetchJson<{ iceServers: RTCIceServer[] }>('/api/webrtc-config', {}, 10000);
+    return await safeFetchJson<CommunityEngagement>('/api/community/engagement', {}, 8000);
+  } catch {
+    return { likesCount: 0, sharesCount: 0, contactsCount: 0 };
+  }
+}
+
+export async function toggleWebsiteLike(action: 'like' | 'unlike'): Promise<CommunityEngagement> {
+  return safeFetchJson<CommunityEngagement>('/api/community/like', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action }),
+  });
+}
+
+export async function recordWebsiteShare(): Promise<CommunityEngagement> {
+  return safeFetchJson<CommunityEngagement>('/api/community/share', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+export async function fetchSavedContacts(): Promise<PhoneContactRecord[]> {
+  try {
+    const data = await safeFetchJson<{ contacts: PhoneContactRecord[] }>('/api/community/contacts', {}, 10000);
+    return data.contacts || [];
+  } catch {
+    return [];
+  }
+}
+
+export async function addPhoneContacts(
+  contacts: Array<{ name: string; phone: string; note?: string }>,
+  addedBy?: string
+): Promise<{ addedCount: number; contacts: PhoneContactRecord[] }> {
+  const token = getAuthToken();
+  return safeFetchJson<{ addedCount: number; contacts: PhoneContactRecord[] }>('/api/community/contacts', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ contacts, addedBy }),
+  });
+}
+
+export async function deleteSavedContact(id: string): Promise<PhoneContactRecord[]> {
+  const data = await safeFetchJson<{ contacts: PhoneContactRecord[] }>(`/api/community/contacts/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+  return data.contacts || [];
+}
+
+// --- 3. WEBRTC ICE / TURN / LIVEKIT SFU CONFIG ---
+export interface ExtendedRTCConfig extends RTCConfiguration {
+  sfuConfigured?: boolean;
+  livekitUrl?: string | null;
+}
+
+export async function fetchWebRTCConfig(): Promise<ExtendedRTCConfig> {
+  try {
+    const data = await safeFetchJson<{
+      iceServers: RTCIceServer[];
+      sfuConfigured?: boolean;
+      livekitUrl?: string | null;
+    }>('/api/webrtc-config', {}, 10000);
     if (Array.isArray(data.iceServers)) {
-      return { iceServers: data.iceServers };
+      return {
+        iceServers: data.iceServers,
+        sfuConfigured: Boolean(data.sfuConfigured),
+        livekitUrl: data.livekitUrl || null,
+      };
     }
   } catch {}
   return {
@@ -327,7 +493,22 @@ export async function fetchWebRTCConfig(): Promise<RTCConfiguration> {
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun2.l.google.com:19302' },
     ],
+    sfuConfigured: false,
+    livekitUrl: null,
   };
+}
+
+export async function fetchLiveKitToken(
+  roomId: string,
+  userId: string,
+  userName: string,
+  canPublish: boolean
+): Promise<{ sfuConfigured: boolean; url?: string; token?: string }> {
+  return safeFetchJson('/api/livekit/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roomId, userId, userName, canPublish }),
+  });
 }
 
 // --- 4. CONFESSIONS & SECRET ROOM API ---

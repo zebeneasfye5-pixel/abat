@@ -3,17 +3,37 @@
 
 @layer base {
   :root {
-    --font-amharic: 'Noto Sans Ethiopic', 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
-    --font-heading: 'Cinzel', 'Noto Sans Ethiopic', serif;
+    --font-amharic: 'Noto Sans Ethiopic', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-heading: 'Noto Sans Ethiopic', 'Cinzel', serif;
+  }
+
+  html {
+    font-size: 16.5px;
   }
 
   body {
     font-family: var(--font-amharic);
+    font-weight: 600;
+    line-height: 1.65;
+    letter-spacing: 0.012em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
     overflow-x: hidden;
   }
 
-  h1, h2, h3, .font-heading {
+  h1, h2, h3, h4, .font-heading {
     font-family: var(--font-heading);
+    font-weight: 800;
+    letter-spacing: 0.015em;
+  }
+
+  p, span, li, a, button, input, textarea, select, label {
+    font-weight: 600;
+  }
+
+  strong, b {
+    font-weight: 800;
   }
 }
 

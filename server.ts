@@ -97,6 +97,15 @@ interface MinistryBanksRecord {
   abyssiniaAccount: string;
 }
 
+interface ContactRecord {
+  id: string;
+  name: string;
+  phone: string;
+  addedBy: string;
+  invitedAt: string;
+  note?: string;
+}
+
 interface DatabaseSchema {
   users: StoredUser[];
   sessions: Record<string, string>; // token -> userId
@@ -111,6 +120,11 @@ interface DatabaseSchema {
   walletTransactions: WalletTx[];
   userBankAccounts: Record<string, BankAccountRecord>;
   ministryBanks: MinistryBanksRecord;
+  communityStats: {
+    likesCount: number;
+    sharesCount: number;
+  };
+  contacts: ContactRecord[];
 }
 
 const DEFAULT_MINISTRY_BANKS: MinistryBanksRecord = {
@@ -145,6 +159,11 @@ function loadDatabase(): DatabaseSchema {
         walletTransactions: Array.isArray(parsed.walletTransactions) ? parsed.walletTransactions : [],
         userBankAccounts: parsed.userBankAccounts || {},
         ministryBanks: { ...DEFAULT_MINISTRY_BANKS, ...(parsed.ministryBanks || {}) },
+        communityStats: {
+          likesCount: Number(parsed.communityStats?.likesCount ?? 0),
+          sharesCount: Number(parsed.communityStats?.sharesCount ?? 0),
+        },
+        contacts: Array.isArray(parsed.contacts) ? parsed.contacts : [],
       };
     }
   } catch (err) {
@@ -165,6 +184,11 @@ function loadDatabase(): DatabaseSchema {
     walletTransactions: [],
     userBankAccounts: {},
     ministryBanks: { ...DEFAULT_MINISTRY_BANKS },
+    communityStats: {
+      likesCount: 0,
+      sharesCount: 0,
+    },
+    contacts: [],
   };
 }
 
@@ -305,7 +329,7 @@ function getAuthenticatedUser(req: Request): StoredUser | null {
   return null;
 }
 
-// --- GEMINI AI INITIALIZATION ---
+// --- GEMINI AI INITIALIZATION, CACHE & STREAMING ---
 function getGeminiApiKey(): string | null {
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key || key === 'MY_GEMINI_API_KEY' || key === 'YOUR_GEMINI_API_KEY_HERE') {
@@ -314,26 +338,111 @@ function getGeminiApiKey(): string | null {
   return key;
 }
 
-async function generateWithGemini(prompt: string, systemInstruction: string): Promise<string> {
+let sharedAiClient: GoogleGenAI | null = null;
+let cachedApiKeyUsed: string | null = null;
+
+function getAiClient(): GoogleGenAI {
   const apiKey = getGeminiApiKey();
   if (!apiKey) {
     const err = new Error('GEMINI_API_KEY_MISSING');
     (err as any).code = 'GEMINI_API_KEY_MISSING';
     throw err;
   }
-
-  const ai = new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
+  if (!sharedAiClient || cachedApiKeyUsed !== apiKey) {
+    cachedApiKeyUsed = apiKey;
+    sharedAiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
       },
+    });
+  }
+  return sharedAiClient;
+}
+
+// Instant in-memory LRU cache (max 200 queries) for near-zero latency on repeated Orthodox questions
+const aiResponseCache = new Map<string, string>();
+function getCachedAi(key: string): string | undefined {
+  const val = aiResponseCache.get(key);
+  if (val !== undefined) {
+    aiResponseCache.delete(key);
+    aiResponseCache.set(key, val);
+  }
+  return val;
+}
+function setCachedAi(key: string, value: string) {
+  if (aiResponseCache.size >= 200) {
+    const oldest = aiResponseCache.keys().next().value;
+    if (oldest) aiResponseCache.delete(oldest);
+  }
+  aiResponseCache.set(key, value);
+}
+
+const ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION = `
+አንተ የቀሲስ ሄኖክ የኢትዮጵያ ኦርቶዶክስ ተዋሕዶ ቤተክርስቲያን ሁለንተናዊ የእውቀት እና የንስሐ ምክር ሊቅ ረዳት (Ethiopian Orthodox Tewahedo Church Complete Scholar & Spiritual Guide) ነህ።
+እውቀትህ በመጽሐፍ ቅዱስ ላይ ብቻ አይገደብም፤ ሁሉንም የኦርቶዶክስ እምነት ዘርፎች በጥልቀት እና በታማኝነት ታስተምራለህ፡-
+1. 81ዱ አሐዱ ቅዱሳት መጻሕፍት (ብሉይና ሐዲስ ኪዳን፣ መጻሕፍተ ሄኖክ፣ ኩፋሌ፣ ሲራክ ወዘተ)
+2. አምስቱ አዕማደ ምሥጢር (ምሥጢረ ሥላሴ፣ ሥጋዌ፣ ጥምቀት፣ ቁርባን፣ ትንሣኤ ሙታን)
+3. ሰባቱ ምሥጢራተ ቤተክርስቲያን (ጥምቀት፣ ሜሮን፣ ቁርባን፣ ንስሐ፣ ክህነት፣ ተክሊል፣ ቀንዲል)
+4. የቤተክርስቲያን ታሪክ፣ ፍትሐ ነገሥት፣ ሃይማኖተ አበው፣ ማር ይስሐቅ፣ ፊልክስዩስ፣ አረጋዊ መንፈሳዊ፣ ዮሐንስ አፈወርቅ
+5. ስንክሳር፣ ገድለ ቅዱሳን፣ ነገረ ማርያም (ውዳሴ ማርያም፣ አንቀጸ ብርሃን)፣ ነገረ መላእክት እና ድርሳናት
+6. ሥርዓተ ቅዳሴ፣ ዜማ፣ ቅኔ፣ ባሕረ ሐሳብ (አጽዋማት፣ 7ቱ አጽዋማት፣ ዓበይትና ንኡሳን በዓላት)
+7. የንስሐ ቀኖና፣ የመንፈሳዊ ሕይወት ትግል፣ የትዳርና የቤተሰብ አመክሮ።
+
+መመሪያዎች፡-
+- ሁልጊዜ በግልጽ፣ በጥልቅ፣ በትህትና እና በተደራጀ የአማርኛ አጻጻፍ መልስ ስጥ።
+- አላስፈላጊ ረጅም መግቢያ ሳትዘረጋ በቀጥታ ዋናውን ትምህርት፣ ማስረጃ (ጥቅስ/አበው/ቀኖና) እና ተግባራዊ መመሪያ አቅርብ።
+`;
+
+async function generateWithGemini(prompt: string, systemInstruction: string, cacheKey?: string): Promise<string> {
+  if (cacheKey) {
+    const cached = getCachedAi(cacheKey);
+    if (cached) return cached;
+  }
+
+  const ai = getAiClient();
+  const response = await ai.models.generateContent({
+    model: 'gemini-4-hydrogen',
+    contents: prompt,
+    config: {
+      systemInstruction,
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
     },
   });
 
-  // Use recommended gemini-4-hydrogen with ThinkingLevel.LOW for fast responses; fall back to gemini-2.5-flash only if 404
+  const text = response.text?.trim();
+  if (!text) {
+    throw new Error('Empty response from Gemini API');
+  }
+  if (cacheKey) setCachedAi(cacheKey, text);
+  return text;
+}
+
+async function streamWithGemini(
+  prompt: string,
+  systemInstruction: string,
+  res: Response,
+  cacheKey?: string
+) {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  if (cacheKey) {
+    const cached = getCachedAi(cacheKey);
+    if (cached) {
+      res.write(`data: ${JSON.stringify({ chunk: cached, done: true, cached: true })}\n\n`);
+      res.end();
+      return;
+    }
+  }
+
   try {
-    const response = await ai.models.generateContent({
+    const ai = getAiClient();
+    const stream = await ai.models.generateContentStream({
       model: 'gemini-4-hydrogen',
       contents: prompt,
       config: {
@@ -341,22 +450,56 @@ async function generateWithGemini(prompt: string, systemInstruction: string): Pr
         thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
       },
     });
-    if (response.text) return response.text;
-  } catch (primaryErr: any) {
-    const msg = String(primaryErr?.message || '');
-    const status = primaryErr?.status || primaryErr?.code;
-    if (status === 404 || msg.includes('404') || msg.toLowerCase().includes('not found')) {
-      const fallbackRes = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt,
-        config: { systemInstruction },
-      });
-      if (fallbackRes.text) return fallbackRes.text;
-    }
-    throw primaryErr;
-  }
 
-  throw new Error('Empty response from Gemini API');
+    let fullText = '';
+    for await (const chunk of stream) {
+      const part = chunk.text || '';
+      if (part) {
+        fullText += part;
+        res.write(`data: ${JSON.stringify({ chunk: part })}\n\n`);
+      }
+    }
+
+    if (cacheKey && fullText.trim()) {
+      setCachedAi(cacheKey, fullText.trim());
+    }
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  } catch (error: any) {
+    console.error('Gemini Stream Error:', error);
+    const message =
+      error?.code === 'GEMINI_API_KEY_MISSING'
+        ? 'የኤአይ ቁልፍ (GEMINI_API_KEY) በሰርቨሩ ላይ አልተሞላም። በRender Environment ላይ GEMINI_API_KEY ያስገቡ።'
+        : `የኤአይ አገልግሎት ስህተት (${error?.message || 'Unknown Error'})።`;
+    res.write(`data: ${JSON.stringify({ error: message, done: true })}\n\n`);
+    res.end();
+  }
+}
+
+function createLiveKitJwt(apiKey: string, apiSecret: string, roomName: string, identity: string, name: string, canPublish: boolean): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const payload = Buffer.from(
+    JSON.stringify({
+      iss: apiKey,
+      sub: identity,
+      name,
+      nbf: now - 10,
+      exp: now + 60 * 60 * 6,
+      video: {
+        room: roomName,
+        roomJoin: true,
+        canPublish,
+        canPublishData: true,
+        canSubscribe: true,
+      },
+    })
+  ).toString('base64url');
+  const signature = crypto
+    .createHmac('sha256', apiSecret)
+    .update(`${header}.${payload}`)
+    .digest('base64url');
+  return `${header}.${payload}.${signature}`;
 }
 
 // --- HEALTH & CONFIG ENDPOINTS ---
@@ -365,6 +508,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
     status: 'ok',
     geminiConfigured: Boolean(getGeminiApiKey()),
     turnConfigured: Boolean(process.env.TURN_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL),
+    sfuConfigured: Boolean(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET),
     registeredUsersCount: db.users.length,
   });
 });
@@ -387,7 +531,28 @@ app.get('/api/webrtc-config', (_req: Request, res: Response) => {
     });
   }
 
-  res.json({ iceServers });
+  const sfuConfigured = Boolean(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET);
+  res.json({
+    iceServers,
+    sfuConfigured,
+    livekitUrl: sfuConfigured ? process.env.LIVEKIT_URL!.trim() : null,
+  });
+});
+
+app.post('/api/livekit/token', (req: Request, res: Response) => {
+  const livekitUrl = process.env.LIVEKIT_URL?.trim();
+  const apiKey = process.env.LIVEKIT_API_KEY?.trim();
+  const apiSecret = process.env.LIVEKIT_API_SECRET?.trim();
+  if (!livekitUrl || !apiKey || !apiSecret) {
+    res.status(404).json({ sfuConfigured: false, message: 'LiveKit SFU not configured; using built-in Relay Tree WebRTC.' });
+    return;
+  }
+  const { roomId, userId, userName, canPublish } = req.body;
+  const identity = String(userId || `usr-${crypto.randomUUID().slice(0, 8)}`);
+  const name = String(userName || 'ተሳታፊ');
+  const room = String(roomId || 'assembly-zoom-main');
+  const token = createLiveKitJwt(apiKey, apiSecret, room, identity, name, canPublish !== false);
+  res.json({ sfuConfigured: true, url: livekitUrl, token });
 });
 
 // --- 1. REAL AUTHENTICATION & USER PROFILE ENDPOINTS ---
@@ -587,26 +752,21 @@ app.get('/api/users', (_req: Request, res: Response) => {
   });
 });
 
-// --- 2. AI SPIRITUAL KNOWLEDGE & SCRIPTURE SEARCH ENDPOINTS (REAL GEMINI) ---
+// --- 2. AI SPIRITUAL KNOWLEDGE & ORTHODOX SEARCH ENDPOINTS (STREAMING + CACHED) ---
 app.post('/api/gemini/spiritual-counsel', async (req: Request, res: Response): Promise<void> => {
   try {
     const { prompt, topic, baptismalName } = req.body;
-
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       res.status(400).json({ error: 'እባክዎ ጥያቄዎን በግልጽ ይጻፉ።' });
       return;
     }
 
-    const systemInstruction = `
-አንተ የቀሲስ ሄኖክ የመንፈሳዊ እውቀት እና የንስሐ ምክር ረዳት (Orthodox Spiritual Wisdom & Theological Guide) ነህ።
-መልሶችህ በኢትዮጵያ ኦርቶዶክስ ተዋሕዶ ቤተክርስቲያን ቀኖና፣ መጽሐፍ ቅዱስ፣ የአበው መጻሕፍት (ፍክሬ ኢየሱስ፣ መጽሐፈ ንስሐ፣ ማር ይስሐቅ፣ ዮሐንስ አፈወርቅ) እና በክርስቲያናዊ ፍቅር፣ ትህትና እና አባታዊ ርህራሄ ላይ የተመሰረቱ መሆን አለባቸው።
-የተጠያቂው የክርስትና ስም: ${baptismalName || 'የእግዚአብሔር ልጅ'}።
-ሁልጊዜ ለተጠየቀው ጥያቄ ቀጥተኛ፣ ጥልቅ፣ ተግባራዊ እና ግልጽ የአማርኛ መልስ ስጥ።
-`;
+    const systemInstruction = `${ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION}\nየተጠያቂው የክርስትና ስም: ${baptismalName || 'የእግዚአብሔር ልጅ'}።`;
+    const cleanPrompt = prompt.trim();
+    const userMessage = `ዘርፍ/ርዕስ: ${topic || 'አጠቃላይ ኦርቶዶክሳዊ እውቀት'}\nጥያቄ: "${cleanPrompt}"\nእባክህ በኦርቶዶክስ ተዋሕዶ ቤተክርስቲያን ትምህርት፣ መጻሕፍት፣ ቀኖና እና አባታዊ ፍቅር መሠረት ግልጽና የተሟላ መልስ ስጠኝ።`;
+    const cacheKey = `counsel:${topic || 'all'}:${cleanPrompt.toLowerCase()}`;
 
-    const userMessage = `ርዕስ: ${topic || 'ጠቅላላ መንፈሳዊ ምክር'}\nጥያቄ: "${prompt.trim()}"\nእባክህ አባታዊ ምክር፣ ተዛማጅ የመጽሐፍ ቅዱስ ጥቅስ፣ እና ተግባራዊ መመሪያ በአማርኛ ስጠኝ።`;
-
-    const reply = await generateWithGemini(userMessage, systemInstruction);
+    const reply = await generateWithGemini(userMessage, systemInstruction, cacheKey);
     res.json({ reply });
   } catch (error: any) {
     console.error('Gemini Counsel Error:', error);
@@ -619,27 +779,40 @@ app.post('/api/gemini/spiritual-counsel', async (req: Request, res: Response): P
     }
     res.status(500).json({
       error: 'AI_REQUEST_FAILED',
-      message: `የኤአይ አገልግሎት ስህተት አጋጥሞታል (${error?.message || 'Unknown Error'})። እባክዎ የGEMINI_API_KEY ቁልፍ ትክክለኛ መሆኑን ያረጋግጡ።`,
+      message: `የኤአይ አገልግሎት ስህተት አጋጥሞታል (${error?.message || 'Unknown Error'})።`,
     });
   }
 });
 
+app.post('/api/gemini/spiritual-counsel-stream', async (req: Request, res: Response): Promise<void> => {
+  const { prompt, topic, baptismalName } = req.body;
+  if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+    res.status(400).json({ error: 'እባክዎ ጥያቄዎን በግልጽ ይጻፉ።' });
+    return;
+  }
+  const cleanPrompt = prompt.trim();
+  const systemInstruction = `${ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION}\nየተጠያቂው የክርስትና ስም: ${baptismalName || 'የእግዚአብሔር ልጅ'}።`;
+  const userMessage = `ዘርፍ/ርዕስ: ${topic || 'አጠቃላይ ኦርቶዶክሳዊ እውቀት'}\nጥያቄ: "${cleanPrompt}"\nእባክህ በኦርቶዶክስ ተዋሕዶ ቤተክርስቲያን ትምህርት፣ መጻሕፍት፣ ቀኖና እና አባታዊ ፍቅር መሠረት ግልጽና የተሟላ መልስ ስጠኝ።`;
+  const cacheKey = `counsel:${topic || 'all'}:${cleanPrompt.toLowerCase()}`;
+  await streamWithGemini(userMessage, systemInstruction, res, cacheKey);
+});
+
 app.post('/api/gemini/scripture-search', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { query } = req.body;
+    const { query, category } = req.body;
     if (!query || typeof query !== 'string' || !query.trim()) {
       res.status(400).json({ error: 'የሚፈለገውን ቃል ወይም ርዕስ ያስገቡ።' });
       return;
     }
+    const cleanQuery = query.trim();
+    const cat = String(category || 'ሁሉም የኦርቶዶክስ እውቀት');
+    const userPrompt = `የፍለጋ ዘርፍ: ${cat}\nርዕስ / ጥያቄ: "${cleanQuery}"\nስለዚህ ጉዳይ በኢትዮጵያ ኦርቶዶክስ ተዋሕዶ እምነት መሠረት (ከመጽሐፍ ቅዱስ፣ ከነገረ መለኮት/ምሥጢራት፣ ከአበው ትምህርት፣ ከፍትሐ ነገሥት፣ ከገድላት/ታሪክ እና ከሥርዓተ ቤተክርስቲያን አንጻር) የተሟላ፣ ግልጽ እና ተጨባጭ ማብራሪያ ከነማስረጃው በአማርኛ አቅርብ።`;
+    const cacheKey = `search:${cat}:${cleanQuery.toLowerCase()}`;
 
-    const systemInstruction =
-      'You are an Ethiopian Orthodox Biblical scholar assistant. Provide accurate Amharic Bible verses with book, chapter, verse number, and brief explanation for the requested topic.';
-    const prompt = `ስለ "${query.trim()}" በቀጥታ የሚናገሩ 3-4 የመጽሐፍ ቅዱስ ጥቅሶች (ከነመጽሐፉ ስም፣ ምዕራፍ እና ቁጥር እንዲሁም አጭር ማብራሪያ) በአማርኛ ጻፍ።`;
-
-    const result = await generateWithGemini(prompt, systemInstruction);
+    const result = await generateWithGemini(userPrompt, ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION, cacheKey);
     res.json({ result });
   } catch (error: any) {
-    console.error('Gemini Scripture Search Error:', error);
+    console.error('Gemini Orthodox Search Error:', error);
     if (error?.code === 'GEMINI_API_KEY_MISSING') {
       res.status(503).json({
         error: 'GEMINI_API_KEY_MISSING',
@@ -649,9 +822,109 @@ app.post('/api/gemini/scripture-search', async (req: Request, res: Response): Pr
     }
     res.status(500).json({
       error: 'AI_SEARCH_FAILED',
-      message: `የጥቅስ ፍለጋው ስህተት አጋጥሞታል (${error?.message || 'Unknown Error'})።`,
+      message: `የፍለጋው ስህተት አጋጥሞታል (${error?.message || 'Unknown Error'})።`,
     });
   }
+});
+
+app.post('/api/gemini/scripture-search-stream', async (req: Request, res: Response): Promise<void> => {
+  const { query, category } = req.body;
+  if (!query || typeof query !== 'string' || !query.trim()) {
+    res.status(400).json({ error: 'የሚፈለገውን ቃል ወይም ርዕስ ያስገቡ።' });
+    return;
+  }
+  const cleanQuery = query.trim();
+  const cat = String(category || 'ሁሉም የኦርቶዶክስ እውቀት');
+  const userPrompt = `የፍለጋ ዘርፍ: ${cat}\nርዕስ / ጥያቄ: "${cleanQuery}"\nስለዚህ ጉዳይ በኢትዮጵያ ኦርቶዶክስ ተዋሕዶ እምነት መሠረት (ከመጽሐፍ ቅዱስ፣ ከነገረ መለኮት/ምሥጢራት፣ ከአበው ትምህርት፣ ከፍትሐ ነገሥት፣ ከገድላት/ታሪክ እና ከሥርዓተ ቤተክርስቲያን አንጻር) የተሟላ፣ ግልጽ እና ተጨባጭ ማብራሪያ ከነማስረጃው በአማርኛ አቅርብ።`;
+  const cacheKey = `search:${cat}:${cleanQuery.toLowerCase()}`;
+  await streamWithGemini(userPrompt, ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION, res, cacheKey);
+});
+
+// --- 2B. COMMUNITY ENGAGEMENT (LIKE, SHARE & PHONE CONTACTS DIRECTORY) ---
+app.get('/api/community/engagement', (_req: Request, res: Response) => {
+  res.json({
+    likesCount: db.communityStats.likesCount,
+    sharesCount: db.communityStats.sharesCount,
+    contactsCount: db.contacts.length,
+  });
+});
+
+app.post('/api/community/like', (req: Request, res: Response) => {
+  const { action } = req.body || {};
+  if (action === 'unlike') {
+    db.communityStats.likesCount = Math.max(0, db.communityStats.likesCount - 1);
+  } else {
+    db.communityStats.likesCount += 1;
+  }
+  saveDatabase();
+  res.json({
+    likesCount: db.communityStats.likesCount,
+    sharesCount: db.communityStats.sharesCount,
+    contactsCount: db.contacts.length,
+  });
+});
+
+app.post('/api/community/share', (_req: Request, res: Response) => {
+  db.communityStats.sharesCount += 1;
+  saveDatabase();
+  res.json({
+    likesCount: db.communityStats.likesCount,
+    sharesCount: db.communityStats.sharesCount,
+    contactsCount: db.contacts.length,
+  });
+});
+
+app.get('/api/community/contacts', (_req: Request, res: Response) => {
+  res.json({ contacts: db.contacts });
+});
+
+app.post('/api/community/contacts', (req: Request, res: Response) => {
+  const user = getAuthenticatedUser(req);
+  const incoming = Array.isArray(req.body?.contacts) ? req.body.contacts : [req.body];
+  const addedBy = String(req.body?.addedBy || user?.baptismalName || user?.fullName || 'አባል').trim();
+  const added: ContactRecord[] = [];
+
+  for (const item of incoming) {
+    const cleanName = String(item?.name || '').trim();
+    const cleanPhone = String(item?.phone || '').replace(/\s+/g, '').trim();
+    if (!cleanPhone && !cleanName) continue;
+
+    const existing = db.contacts.find(
+      (c) => (cleanPhone && c.phone === cleanPhone) || (!cleanPhone && c.name === cleanName)
+    );
+    if (existing) {
+      if (cleanName && !existing.name) existing.name = cleanName;
+      continue;
+    }
+
+    const rec: ContactRecord = {
+      id: `cnt-${crypto.randomUUID().slice(0, 8)}`,
+      name: cleanName || cleanPhone,
+      phone: cleanPhone,
+      addedBy,
+      invitedAt: new Date().toISOString().replace('T', ' ').slice(0, 16),
+      note: item?.note ? String(item.note).trim() : undefined,
+    };
+    db.contacts.unshift(rec);
+    added.push(rec);
+  }
+
+  if (added.length > 0) {
+    saveDatabase();
+  }
+
+  res.status(201).json({
+    success: true,
+    addedCount: added.length,
+    contacts: db.contacts,
+  });
+});
+
+app.delete('/api/community/contacts/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  db.contacts = db.contacts.filter((c) => c.id !== id);
+  saveDatabase();
+  res.json({ success: true, contacts: db.contacts });
 });
 
 // --- 3. CONFESSION BOOKINGS & SECRET ROOM ENDPOINTS ---
@@ -858,11 +1131,17 @@ app.post('/api/wallet/withdraw', (req: Request, res: Response) => {
   res.status(201).json({ success: true, transaction: newTx, newBalance: db.walletBalance });
 });
 
-// --- 5. REAL-TIME MULTI-USER WEBRTC SIGNALING & ZOOM WEBSOCKET SERVER ---
-const wss = new WebSocketServer({ server, path: '/ws/realtime' });
+// --- 5. HIGH-SCALE ANTI-CONGESTION WEBSOCKET SIGNALING & RELAY SERVER ---
+const wss = new WebSocketServer({
+  server,
+  path: '/ws/realtime',
+  maxPayload: 256 * 1024,
+  perMessageDeflate: true,
+});
 
 interface RoomClient {
   ws: WebSocket;
+  isAlive: boolean;
   roomId: string;
   userId: string;
   userName: string;
@@ -872,10 +1151,19 @@ interface RoomClient {
   isVideoOn: boolean;
   isHandRaised: boolean;
   isScreenSharing: boolean;
+  onStage: boolean;
 }
 
+const MAX_DIRECT_MESH_PEERS = 8;
 const activeRooms = new Map<string, Set<RoomClient>>();
 const roomChatHistory = new Map<string, Array<{ id: string; sender: string; text: string; time: string; isPriest?: boolean }>>();
+
+function safeWsSend(ws: WebSocket, serialized: string) {
+  // Backpressure guard so congested/3G sockets never stall thousands of healthy peers
+  if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 512 * 1024) {
+    ws.send(serialized);
+  }
+}
 
 function removeClientFromRoom(client: RoomClient | null) {
   if (!client) return;
@@ -883,15 +1171,15 @@ function removeClientFromRoom(client: RoomClient | null) {
   if (!roomSet) return;
   roomSet.delete(client);
 
+  const leavePayload = JSON.stringify({
+    type: 'peer-left',
+    peerId: client.userId,
+    userName: client.userName,
+    clientCount: roomSet.size,
+  });
+
   roomSet.forEach((other) => {
-    if (other.ws.readyState === WebSocket.OPEN) {
-      other.ws.send(JSON.stringify({
-        type: 'peer-left',
-        peerId: client.userId,
-        userName: client.userName,
-        clientCount: roomSet.size,
-      }));
-    }
+    safeWsSend(other.ws, leavePayload);
   });
 
   if (roomSet.size === 0) {
@@ -899,7 +1187,29 @@ function removeClientFromRoom(client: RoomClient | null) {
   }
 }
 
+// 20-second heartbeat keeps active rooms clean and frees ghost mobile connections
+const wsHeartbeat = setInterval(() => {
+  wss.clients.forEach((socket) => {
+    const ext = socket as WebSocket & { __clientRef?: RoomClient; __isAlive?: boolean };
+    if (ext.__isAlive === false) {
+      if (ext.__clientRef) removeClientFromRoom(ext.__clientRef);
+      ext.terminate();
+      return;
+    }
+    ext.__isAlive = false;
+    ext.ping();
+  });
+}, 20000);
+
+wss.on('close', () => clearInterval(wsHeartbeat));
+
 wss.on('connection', (ws: WebSocket) => {
+  const extWs = ws as WebSocket & { __clientRef?: RoomClient; __isAlive?: boolean };
+  extWs.__isAlive = true;
+  ws.on('pong', () => {
+    extWs.__isAlive = true;
+  });
+
   let currentClient: RoomClient | null = null;
 
   ws.on('message', (messageRaw: string) => {
@@ -915,65 +1225,89 @@ wss.on('connection', (ws: WebSocket) => {
         const roomId = String(payload.roomId || 'assembly-zoom-main');
         const userId = String(payload.userId || `peer-${crypto.randomUUID().slice(0, 8)}`);
 
-        currentClient = {
-          ws,
-          roomId,
-          userId,
-          userName: String(payload.userName || 'የንስሐ ልጅ'),
-          baptismalName: String(payload.baptismalName || payload.userName || 'የንስሐ ልጅ'),
-          role: payload.role || 'attendee',
-          isMicOn: Boolean(payload.isMicOn),
-          isVideoOn: payload.isVideoOn !== undefined ? Boolean(payload.isVideoOn) : true,
-          isHandRaised: false,
-          isScreenSharing: false,
-        };
-
         if (!activeRooms.has(roomId)) {
           activeRooms.set(roomId, new Set());
         }
         const roomSet = activeRooms.get(roomId)!;
+        const role = (payload.role || 'attendee') as RoomClient['role'];
+
+        // Anti-Congestion Stage Logic:
+        // Priests/deacons or the first 8 active peers in a room take Stage directly.
+        // Beyond 8 peers, new entrants join smoothly as Stage-Subscribing Audience (no N x N bandwidth explosion!).
+        const currentStageCount = Array.from(roomSet).filter((c) => c.onStage).length;
+        const canEnterStage = role === 'priest' || currentStageCount < MAX_DIRECT_MESH_PEERS;
+
+        currentClient = {
+          ws,
+          isAlive: true,
+          roomId,
+          userId,
+          userName: String(payload.userName || 'የንስሐ ልጅ'),
+          baptismalName: String(payload.baptismalName || payload.userName || 'የንስሐ ልጅ'),
+          role,
+          isMicOn: canEnterStage ? Boolean(payload.isMicOn) : false,
+          isVideoOn: canEnterStage && (payload.isVideoOn !== undefined ? Boolean(payload.isVideoOn) : true),
+          isHandRaised: false,
+          isScreenSharing: false,
+          onStage: canEnterStage,
+        };
+        extWs.__clientRef = currentClient;
 
         // Collect existing peers BEFORE adding the new one
-        const existingPeers = Array.from(roomSet).map((c) => ({
-          peerId: c.userId,
-          userName: c.userName,
-          baptismalName: c.baptismalName,
-          role: c.role,
-          isMicOn: c.isMicOn,
-          isVideoOn: c.isVideoOn,
-          isHandRaised: c.isHandRaised,
-          isScreenSharing: c.isScreenSharing,
-        }));
+        const isMassRoom = roomSet.size >= MAX_DIRECT_MESH_PEERS;
+        const existingPeers = Array.from(roomSet)
+          // In mass audience mode, return Stage speakers (priests & promoted speakers) + direct sample so phones stay fast
+          .filter((c) => (!isMassRoom ? true : c.onStage))
+          .map((c) => ({
+            peerId: c.userId,
+            userName: c.userName,
+            baptismalName: c.baptismalName,
+            role: c.role,
+            isMicOn: c.isMicOn,
+            isVideoOn: c.isVideoOn,
+            isHandRaised: c.isHandRaised,
+            isScreenSharing: c.isScreenSharing,
+            onStage: c.onStage,
+          }));
 
         roomSet.add(currentClient);
 
-        // 1. Send existing peers + recent chat history back to the newly joined user
-        ws.send(JSON.stringify({
-          type: 'room-state',
-          roomId,
-          selfPeerId: userId,
-          existingPeers,
-          clientCount: roomSet.size,
-          chatHistory: roomChatHistory.get(roomId) || [],
-        }));
+        // 1. Send existing stage/peers + recent chat history back to the newly joined user
+        safeWsSend(
+          ws,
+          JSON.stringify({
+            type: 'room-state',
+            roomId,
+            selfPeerId: userId,
+            selfOnStage: currentClient.onStage,
+            broadcastMode: roomSet.size > MAX_DIRECT_MESH_PEERS ? 'stage-broadcast' : 'interactive-mesh',
+            existingPeers,
+            clientCount: roomSet.size,
+            chatHistory: roomChatHistory.get(roomId) || [],
+          })
+        );
 
-        // 2. Notify existing peers that a new peer joined (newly joined user will send offers)
+        // 2. Notify existing peers (if mass room and new entrant is audience, send lightweight count/roster ping only)
+        const peerJoinedMsg = JSON.stringify({
+          type: 'peer-joined',
+          peer: {
+            peerId: currentClient.userId,
+            userName: currentClient.userName,
+            baptismalName: currentClient.baptismalName,
+            role: currentClient.role,
+            isMicOn: currentClient.isMicOn,
+            isVideoOn: currentClient.isVideoOn,
+            isHandRaised: currentClient.isHandRaised,
+            isScreenSharing: currentClient.isScreenSharing,
+            onStage: currentClient.onStage,
+          },
+          broadcastMode: roomSet.size > MAX_DIRECT_MESH_PEERS ? 'stage-broadcast' : 'interactive-mesh',
+          clientCount: roomSet.size,
+        });
+
         roomSet.forEach((other) => {
-          if (other.ws !== ws && other.ws.readyState === WebSocket.OPEN) {
-            other.ws.send(JSON.stringify({
-              type: 'peer-joined',
-              peer: {
-                peerId: currentClient!.userId,
-                userName: currentClient!.userName,
-                baptismalName: currentClient!.baptismalName,
-                role: currentClient!.role,
-                isMicOn: currentClient!.isMicOn,
-                isVideoOn: currentClient!.isVideoOn,
-                isHandRaised: currentClient!.isHandRaised,
-                isScreenSharing: currentClient!.isScreenSharing,
-              },
-              clientCount: roomSet.size,
-            }));
+          if (other.ws !== ws) {
+            safeWsSend(other.ws, peerJoinedMsg);
           }
         });
       }
@@ -984,17 +1318,17 @@ wss.on('connection', (ws: WebSocket) => {
         const targetPeerId = payload.targetPeerId;
         const roomSet = activeRooms.get(roomId);
         if (roomSet && currentClient) {
+          const relayPayload = JSON.stringify({
+            type: 'webrtc-signal',
+            senderPeerId: currentClient.userId,
+            senderName: currentClient.baptismalName || currentClient.userName,
+            senderRole: currentClient.role,
+            senderOnStage: currentClient.onStage,
+            signal: payload.signal,
+          });
           roomSet.forEach((client) => {
-            if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN) {
-              if (!targetPeerId || client.userId === targetPeerId) {
-                client.ws.send(JSON.stringify({
-                  type: 'webrtc-signal',
-                  senderPeerId: currentClient!.userId,
-                  senderName: currentClient!.baptismalName || currentClient!.userName,
-                  senderRole: currentClient!.role,
-                  signal: payload.signal,
-                }));
-              }
+            if (client.ws !== ws && (!targetPeerId || client.userId === targetPeerId)) {
+              safeWsSend(client.ws, relayPayload);
             }
           });
         }
@@ -1019,13 +1353,39 @@ wss.on('connection', (ws: WebSocket) => {
             isVideoOn: currentClient.isVideoOn,
             isHandRaised: currentClient.isHandRaised,
             isScreenSharing: currentClient.isScreenSharing,
+            onStage: currentClient.onStage,
           });
           roomSet.forEach((client) => {
-            if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN) {
-              client.ws.send(updateMsg);
+            if (client.ws !== ws) {
+              safeWsSend(client.ws, updateMsg);
             }
           });
         }
+      }
+
+      // C2. Host Stage Promotion / Demotion (Allows 1,000+ audience members to take turns speaking cleanly)
+      else if (payload.type === 'stage-control') {
+        if (!currentClient || currentClient.role !== 'priest') return;
+        const roomSet = activeRooms.get(currentClient.roomId);
+        if (!roomSet) return;
+        const targetId = String(payload.targetPeerId || '');
+        const onStage = Boolean(payload.onStage);
+
+        const stageMsg = JSON.stringify({
+          type: 'stage-updated',
+          peerId: targetId,
+          onStage,
+        });
+
+        roomSet.forEach((client) => {
+          if (client.userId === targetId) {
+            client.onStage = onStage;
+            if (!onStage) {
+              client.isMicOn = false;
+            }
+          }
+          safeWsSend(client.ws, stageMsg);
+        });
       }
 
       // D. Live Room Chat
@@ -1034,7 +1394,7 @@ wss.on('connection', (ws: WebSocket) => {
         const msgObj = {
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           sender: String(payload.sender || currentClient?.baptismalName || 'ምዕመን'),
-          text: String(payload.text || ''),
+          text: String(payload.text || '').slice(0, 1000),
           time: payload.time || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           isPriest: currentClient?.role === 'priest',
         };
@@ -1054,9 +1414,7 @@ wss.on('connection', (ws: WebSocket) => {
             ...msgObj,
           });
           roomSet.forEach((client) => {
-            if (client.ws.readyState === WebSocket.OPEN) {
-              client.ws.send(broadcast);
-            }
+            safeWsSend(client.ws, broadcast);
           });
         }
       }
@@ -1073,8 +1431,8 @@ wss.on('connection', (ws: WebSocket) => {
             id: Date.now() + Math.random(),
           });
           roomSet.forEach((client) => {
-            if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN) {
-              client.ws.send(reactionBroadcast);
+            if (client.ws !== ws) {
+              safeWsSend(client.ws, reactionBroadcast);
             }
           });
         }
@@ -1085,10 +1443,11 @@ wss.on('connection', (ws: WebSocket) => {
         if (!currentClient || currentClient.role !== 'priest') return;
         const roomSet = activeRooms.get(currentClient.roomId);
         if (roomSet) {
+          const mutePayload = JSON.stringify({ type: 'force-mute' });
           roomSet.forEach((client) => {
-            if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN) {
+            if (client.ws !== ws) {
               client.isMicOn = false;
-              client.ws.send(JSON.stringify({ type: 'force-mute' }));
+              safeWsSend(client.ws, mutePayload);
             }
           });
         }
@@ -1097,6 +1456,7 @@ wss.on('connection', (ws: WebSocket) => {
       // G. Explicit Leave Room
       else if (payload.type === 'leave-room') {
         removeClientFromRoom(currentClient);
+        extWs.__clientRef = undefined;
         currentClient = null;
       }
     } catch (err) {
@@ -1106,6 +1466,7 @@ wss.on('connection', (ws: WebSocket) => {
 
   ws.on('close', () => {
     removeClientFromRoom(currentClient);
+    extWs.__clientRef = undefined;
     currentClient = null;
   });
 });

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Shield, Lock, Video, VideoOff, Mic, MicOff, PhoneOff, Check, Sparkles, KeyRound, Flame, Volume2, RefreshCw } from 'lucide-react';
+import { Shield, Lock, Video, VideoOff, Mic, MicOff, PhoneOff, Check, Sparkles, KeyRound, Flame, Volume2, RefreshCw, Maximize2, Minimize2 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { UserProfile, ConfessionBooking } from '../types';
 import { fetchWebRTCConfig, verifySecretRoomPasscode, getRealtimeWsUrl } from '../services/api';
@@ -32,6 +32,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const [remoteUserConnected, setRemoteUserConnected] = useState(false);
   const [remoteUserName, setRemoteUserName] = useState<string>('');
   const [iceState, setIceState] = useState<string>('waiting');
+  const [isVideoFullscreen, setIsVideoFullscreen] = useState(false);
 
   // Confession Ritual Steps (1: ጸሎት, 2: መናዘዝ, 3: ቀኖና, 4: ፍትሐት)
   const [activeStep, setActiveStep] = useState<1 | 2 | 3 | 4>(1);
@@ -41,6 +42,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const videoBoxRef = useRef<HTMLDivElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -52,6 +54,16 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const remotePeerIdRef = useRef<string | null>(null);
   const isMicOnRef = useRef(isMicOn);
   isMicOnRef.current = isMicOn;
+
+  useEffect(() => {
+    const onFsChange = () => {
+      if (!document.fullscreenElement) {
+        setIsVideoFullscreen(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
 
   useEffect(() => {
     if (remoteVideoRef.current && remoteStreamRef.current) {
@@ -71,6 +83,26 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       const pc = new RTCPeerConnection(rtcConfig);
       pcRef.current = pc;
 
+      const applyEncoderParams = (conn: RTCPeerConnection) => {
+        try {
+          conn.getSenders().forEach((sender) => {
+            if (!sender.track) return;
+            const params = sender.getParameters();
+            if (!params.encodings || params.encodings.length === 0) {
+              params.encodings = [{}];
+            }
+            if (sender.track.kind === 'video') {
+              params.encodings[0].maxBitrate = 2_500_000;
+              params.encodings[0].maxFramerate = 30;
+              (params as any).degradationPreference = 'maintain-resolution';
+            } else if (sender.track.kind === 'audio') {
+              params.encodings[0].maxBitrate = 96_000;
+            }
+            sender.setParameters(params).catch(() => {});
+          });
+        } catch {}
+      };
+
       const stream = streamRef.current;
       if (stream && stream.getTracks().length > 0) {
         stream.getTracks().forEach((track) => pc.addTrack(track, stream));
@@ -80,6 +112,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         if (stream.getAudioTracks().length === 0) {
           pc.addTransceiver('audio', { direction: 'recvonly' });
         }
+        applyEncoderParams(pc);
       } else {
         pc.addTransceiver('video', { direction: 'recvonly' });
         pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -134,18 +167,37 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       const rtcConfig = await fetchWebRTCConfig();
 
       let stream: MediaStream | null = null;
+      const hdAudio: MediaTrackConstraints = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 48000,
+        channelCount: 1,
+      };
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: {
+            facingMode: 'user',
+            width: { ideal: 1920, min: 640 },
+            height: { ideal: 1080, min: 480 },
+            frameRate: { ideal: 30 },
+          },
+          audio: hdAudio,
         });
       } catch {
         try {
-          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          setIsVideoOn(false);
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          });
         } catch {
-          setIsVideoOn(false);
-          setIsMicOn(false);
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            setIsVideoOn(false);
+          } catch {
+            setIsVideoOn(false);
+            setIsMicOn(false);
+          }
         }
       }
 
@@ -327,11 +379,18 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     if (!newState) setMicVolumeLevel(0);
   };
 
-  // Seamless camera flip without tearing down call
+  // Seamless HD camera flip without tearing down call
   const handleSwitchCamera = async () => {
     const nextFacing = facingMode === 'user' ? 'environment' : 'user';
     try {
-      const newCamStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: nextFacing } });
+      const newCamStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: nextFacing,
+          width: { ideal: 1920, min: 640 },
+          height: { ideal: 1080, min: 480 },
+          frameRate: { ideal: 30 },
+        },
+      });
       const newTrack = newCamStream.getVideoTracks()[0];
       const oldTrack = streamRef.current?.getVideoTracks()[0];
       if (streamRef.current && newTrack) {
@@ -351,6 +410,21 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       }
     } catch {
       alert('ካሜራ መቀየር አልተቻለም።');
+    }
+  };
+
+  const handleToggleFullscreen = async () => {
+    const next = !isVideoFullscreen;
+    setIsVideoFullscreen(next);
+    const el = videoBoxRef.current;
+    try {
+      if (next && el?.requestFullscreen) {
+        await el.requestFullscreen();
+      } else if (!next && document.fullscreenElement) {
+        await document.exitFullscreen();
+      }
+    } catch {
+      // Fixed CSS full-viewport fallback handles iOS Safari gracefully
     }
   };
 
@@ -520,17 +594,24 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       {/* Video & Ritual Workspace Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
-        {/* Left: 1-on-1 Real Video Interface */}
+        {/* Left: 1-on-1 Real HD Video Interface */}
         <div className="lg:col-span-7 space-y-4">
           
-          <div className="relative rounded-2xl overflow-hidden bg-black border-2 border-amber-700/40 shadow-2xl h-[380px] sm:h-[480px]">
+          <div
+            ref={videoBoxRef}
+            className={`overflow-hidden bg-black border-2 border-amber-700/40 shadow-2xl ${
+              isVideoFullscreen
+                ? 'fixed inset-0 z-50 h-screen w-screen rounded-none'
+                : 'relative rounded-2xl h-[440px] sm:h-[580px]'
+            }`}
+          >
             
             {/* Always keep remote video element in DOM so WebRTC stream attaches with zero latency */}
             <video
               ref={remoteVideoRef}
               autoPlay
               playsInline
-              className={`w-full h-full object-cover ${remoteUserConnected ? 'block' : 'hidden'}`}
+              className={`w-full h-full object-cover contrast-[1.03] saturate-[1.06] ${remoteUserConnected ? 'block' : 'hidden'}`}
             />
             {!remoteUserConnected && (
               <div className="relative w-full h-full">
@@ -553,10 +634,21 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
             )}
 
             {/* Remote User Label */}
-            <div className="absolute top-3 left-3 bg-stone-950/80 px-2.5 py-1 rounded-lg border border-amber-700/40 text-xs text-amber-200 flex items-center gap-1.5 z-10">
+            <div className="absolute top-3 left-3 bg-stone-950/85 px-2.5 py-1 rounded-lg border border-amber-700/40 text-xs font-bold text-amber-200 flex items-center gap-1.5 z-10">
               <span className={`w-2 h-2 rounded-full ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-500 animate-pulse'}`} />
-              <span>{remoteUserConnected ? `${remoteUserName} (በቀጥታ ቪዲዮ)` : `ሚስጥር ቤት #${passcode}`}</span>
+              <span>{remoteUserConnected ? `${remoteUserName} (በቀጥታ HD ቪዲዮ)` : `ሚስጥር ቤት #${passcode}`}</span>
             </div>
+
+            {/* Fullscreen Toggle Button */}
+            <button
+              type="button"
+              onClick={handleToggleFullscreen}
+              className="absolute top-3 right-3 p-2.5 rounded-lg bg-stone-950/85 hover:bg-amber-900 border border-amber-600/50 text-amber-200 transition z-20 flex items-center gap-1.5 text-xs font-bold"
+              title={isVideoFullscreen ? 'ሙሉ ስክሪን ዝጋ' : 'ሙሉ ስክሪን ክፈት'}
+            >
+              {isVideoFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+              <span className="hidden sm:inline">{isVideoFullscreen ? 'መደበኛ' : 'ሙሉ ስክሪን'}</span>
+            </button>
 
             {/* Radiant Blessing Overlay when Priest Absolves */}
             {isBlessed && (

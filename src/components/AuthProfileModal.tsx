@@ -42,6 +42,21 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
     if (isOpen) {
       setErrorMsg('');
       setSuccessMsg('');
+      const params = new URLSearchParams(window.location.search);
+      const inviteName = params.get('inviteName')?.trim() || '';
+      const invitePhone = params.get('invitePhone')?.trim() || '';
+
+      if (!currentUser.isAuthenticated && (inviteName || invitePhone)) {
+        setMode('signup');
+        setFormData((prev) => ({
+          ...prev,
+          fullName: inviteName || prev.fullName,
+          baptismalName: inviteName || prev.baptismalName,
+          phone: invitePhone || prev.phone,
+        }));
+        return;
+      }
+
       setMode(currentUser.isAuthenticated ? 'profile' : 'signin');
       if (currentUser.isAuthenticated) {
         setFormData((prev) => ({

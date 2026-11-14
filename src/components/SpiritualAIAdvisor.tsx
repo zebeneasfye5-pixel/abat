@@ -1,74 +1,187 @@
-import React, { useState } from 'react';
-import { Sparkles, Send, Volume2, VolumeX, BookOpen, Search, Copy, Check } from 'lucide-react';
-import { askSpiritualCounsel, searchScripture } from '../services/api';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  Sparkles,
+  Send,
+  Volume2,
+  VolumeX,
+  BookOpen,
+  Search,
+  Copy,
+  Check,
+  Share2,
+  Download,
+  Zap,
+} from 'lucide-react';
+import { streamOrthodoxSearch, streamSpiritualCounsel } from '../services/api';
 import { UserProfile } from '../types';
 
 interface SpiritualAIAdvisorProps {
   user: UserProfile;
 }
 
+const COUNSEL_TOPICS = [
+  'አጠቃላይ ኦርቶዶክስ',
+  'ምሥጢራተ ቤተክርስቲያን',
+  'ቀኖናና ፍትሐ ነገሥት',
+  'ቅዱሳንና ታሪክ',
+  'ጾም፣ ጸሎትና ቅዳሴ',
+  'ንስሐና ቤተሰብ',
+];
+
+const SEARCH_CATEGORIES = [
+  'ሁሉም የኦርቶዶክስ እውቀት',
+  'መጽሐፍ ቅዱስ (81ዱ)',
+  'አዕማደ ምሥጢርና ነገረ መለኮት',
+  'ቅዱሳን፣ ስንክሳርና ገድላት',
+  'ሥርዓተ ቅዳሴ፣ በዓላትና አጽዋማት',
+];
+
+function downloadAsTextFile(title: string, body: string) {
+  const header = `ቀሲስ ሄኖክ - የኢትዮጵያ ኦርቶዶክስ ተዋሕዶ እውቀት ማህደር\nርዕስ: ${title}\nቀን: ${new Date().toLocaleDateString()}\n${'='.repeat(45)}\n\n`;
+  const blob = new Blob(['\uFEFF' + header + body], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `qesis-henok-${Date.now().toString().slice(-6)}.txt`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
 export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) => {
   const [prompt, setPrompt] = useState('');
-  const [topic, setTopic] = useState('የንስሐ ምስጢር');
+  const [topic, setTopic] = useState(COUNSEL_TOPICS[0]);
   const [loading, setLoading] = useState(false);
   const [conversation, setConversation] = useState<Array<{ role: 'user' | 'priest_ai'; text: string }>>([
     {
       role: 'priest_ai',
-      text: `በእግዚአብሔር ስም ሰላም ለእናንተ ይሁን ${user.baptismalName || 'ልጄ'}። እኔ የቀሲስ ሄኖክ የኦርቶዶክሳዊ እውቀት መረጃ ቋት እና የኤአይ ረዳት ነኝ። በንስሐ፣ በአስተምህሮ፣ በቀኖና፣ በጾም እና በመንፈሳዊ አመክሮ ዙሪያ ያለዎትን ማንኛውንም ጥያቄ ይጠይቁኝ። መጽሐፍ ቅዱሳዊ እና አበዋዊ መልሶችን እሰጣችኋለሁ።`,
+      text: `በእግዚአብሔር ስም ሰላም ለእናንተ ይሁን ${user.baptismalName || 'ልጄ'}። እኔ የቀሲስ ሄኖክ ሁለንተናዊ የኢትዮጵያ ኦርቶዶክስ ተዋሕዶ እውቀት እና የኤአይ ረዳት ነኝ። በመጽሐፍ ቅዱስ፣ በነገረ መለኮት፣ በምሥጢራተ ቤተክርስቲያን፣ በፍትሐ ነገሥት፣ በቅዱሳን ታሪክ፣ በቅዳሴ፣ በጾምና በንስሐ ዙሪያ ያለዎትን ማንኛውንም ጥያቄ ይጠይቁኝ — መልሱ በፍጥነት በቀጥታ ይታያል።`,
     },
   ]);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [sharedKey, setSharedKey] = useState<string | null>(null);
 
-  // Scripture Quick Search
+  // Fast Orthodox Universal Search
   const [scriptureQuery, setScriptureQuery] = useState('');
+  const [searchCategory, setSearchCategory] = useState(SEARCH_CATEGORIES[0]);
+  const [autoSearchEnabled, setAutoSearchEnabled] = useState(true);
   const [scriptureResult, setScriptureResult] = useState<string | null>(null);
   const [scriptureLoading, setScriptureLoading] = useState(false);
 
+  const chatAbortRef = useRef<AbortController | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
+
   const presetQuestions = [
-    'የንስሐ ጸሎት እንዴት ልጸልይ?',
-    'የስጋዬን ድካም እና ፈተና እንዴት ላሸንፍ?',
-    'የንስሐ ቀኖና ምንድን ነው? ጥቅሙስ?',
-    'በጾም ወቅት በልብ ሊደረግ የሚገባው ጥንቃቄ ምንድን ነው?',
-    'ስለ ባልና ሚስት ሰላም የመጽሐፍ ቅዱስ ምክር ምንድን ነው?',
+    'ሰባቱ ምሥጢራተ ቤተክርስቲያን ምንድን ናቸው?',
+    'የንስሐ ጸሎትና ቀኖና እንዴት ይፈጸማል?',
+    'አምስቱ አዕማደ ምሥጢር በዝርዝር',
+    'የቅድስት ድንግል ማርያም ነገረ ማርያም በኦርቶዶክስ',
+    'የሰባቱ አጽዋማት ስምና ትርጉም',
   ];
 
-  const handleAsk = async (userQuestion?: string) => {
-    const q = userQuestion || prompt;
-    if (!q.trim() || loading) return;
+  const quickSearchTopics = [
+    'ምሥጢረ ሥላሴ',
+    'ቅዱስ ያሬድ እና ዜማ',
+    'ጥምቀት እና ሜሮን',
+    'ጾመ ነነዌ እና ዐቢይ ጾም',
+    'ፍትሐ ነገሥት',
+    'መዝሙረ ዳዊት 51',
+  ];
 
-    setConversation((prev) => [...prev, { role: 'user', text: q }]);
-    setPrompt('');
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [conversation]);
+
+  const handleAsk = async (userQuestion?: string) => {
+    const q = (userQuestion ?? prompt).trim();
+    if (!q || loading) return;
+
+    chatAbortRef.current?.abort();
+    const controller = new AbortController();
+    chatAbortRef.current = controller;
+
+    setConversation((prev) => [...prev, { role: 'user', text: q }, { role: 'priest_ai', text: '' }]);
+    if (!userQuestion) setPrompt('');
     setLoading(true);
 
     try {
-      const response = await askSpiritualCounsel(q, topic, user.baptismalName);
-      setConversation((prev) => [...prev, { role: 'priest_ai', text: response }]);
-    } catch (err: any) {
-      setConversation((prev) => [
-        ...prev,
-        {
-          role: 'priest_ai',
-          text: `⚠️ ${err?.message || 'ከኤአይ ሰርቨር ጋር መገናኘት አልተቻለም። እባክዎ የGEMINI_API_KEY እና የኢንተርኔት ግንኙነትዎን ያረጋግጡ።'}`,
+      await streamSpiritualCounsel(
+        q,
+        topic,
+        user.baptismalName,
+        (accumulated) => {
+          setConversation((prev) => {
+            const copy = [...prev];
+            if (copy.length > 0 && copy[copy.length - 1].role === 'priest_ai') {
+              copy[copy.length - 1] = { role: 'priest_ai', text: accumulated };
+            }
+            return copy;
+          });
         },
-      ]);
+        controller.signal
+      );
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return;
+      setConversation((prev) => {
+        const copy = [...prev];
+        if (copy.length > 0 && copy[copy.length - 1].role === 'priest_ai') {
+          copy[copy.length - 1] = {
+            role: 'priest_ai',
+            text: `⚠️ ${err?.message || 'ከኤአይ ሰርቨር ጋር መገናኘት አልተቻለም። እባክዎ የGEMINI_API_KEY መሞላቱን ያረጋግጡ።'}`,
+          };
+        }
+        return copy;
+      });
     } finally {
       setLoading(false);
     }
   };
 
-  const handleSearchScripture = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!scriptureQuery.trim() || scriptureLoading) return;
+  const executeOrthodoxSearch = async (queryText: string, cat = searchCategory) => {
+    const clean = queryText.trim();
+    if (clean.length < 2) return;
+
+    searchAbortRef.current?.abort();
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
+
     setScriptureLoading(true);
+    setScriptureResult('');
     try {
-      const res = await searchScripture(scriptureQuery);
-      setScriptureResult(res);
+      await streamOrthodoxSearch(
+        clean,
+        cat,
+        (accumulated) => {
+          setScriptureResult(accumulated);
+        },
+        controller.signal
+      );
     } catch (err: any) {
-      setScriptureResult(`⚠️ ${err?.message || 'ጥቅሱን ከኤአይ ሰርቨር ማምጣት አልተቻለም። እባክዎ የGEMINI_API_KEY ትክክለኛ መሆኑን ያረጋግጡ።'}`);
+      if (err?.name === 'AbortError') return;
+      setScriptureResult(`⚠️ ${err?.message || 'መረጃውን ከኤአይ ማምጣት አልተቻለም።'}`);
     } finally {
       setScriptureLoading(false);
     }
+  };
+
+  // Automatic Debounced Search while typing when Auto-Search is enabled
+  useEffect(() => {
+    if (!autoSearchEnabled) return;
+    const trimmed = scriptureQuery.trim();
+    if (trimmed.length < 3) return;
+    const timer = setTimeout(() => {
+      executeOrthodoxSearch(trimmed, searchCategory);
+    }, 650);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scriptureQuery, searchCategory, autoSearchEnabled]);
+
+  const handleSearchSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    executeOrthodoxSearch(scriptureQuery, searchCategory);
   };
 
   const handleSpeech = (text: string) => {
@@ -80,7 +193,7 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
       }
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.lang = 'am-ET';
-      utterance.rate = 0.9;
+      utterance.rate = 0.95;
       utterance.onend = () => setIsSpeaking(false);
       utterance.onerror = () => setIsSpeaking(false);
       setIsSpeaking(true);
@@ -88,35 +201,71 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
     }
   };
 
-  const handleCopy = (text: string, index: number) => {
-    navigator.clipboard?.writeText(text);
-    setCopiedIndex(index);
-    setTimeout(() => setCopiedIndex(null), 2000);
+  const handleCopy = async (text: string, key: string) => {
+    try {
+      await navigator.clipboard?.writeText(text);
+      setCopiedKey(key);
+      setTimeout(() => setCopiedKey(null), 2000);
+    } catch {}
+  };
+
+  const handleShare = async (title: string, text: string, key: string) => {
+    const shareBody = `${title}\n\n${text}\n\nምንጭ፡ ቀሲስ ሄኖክ (${window.location.origin})`;
+    if (navigator.share) {
+      try {
+        await navigator.share({ title, text: shareBody, url: window.location.origin });
+        setSharedKey(key);
+        setTimeout(() => setSharedKey(null), 2000);
+        return;
+      } catch {}
+    }
+    await handleCopy(shareBody, key);
+    setSharedKey(key);
+    setTimeout(() => setSharedKey(null), 2000);
+  };
+
+  const handleDownloadFullChat = () => {
+    const transcript = conversation
+      .filter((m) => m.text.trim())
+      .map((m) => `[${m.role === 'user' ? user.baptismalName || 'ጠያቂ' : 'ቀሲስ ሄኖክ AI'}]\n${m.text}`)
+      .join('\n\n------------------------------\n\n');
+    downloadAsTextFile('የኤአይ መንፈሳዊ ውይይት ማህደር', transcript);
   };
 
   return (
-    <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-      
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
       {/* Title Header */}
-      <div className="p-6 rounded-2xl bg-gradient-to-r from-stone-900 via-amber-950/40 to-stone-900 border border-amber-800/40 flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-950/80 border border-amber-700/50 text-amber-300 text-xs font-medium">
-            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-            <span>ዘመናዊ የኦርቶዶክሳዊ እውቀት መረጃ አመንጭ</span>
+      <div className="p-5 sm:p-6 rounded-2xl bg-gradient-to-r from-stone-900 via-amber-950/40 to-stone-900 border border-amber-800/40 flex flex-col gap-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-950/80 border border-amber-700/50 text-amber-300 text-xs font-bold">
+              <Zap className="w-3.5 h-3.5 text-amber-400" />
+              <span>እጅግ ፈጣን ቀጥታ የኦርቶዶክስ እውቀት ኤአይ (Streaming)</span>
+            </div>
+            <h2 className="text-2xl sm:text-3xl font-heading font-extrabold text-amber-100 mt-2">
+              የቀሲስ ሄኖክ ሁለንተናዊ የኦርቶዶክስ እውቀት ማህደር
+            </h2>
           </div>
-          <h2 className="text-2xl sm:text-3xl font-heading font-bold text-amber-100 mt-2">
-            የቀሲስ ሄኖክ የኤአይ ጭንቅላት
-          </h2>
+
+          <button
+            onClick={handleDownloadFullChat}
+            className="px-3.5 py-2 rounded-xl bg-stone-950 hover:bg-stone-800 border border-amber-600/60 text-amber-200 text-xs font-extrabold inline-flex items-center gap-2 transition"
+          >
+            <Download className="w-4 h-4 text-amber-400" />
+            <span>ሙሉ ውይይቱን ዳውንሎድ አድርግ</span>
+          </button>
         </div>
 
-        {/* Topic Selector Tabs */}
-        <div className="flex flex-wrap gap-1.5 p-1 bg-stone-950 rounded-xl border border-stone-800 text-xs">
-          {['የንስሐ ምስጢር', 'ቀኖናና ተግሣጽ', 'ጾምና ጸሎት', 'የቤተሰብ አመክሮ'].map((t) => (
+        {/* Comprehensive Orthodox Topic Selector Tabs */}
+        <div className="flex flex-wrap gap-1.5 p-1.5 bg-stone-950 rounded-xl border border-stone-800 text-xs">
+          {COUNSEL_TOPICS.map((t) => (
             <button
               key={t}
               onClick={() => setTopic(t)}
-              className={`px-3 py-1.5 rounded-lg transition font-medium ${
-                topic === t ? 'bg-amber-900/80 text-amber-200 border border-amber-600/50' : 'text-stone-400 hover:text-stone-200'
+              className={`px-3 py-1.5 rounded-lg transition font-bold ${
+                topic === t
+                  ? 'bg-amber-800 text-amber-100 border border-amber-500/60 shadow'
+                  : 'text-stone-300 hover:text-amber-200'
               }`}
             >
               {t}
@@ -125,72 +274,92 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
         </div>
       </div>
 
-      {/* Main Grid: Chat Counsel & Scripture Search Engine */}
+      {/* Main Grid: Live Streaming Counsel & Comprehensive Orthodox Search */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        
-        {/* Left Column (8 cols): Interactive Spiritual Dialogue */}
-        <div className="lg:col-span-8 flex flex-col h-[600px] rounded-2xl bg-stone-900/60 border border-amber-900/30 overflow-hidden">
-          
+        {/* Left Column (7 cols): Interactive Streaming Dialogue */}
+        <div className="lg:col-span-7 flex flex-col h-[640px] rounded-2xl bg-stone-900/70 border border-amber-900/40 overflow-hidden shadow-xl">
           {/* Conversation Stream */}
-          <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-4">
             {conversation.map((msg, idx) => (
               <div
                 key={idx}
                 className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
               >
                 {msg.role === 'priest_ai' && (
-                  <div className="w-8 h-8 rounded-full bg-amber-950 border border-amber-600/60 flex items-center justify-center text-amber-300 font-bold shrink-0 text-xs">
+                  <div className="w-9 h-9 rounded-full bg-amber-950 border border-amber-500/70 flex items-center justify-center text-amber-200 font-extrabold shrink-0 text-sm">
                     ሄ
                   </div>
                 )}
 
                 <div
-                  className={`max-w-[85%] sm:max-w-[75%] p-4 rounded-2xl text-xs sm:text-sm leading-relaxed ${
+                  className={`max-w-[88%] sm:max-w-[80%] p-4 rounded-2xl text-sm leading-relaxed ${
                     msg.role === 'user'
-                      ? 'bg-amber-950/80 text-amber-100 border border-amber-700/60 rounded-br-none'
-                      : 'bg-stone-950/90 text-stone-200 border border-stone-800 rounded-bl-none shadow-md font-serif'
+                      ? 'bg-amber-950/90 text-amber-100 border border-amber-700/70 rounded-br-none font-bold'
+                      : 'bg-stone-950/95 text-stone-100 border border-stone-800 rounded-bl-none shadow-md'
                   }`}
                 >
-                  <p className="whitespace-pre-wrap">{msg.text}</p>
-                  
-                  {msg.role === 'priest_ai' && (
-                    <div className="flex items-center gap-2 mt-3 pt-2 border-t border-stone-800/80 text-[11px] text-stone-400 not-italic font-sans">
+                  {msg.text ? (
+                    <p className="whitespace-pre-wrap font-semibold">{msg.text}</p>
+                  ) : (
+                    <div className="flex items-center gap-2 text-xs text-amber-300 font-bold">
+                      <Sparkles className="w-4 h-4 animate-spin text-amber-400" />
+                      <span>በፍጥነት በመመለስ ላይ...</span>
+                    </div>
+                  )}
+
+                  {msg.role === 'priest_ai' && msg.text && (
+                    <div className="flex flex-wrap items-center gap-2 mt-3 pt-2.5 border-t border-stone-800/80 text-xs text-stone-300">
                       <button
                         onClick={() => handleSpeech(msg.text)}
-                        className="hover:text-amber-300 flex items-center gap-1 transition"
+                        className="px-2 py-1 rounded-lg bg-stone-900 hover:bg-stone-800 hover:text-amber-200 flex items-center gap-1 transition font-bold"
                       >
-                        {isSpeaking ? <VolumeX className="w-3.5 h-3.5 text-red-400" /> : <Volume2 className="w-3.5 h-3.5 text-amber-400" />}
-                        <span>{isSpeaking ? 'አቁም' : 'በድምፅ አድምጥ'}</span>
+                        {isSpeaking ? (
+                          <VolumeX className="w-3.5 h-3.5 text-red-400" />
+                        ) : (
+                          <Volume2 className="w-3.5 h-3.5 text-amber-400" />
+                        )}
+                        <span>{isSpeaking ? 'አቁም' : 'አድምጥ'}</span>
                       </button>
-                      <span>·</span>
                       <button
-                        onClick={() => handleCopy(msg.text, idx)}
-                        className="hover:text-amber-300 flex items-center gap-1 transition"
+                        onClick={() => handleCopy(msg.text, `chat-${idx}`)}
+                        className="px-2 py-1 rounded-lg bg-stone-900 hover:bg-stone-800 hover:text-amber-200 flex items-center gap-1 transition font-bold"
                       >
-                        {copiedIndex === idx ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                        <span>{copiedIndex === idx ? 'ተቀድቷል' : 'ቅዳ'}</span>
+                        {copiedKey === `chat-${idx}` ? (
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5" />
+                        )}
+                        <span>{copiedKey === `chat-${idx}` ? 'ተቀድቷል' : 'ቅዳ'}</span>
+                      </button>
+                      <button
+                        onClick={() => handleShare('የቀሲስ ሄኖክ የኦርቶዶክስ ትምህርት', msg.text, `share-chat-${idx}`)}
+                        className="px-2 py-1 rounded-lg bg-stone-900 hover:bg-stone-800 hover:text-amber-200 flex items-center gap-1 transition font-bold"
+                      >
+                        <Share2 className="w-3.5 h-3.5 text-sky-400" />
+                        <span>{sharedKey === `share-chat-${idx}` ? 'ሼር ተደርጓል' : 'ሼር'}</span>
+                      </button>
+                      <button
+                        onClick={() => downloadAsTextFile(topic, msg.text)}
+                        className="px-2 py-1 rounded-lg bg-stone-900 hover:bg-stone-800 hover:text-emerald-300 flex items-center gap-1 transition font-bold"
+                      >
+                        <Download className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>ዳውንሎድ</span>
                       </button>
                     </div>
                   )}
                 </div>
               </div>
             ))}
-
-            {loading && (
-              <div className="flex items-center gap-2 p-3 rounded-xl bg-stone-950/60 border border-stone-800 text-xs text-amber-300 w-fit">
-                <Sparkles className="w-4 h-4 animate-spin text-amber-400" />
-                <span>የቀሲስ ሄኖክ የኤአይ ጭንቅላት ከመጻሕፍት እየፈተሸ ነው...</span>
-              </div>
-            )}
+            <div ref={chatBottomRef} />
           </div>
 
-          {/* Quick Preset Buttons */}
+          {/* Quick Preset Questions */}
           <div className="p-2.5 bg-stone-950/90 border-t border-stone-800 flex items-center gap-1.5 overflow-x-auto">
             {presetQuestions.map((pq, i) => (
               <button
                 key={i}
                 onClick={() => handleAsk(pq)}
-                className="px-2.5 py-1 rounded-lg bg-stone-900 border border-stone-700/60 text-[11px] text-stone-300 whitespace-nowrap hover:text-amber-200 hover:border-amber-600 transition"
+                className="px-3 py-1.5 rounded-lg bg-stone-900 border border-stone-700/70 text-xs text-stone-200 font-bold whitespace-nowrap hover:text-amber-200 hover:border-amber-500 transition"
               >
                 {pq}
               </button>
@@ -209,79 +378,158 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
               type="text"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder="የንስሐ፣ የቀኖና ወይም የመንፈሳዊ ሕይወት ጥያቄዎን እዚህ ይጻፉ..."
-              className="flex-1 bg-stone-900 border border-stone-700 rounded-xl px-4 py-2.5 text-xs sm:text-sm text-stone-100 placeholder-stone-500 focus:outline-none focus:border-amber-500"
+              placeholder="ማንኛውንም የኦርቶዶክስ እምነት፣ ቀኖና፣ ታሪክ ወይም መንፈሳዊ ጥያቄ ይጻፉ..."
+              className="flex-1 bg-stone-900 border border-stone-700 rounded-xl px-4 py-3 text-sm text-stone-100 placeholder-stone-400 focus:outline-none focus:border-amber-500"
             />
             <button
               type="submit"
               disabled={loading || !prompt.trim()}
-              className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-red-950 to-amber-900 border border-amber-600 text-amber-200 font-medium text-xs hover:border-amber-400 disabled:opacity-50 transition flex items-center gap-1.5"
+              className="px-5 py-3 rounded-xl bg-gradient-to-r from-red-900 to-amber-800 border border-amber-500 text-white font-extrabold text-sm hover:border-amber-300 disabled:opacity-50 transition flex items-center gap-1.5"
             >
               <Send className="w-4 h-4" />
-              <span className="hidden sm:inline">ጠይቅ</span>
+              <span>ጠይቅ</span>
             </button>
           </form>
-
         </div>
 
-        {/* Right Column (4 cols): Scripture Cross-Referencing Tool */}
-        <div className="lg:col-span-4 space-y-4">
-          
-          <div className="p-5 rounded-2xl bg-stone-900/60 border border-amber-900/30 space-y-4">
-            <div className="flex items-center gap-2">
-              <BookOpen className="w-5 h-5 text-amber-400" />
-              <h3 className="text-base font-semibold font-heading text-amber-200">
-                የመጽሐፍ ቅዱስ ጥቅሶች ፍለጋ
-              </h3>
+        {/* Right Column (5 cols): Ultra-Fast Auto Orthodox Encyclopedia Search + Share + Download */}
+        <div className="lg:col-span-5 space-y-4">
+          <div className="p-5 rounded-2xl bg-stone-900/70 border border-amber-900/40 space-y-4 shadow-xl">
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <BookOpen className="w-5 h-5 text-amber-400 shrink-0" />
+                <h3 className="text-base sm:text-lg font-extrabold font-heading text-amber-100">
+                  ሁለንተናዊ የኦርቶዶክስ እውቀት ፍለጋ
+                </h3>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setAutoSearchEnabled((v) => !v)}
+                className={`px-2.5 py-1 rounded-lg border text-[11px] font-extrabold shrink-0 transition ${
+                  autoSearchEnabled
+                    ? 'bg-emerald-950/80 border-emerald-500/70 text-emerald-300'
+                    : 'bg-stone-950 border-stone-700 text-stone-400'
+                }`}
+              >
+                {autoSearchEnabled ? '⚡ Auto-Search: በርቷል' : 'Auto-Search: ጠፍቷል'}
+              </button>
             </div>
-            <p className="text-xs text-stone-400">
-              በርዕስ ወይም በኃጢአት አይነት መሰረት አጽናኝ የመጽሐፍ ቅዱስ ጥቅሶችን ያግኙ።
+
+            <p className="text-xs text-stone-300 font-semibold">
+              መጽሐፍ ቅዱስ፣ አዕማደ ምሥጢር፣ ፍትሐ ነገሥት፣ ገድለ ቅዱሳን፣ ቅዳሴ፣ በዓላትና አጽዋማት — ሲጽፉ በቀጥታ ይፈልጋል!
             </p>
 
-            <form onSubmit={handleSearchScripture} className="flex gap-2">
+            {/* Category Selector */}
+            <select
+              value={searchCategory}
+              onChange={(e) => setSearchCategory(e.target.value)}
+              className="w-full bg-stone-950 border border-stone-700 rounded-xl px-3 py-2 text-xs text-amber-200 font-bold focus:outline-none focus:border-amber-500"
+            >
+              {SEARCH_CATEGORIES.map((c) => (
+                <option key={c} value={c}>
+                  ዘርፍ: {c}
+                </option>
+              ))}
+            </select>
+
+            <form onSubmit={handleSearchSubmit} className="flex gap-2">
               <div className="relative flex-1">
-                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
                 <input
                   type="text"
                   value={scriptureQuery}
                   onChange={(e) => setScriptureQuery(e.target.value)}
-                  placeholder="ለምሳሌ፡ ይቅርታ፣ ኃጢአት፣ ተስፋ..."
-                  className="w-full bg-stone-950 border border-stone-700 rounded-xl pl-9 pr-3 py-2 text-xs text-stone-100 placeholder-stone-500 focus:outline-none focus:border-amber-500"
+                  placeholder="ቃል ወይም ርዕስ ይጻፉ (ምሳሌ፡ ሥላሴ፣ ጥምቀት፣ ኪዳነ ምሕረት...)"
+                  className="w-full bg-stone-950 border border-stone-700 rounded-xl pl-9 pr-3 py-2.5 text-sm text-stone-100 placeholder-stone-500 focus:outline-none focus:border-amber-500"
                 />
               </div>
               <button
                 type="submit"
                 disabled={scriptureLoading || !scriptureQuery.trim()}
-                className="px-3 py-2 rounded-xl bg-amber-950 border border-amber-700 text-amber-300 text-xs font-medium hover:bg-amber-900 disabled:opacity-50 transition"
+                className="px-4 py-2.5 rounded-xl bg-amber-700 hover:bg-amber-600 border border-amber-500 text-stone-950 text-xs font-extrabold disabled:opacity-50 transition"
               >
                 ፈልግ
               </button>
             </form>
 
-            {/* Scripture Search Results */}
-            {scriptureLoading ? (
-              <p className="text-xs text-amber-300 animate-pulse">ጥቅሶች ከመጽሐፍ ቅዱስ እየተፈለጉ ነው...</p>
-            ) : scriptureResult ? (
-              <div className="p-3.5 rounded-xl bg-stone-950 border border-stone-800 text-xs text-stone-200 whitespace-pre-wrap leading-relaxed font-serif">
-                {scriptureResult}
+            {/* Quick Tap Topics */}
+            <div className="flex flex-wrap gap-1.5">
+              {quickSearchTopics.map((qt) => (
+                <button
+                  key={qt}
+                  type="button"
+                  onClick={() => {
+                    setScriptureQuery(qt);
+                    executeOrthodoxSearch(qt, searchCategory);
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-stone-950 hover:bg-amber-950/60 border border-stone-800 hover:border-amber-600/50 text-[11px] text-amber-200 font-bold transition"
+                >
+                  {qt}
+                </button>
+              ))}
+            </div>
+
+            {/* Live Streaming Search Output + Share & Download */}
+            {scriptureResult !== null ? (
+              <div className="space-y-2.5">
+                <div className="p-4 rounded-xl bg-stone-950 border border-stone-800 text-sm text-stone-100 whitespace-pre-wrap leading-relaxed max-h-[340px] overflow-y-auto font-semibold">
+                  {scriptureResult || (
+                    <span className="text-amber-300 animate-pulse text-xs">
+                      ከኦርቶዶክስ እውቀት ማህደር በፍጥነት በማምጣት ላይ...
+                    </span>
+                  )}
+                </div>
+
+                {scriptureResult && (
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => handleShare(`ኦርቶዶክሳዊ እውቀት: ${scriptureQuery}`, scriptureResult, 'search-share')}
+                      className="flex-1 py-2 px-3 rounded-xl bg-sky-950/70 hover:bg-sky-900 border border-sky-700/60 text-sky-200 font-bold inline-flex items-center justify-center gap-1.5 transition"
+                    >
+                      <Share2 className="w-3.5 h-3.5" />
+                      <span>{sharedKey === 'search-share' ? 'ተጋርቷል!' : 'ሼር አድርግ'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => downloadAsTextFile(scriptureQuery || 'የኦርቶዶክስ እውቀት', scriptureResult)}
+                      className="flex-1 py-2 px-3 rounded-xl bg-emerald-950/70 hover:bg-emerald-900 border border-emerald-700/60 text-emerald-200 font-bold inline-flex items-center justify-center gap-1.5 transition"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>ዳውንሎድ (.txt)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(scriptureResult, 'search-copy')}
+                      className="py-2 px-3 rounded-xl bg-stone-950 hover:bg-stone-800 border border-stone-700 text-stone-200 font-bold inline-flex items-center gap-1.5 transition"
+                    >
+                      {copiedKey === 'search-copy' ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                      <span>{copiedKey === 'search-copy' ? 'ተቀድቷል' : 'ቅዳ'}</span>
+                    </button>
+                  </div>
+                )}
               </div>
             ) : (
-              <div className="p-3 rounded-xl bg-stone-950/60 border border-stone-800/80 text-xs text-stone-400 space-y-2">
-                <p className="font-semibold text-amber-300">ተደጋግመው የሚፈለጉ ጥቅሶች፡</p>
-                <ul className="space-y-1 list-disc list-inside">
-                  <li>መዝሙረ ዳዊት 51 (የዳዊት የንስሐ ጸሎት)</li>
-                  <li>1 ዮሐንስ 1:9 (የኃጢአት ስርየት)</li>
-                  <li>ሉቃስ 15 (የጠፋው ልጅ ምሳሌ)</li>
-                  <li>ምሳሌ 28:13 (ኃጢአትን መናዘዝ)</li>
+              <div className="p-3.5 rounded-xl bg-stone-950/70 border border-stone-800 text-xs text-stone-300 space-y-2">
+                <p className="font-extrabold text-amber-300">በቀላሉ ጠቅ አድርገው መፈለግ የሚችሉባቸው ርዕሶች፡</p>
+                <ul className="space-y-1 list-disc list-inside font-bold">
+                  <li>ምሥጢረ ሥላሴና አምስቱ አዕማደ ምሥጢር</li>
+                  <li>ሰባቱ ምሥጢራተ ቤተክርስቲያን</li>
+                  <li>ፍትሐ ነገሥትና የንስሐ ቀኖና</li>
+                  <li>የቅዱሳን ገድል፣ ስንክሳርና ነገረ ማርያም</li>
                 </ul>
               </div>
             )}
           </div>
-
         </div>
-
       </div>
-
     </div>
   );
 };

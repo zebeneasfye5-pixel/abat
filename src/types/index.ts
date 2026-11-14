@@ -87,3 +87,19 @@ export interface OfflinePrayer {
   amharicText: string;
   description: string;
 }
+
+export interface CommunityEngagement {
+  likesCount: number;
+  sharesCount: number;
+  contactsCount: number;
+}
+
+export interface PhoneContactRecord {
+  id: string;
+  name: string;
+  phone: string;
+  addedBy: string;
+  invitedAt: string;
+  note?: string;
+}
+

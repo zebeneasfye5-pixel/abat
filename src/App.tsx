@@ -8,6 +8,7 @@ import {
   WalletTransaction,
   BankAccountInfo,
   MinistryBankAccounts,
+  CommunityEngagement,
 } from './types';
 import {
   fetchConfessions,
@@ -15,6 +16,9 @@ import {
   fetchCurrentUser,
   getSavedUserSnapshot,
   updateConfessionStatus,
+  fetchCommunityEngagement,
+  toggleWebsiteLike,
+  recordWebsiteShare,
 } from './services/api';
 import { usePWAInstall } from './hooks/usePWAInstall';
 import {
@@ -30,6 +34,9 @@ import {
   LogIn,
   ArrowLeft,
   Home,
+  Heart,
+  Share2,
+  UserPlus,
 } from 'lucide-react';
 
 // Lazy-load secondary views & modals so the initial Home bundle loads fast on mobile networks
@@ -41,6 +48,7 @@ const OfflineLibrary = lazy(() => import('./components/OfflineLibrary').then((m)
 const SuperDashboardDrawer = lazy(() => import('./components/SuperDashboardDrawer').then((m) => ({ default: m.SuperDashboardDrawer })));
 const AuthProfileModal = lazy(() => import('./components/AuthProfileModal').then((m) => ({ default: m.AuthProfileModal })));
 const PWAInstallModal = lazy(() => import('./components/PWAInstallModal').then((m) => ({ default: m.PWAInstallModal })));
+const CommunityInviteModal = lazy(() => import('./components/CommunityInviteModal').then((m) => ({ default: m.CommunityInviteModal })));
 
 const EMPTY_GUEST_USER: UserProfile = {
   id: '',
@@ -76,9 +84,23 @@ export default function App() {
   const [isDashboardOpen, setIsDashboardOpen] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isInstallModalOpen, setIsInstallModalOpen] = useState(false);
+  const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [installBannerDismissed, setInstallBannerDismissed] = useState(false);
   const [isOnline, setIsOnline] = useState<boolean>(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const [authChecked, setAuthChecked] = useState(false);
+  const [engagement, setEngagement] = useState<CommunityEngagement>({
+    likesCount: 0,
+    sharesCount: 0,
+    contactsCount: 0,
+  });
+  const [hasLiked, setHasLiked] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('qh_site_liked_v1') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [shareToast, setShareToast] = useState<string>('');
 
   // Immediately hydrate saved authenticated user synchronously so closing & reopening NEVER asks to re-register
   const [user, setUser] = useState<UserProfile>(() => getSavedUserSnapshot() || EMPTY_GUEST_USER);
@@ -110,9 +132,16 @@ export default function App() {
       .then((loggedInUser) => {
         if (loggedInUser) {
           setUser(loggedInUser);
+        } else {
+          const params = new URLSearchParams(window.location.search);
+          if (params.get('inviteName') || params.get('invitePhone')) {
+            setIsAuthModalOpen(true);
+          }
         }
       })
       .finally(() => setAuthChecked(true));
+
+    fetchCommunityEngagement().then(setEngagement).catch(() => {});
 
     return () => {
       window.removeEventListener('online', handleOnline);
@@ -144,6 +173,10 @@ export default function App() {
         setIsAuthModalOpen(false);
         return;
       }
+      if (isInviteModalOpen) {
+        setIsInviteModalOpen(false);
+        return;
+      }
       if (isInstallModalOpen) {
         setIsInstallModalOpen(false);
         return;
@@ -160,7 +193,7 @@ export default function App() {
 
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, [isDashboardOpen, isAuthModalOpen, isInstallModalOpen]);
+  }, [isDashboardOpen, isAuthModalOpen, isInstallModalOpen, isInviteModalOpen]);
 
   const handleUpdateUser = (updated: UserProfile) => {
     setUser(updated);
@@ -198,6 +231,10 @@ export default function App() {
       setIsAuthModalOpen(false);
       return;
     }
+    if (isInviteModalOpen) {
+      setIsInviteModalOpen(false);
+      return;
+    }
     if (isInstallModalOpen) {
       setIsInstallModalOpen(false);
       return;
@@ -212,7 +249,7 @@ export default function App() {
       setActiveTab('home');
     }
     window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, [isDashboardOpen, isAuthModalOpen, isInstallModalOpen, tabHistory]);
+  }, [isDashboardOpen, isAuthModalOpen, isInstallModalOpen, isInviteModalOpen, tabHistory]);
 
   const handleOpenDashboard = () => {
     if (!user.isAuthenticated) {
@@ -250,6 +287,40 @@ export default function App() {
       if (outcome === 'accepted') return;
     }
     setIsInstallModalOpen(true);
+  };
+
+  const handleToggleLike = async () => {
+    const nextLiked = !hasLiked;
+    setHasLiked(nextLiked);
+    setEngagement((prev) => ({
+      ...prev,
+      likesCount: Math.max(0, prev.likesCount + (nextLiked ? 1 : -1)),
+    }));
+    try {
+      localStorage.setItem('qh_site_liked_v1', nextLiked ? '1' : '0');
+    } catch {}
+    const updated = await toggleWebsiteLike(nextLiked ? 'like' : 'unlike');
+    setEngagement(updated);
+  };
+
+  const handleShareSite = async () => {
+    const url = window.location.origin;
+    const text = `በ"ቀሲስ ሄኖክ" የኢትዮጵያ ኦርቶዶክስ ተዋሕዶ የቀጥታ ዙም ጉባኤ፣ የንስሐ ሚስጥር ቤት እና መንፈሳዊ ኤአይ ሊቅ ይቀላቀሉ፦ ${url}`;
+    try {
+      if (navigator.share) {
+        await navigator.share({
+          title: 'ቀሲስ ሄኖክ — መንፈሳዊ ጉባኤና ኤአይ',
+          text,
+          url,
+        });
+      } else {
+        await navigator.clipboard.writeText(url);
+        setShareToast('የድህረገጹ ሊንክ ተቀድቷል! ለወዳጆችዎ ይላኩ።');
+        setTimeout(() => setShareToast(''), 3500);
+      }
+      const updated = await recordWebsiteShare();
+      setEngagement(updated);
+    } catch {}
   };
 
   const renderAuthGate = (title: string) => (
@@ -357,10 +428,23 @@ export default function App() {
         </div>
       )}
 
+      {shareToast && (
+        <div className="fixed bottom-20 right-4 z-50 px-4 py-2.5 rounded-xl bg-emerald-950 border border-emerald-500 text-emerald-200 text-xs font-bold shadow-2xl">
+          {shareToast}
+        </div>
+      )}
+
       <main className="flex-1 pb-20 lg:pb-12">
         {activeTab === 'home' && (
           <>
-            <HeroSection onNavigate={handleNavigate} />
+            <HeroSection
+              onNavigate={handleNavigate}
+              engagement={engagement}
+              hasLiked={hasLiked}
+              onToggleLike={handleToggleLike}
+              onShareSite={handleShareSite}
+              onOpenContactsInvite={() => setIsInviteModalOpen(true)}
+            />
 
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -512,15 +596,48 @@ export default function App() {
         </button>
       </div>
 
-      <footer className="border-t border-amber-900/20 bg-stone-950 py-8 text-center text-xs text-stone-500 space-y-2">
+      <footer className="border-t border-amber-900/20 bg-stone-950 py-8 text-center text-xs text-stone-400 space-y-3 px-4">
+        <div className="flex flex-wrap items-center justify-center gap-2 pb-1">
+          <button
+            type="button"
+            onClick={handleToggleLike}
+            className={`px-3.5 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition ${
+              hasLiked
+                ? 'bg-red-950/90 border-red-500 text-red-200'
+                : 'bg-stone-900 border-stone-700 text-stone-200 hover:border-red-500/60'
+            }`}
+          >
+            <Heart className={`w-3.5 h-3.5 ${hasLiked ? 'fill-red-400 text-red-400' : 'text-red-400'}`} />
+            <span>ላይክ ({engagement.likesCount})</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleShareSite}
+            className="px-3.5 py-2 rounded-xl bg-amber-950/70 hover:bg-amber-900 border border-amber-700/60 text-amber-200 text-xs font-bold flex items-center gap-1.5 transition"
+          >
+            <Share2 className="w-3.5 h-3.5 text-amber-400" />
+            <span>ሼር ({engagement.sharesCount})</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIsInviteModalOpen(true)}
+            className="px-3.5 py-2 rounded-xl bg-emerald-950/70 hover:bg-emerald-900 border border-emerald-700/60 text-emerald-200 text-xs font-bold flex items-center gap-1.5 transition"
+          >
+            <UserPlus className="w-3.5 h-3.5 text-emerald-400" />
+            <span>ከስልክ ሰው ጨምር ({engagement.contactsCount})</span>
+          </button>
+        </div>
+
         <div className="flex items-center justify-center gap-2">
           <Flame className="w-4 h-4 text-amber-500 animate-candle" />
-          <span className="font-heading font-semibold text-amber-200">ቀሲስ ሄኖክ — የንስሐና የመንፈሳዊ አገልግሎት ሥርዓት</span>
+          <span className="font-heading font-bold text-amber-200">ቀሲስ ሄኖክ — የንስሐና የመንፈሳዊ አገልግሎት ሥርዓት</span>
         </div>
-        <p className="max-w-md mx-auto text-stone-400">
+        <p className="max-w-md mx-auto text-stone-400 font-semibold">
           "አቤቱ፥ ንጹሕ ልብን ፍጠርልኝ፥ የቀናውንም መንፈስ በውስጤ አድስ።" (መዝሙረ ዳዊት ፶፩:፲)
         </p>
-        <p className="text-[11px] text-stone-600">
+        <p className="text-[11px] text-stone-500 font-semibold">
           © {new Date().getFullYear()} ቀሲስ ሄኖክ. ሁሉም መብቱ የተጠበቀ ነው።
         </p>
       </footer>
@@ -553,6 +670,17 @@ export default function App() {
           <PWAInstallModal
             isOpen={isInstallModalOpen}
             onClose={() => setIsInstallModalOpen(false)}
+          />
+        )}
+
+        {isInviteModalOpen && (
+          <CommunityInviteModal
+            isOpen={isInviteModalOpen}
+            onClose={() => setIsInviteModalOpen(false)}
+            user={user}
+            engagement={engagement}
+            onEngagementChange={setEngagement}
+            onShareSite={handleShareSite}
           />
         )}
       </Suspense>

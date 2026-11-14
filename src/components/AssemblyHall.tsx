@@ -24,15 +24,26 @@ import {
   Check,
   Wifi,
   AlertTriangle,
+  Sparkles,
+  ArrowUpCircle,
+  ArrowDownCircle,
 } from 'lucide-react';
 import { UserProfile } from '../types';
-import { fetchWebRTCConfig, getRealtimeWsUrl } from '../services/api';
+import { fetchLiveKitToken, fetchWebRTCConfig, getRealtimeWsUrl } from '../services/api';
 import { toggleSpiritualHymn, stopSpiritualHymn, playChurchBell } from '../utils/audio';
 
 interface AssemblyHallProps {
   user: UserProfile;
   onLeaveMeeting?: () => void;
 }
+
+type VideoQualityPreset = '1080p' | '720p' | '360p';
+
+const QUALITY_MAP: Record<VideoQualityPreset, { width: number; height: number; maxBitrate: number; label: string }> = {
+  '1080p': { width: 1920, height: 1080, maxBitrate: 2_500_000, label: 'Full HD 1080p' },
+  '720p': { width: 1280, height: 720, maxBitrate: 1_200_000, label: 'HD 720p' },
+  '360p': { width: 640, height: 360, maxBitrate: 450_000, label: 'ፈጣን 360p' },
+};
 
 interface RemotePeer {
   peerId: string;
@@ -45,6 +56,7 @@ interface RemotePeer {
   isVideoOn: boolean;
   isHandRaised: boolean;
   isScreenSharing: boolean;
+  onStage?: boolean;
 }
 
 interface ChatMessage {
@@ -62,13 +74,40 @@ interface FloatingReaction {
   x: number;
 }
 
-// Sub-component for reliable remote video/audio attachment
+async function applyStudioEncoderTuning(pc: RTCPeerConnection, quality: VideoQualityPreset) {
+  const targetBitrate = QUALITY_MAP[quality].maxBitrate;
+  for (const sender of pc.getSenders()) {
+    if (!sender.track) continue;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+      }
+      if (sender.track.kind === 'video') {
+        params.encodings[0].maxBitrate = targetBitrate;
+        params.encodings[0].maxFramerate = 30;
+        (params as any).degradationPreference = 'maintain-framerate';
+      } else if (sender.track.kind === 'audio') {
+        params.encodings[0].maxBitrate = 96_000;
+      }
+      await sender.setParameters(params);
+    } catch {
+      // Browser may skip unsupported RTCRtpEncodingParameters gracefully
+    }
+  }
+}
+
+// Sub-component for reliable high-res remote video/audio attachment + per-video fullscreen
 const RemoteVideoTile: React.FC<{
   peer: RemotePeer;
   isGlobalAudioMuted: boolean;
   isPinned: boolean;
+  isExpanded: boolean;
   onPin: (peerId: string) => void;
-}> = ({ peer, isGlobalAudioMuted, isPinned, onPin }) => {
+  onToggleExpand: (peerId: string) => void;
+  tallStage?: boolean;
+}> = ({ peer, isGlobalAudioMuted, isPinned, isExpanded, onPin, onToggleExpand, tallStage }) => {
+  const tileRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [needsPlayTap, setNeedsPlayTap] = useState(false);
 
@@ -85,11 +124,36 @@ const RemoteVideoTile: React.FC<{
     }
   }, [peer.stream, peer.isVideoOn]);
 
+  const handleTileFullscreen = async () => {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen().catch(() => {});
+      if (isExpanded) onToggleExpand(peer.peerId);
+      return;
+    }
+    onToggleExpand(peer.peerId);
+    const el = tileRef.current;
+    const vid = videoRef.current as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | null;
+    if (el?.requestFullscreen) {
+      el.requestFullscreen().catch(() => {});
+    } else if (vid?.webkitEnterFullscreen) {
+      try {
+        vid.webkitEnterFullscreen();
+      } catch {}
+    }
+  };
+
   const isConnected = peer.connectionState === 'connected' || peer.connectionState === 'completed';
 
   return (
     <div
-      className={`relative rounded-2xl overflow-hidden bg-stone-950 border-2 transition-all shadow-xl aspect-[16/10] flex flex-col justify-between ${
+      ref={tileRef}
+      className={`overflow-hidden bg-stone-950 border-2 transition-all shadow-2xl flex flex-col justify-between ${
+        isExpanded
+          ? 'fixed inset-0 z-50 rounded-none border-amber-500 h-screen w-screen'
+          : tallStage
+          ? 'relative rounded-2xl min-h-[420px] sm:min-h-[540px] lg:min-h-[620px]'
+          : 'relative rounded-2xl min-h-[320px] sm:min-h-[400px]'
+      } ${
         peer.isMicOn && isConnected
           ? 'border-emerald-500 ring-2 ring-emerald-500/40'
           : peer.isHandRaised
@@ -102,19 +166,19 @@ const RemoteVideoTile: React.FC<{
         autoPlay
         playsInline
         muted={isGlobalAudioMuted}
-        className={`absolute inset-0 w-full h-full object-cover ${
+        className={`absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.06] ${
           peer.stream && peer.isVideoOn ? 'block' : 'hidden'
         }`}
       />
 
       {(!peer.stream || !peer.isVideoOn) && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-900/95 text-stone-300 p-4 text-center">
-          <div className="w-14 h-14 rounded-full bg-amber-950 border border-amber-600/50 flex items-center justify-center text-lg font-bold text-amber-200 mb-2">
+          <div className="w-16 h-16 rounded-full bg-amber-950 border-2 border-amber-500/60 flex items-center justify-center text-xl font-extrabold text-amber-200 mb-2">
             {(peer.baptismalName || peer.userName || 'ተ').charAt(0)}
           </div>
-          <p className="text-xs font-semibold text-amber-200">{peer.baptismalName || peer.userName}</p>
-          <p className="text-[11px] text-stone-400 mt-0.5">
-            {!peer.stream ? 'ቪዲዮ በመገናኘት ላይ...' : 'ካሜራ ዘግተዋል'}
+          <p className="text-sm font-extrabold text-amber-200">{peer.baptismalName || peer.userName}</p>
+          <p className="text-xs text-stone-300 mt-1">
+            {!peer.stream ? 'ከፍተኛ ጥራት HD ቪዲዮ በመገናኘት ላይ...' : 'ካሜራ ዘግተዋል'}
           </p>
         </div>
       )}
@@ -124,30 +188,30 @@ const RemoteVideoTile: React.FC<{
           onClick={() => {
             videoRef.current?.play().then(() => setNeedsPlayTap(false)).catch(() => {});
           }}
-          className="absolute inset-0 z-20 bg-black/70 flex flex-col items-center justify-center text-amber-200 text-xs font-bold gap-2"
+          className="absolute inset-0 z-20 bg-black/75 flex flex-col items-center justify-center text-amber-200 text-xs font-extrabold gap-2"
         >
-          <Volume2 className="w-7 h-7 text-amber-400 animate-pulse" />
+          <Volume2 className="w-8 h-8 text-amber-400 animate-pulse" />
           <span>ድምፅና ምስል ለማብራት ይንኩ (Tap to Play)</span>
         </button>
       )}
 
       {/* Top Info */}
-      <div className="relative z-10 p-2.5 flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 bg-stone-950/85 backdrop-blur-md px-2.5 py-1 rounded-lg border border-stone-700 text-xs text-amber-200 truncate">
+      <div className="relative z-10 p-3 flex items-center justify-between gap-2 bg-gradient-to-b from-black/75 via-black/30 to-transparent">
+        <div className="flex items-center gap-1.5 bg-stone-950/90 backdrop-blur-md px-3 py-1 rounded-lg border border-stone-700 text-xs text-amber-200 truncate">
           <span
             className={`w-2 h-2 rounded-full shrink-0 ${
               isConnected ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'
             }`}
           />
-          <span className="font-bold truncate">
+          <span className="font-extrabold truncate">
             {peer.baptismalName || peer.userName}
             {peer.role === 'priest' ? ' (ቀሲስ)' : ''}
           </span>
         </div>
 
-        <div className="flex items-center gap-1 shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0">
           {peer.isHandRaised && (
-            <div className="flex items-center gap-1 bg-amber-500 text-stone-950 px-2 py-0.5 rounded-lg text-[10px] font-bold animate-bounce shadow">
+            <div className="flex items-center gap-1 bg-amber-500 text-stone-950 px-2.5 py-0.5 rounded-lg text-[11px] font-extrabold animate-bounce shadow">
               <Hand className="w-3 h-3" />
               <span>ሀሳብ አለኝ</span>
             </div>
@@ -157,40 +221,47 @@ const RemoteVideoTile: React.FC<{
             className={`p-1.5 rounded-lg border transition ${
               isPinned
                 ? 'bg-amber-600 text-stone-950 border-amber-400'
-                : 'bg-stone-900/80 text-stone-300 border-stone-700 hover:text-amber-200'
+                : 'bg-stone-900/90 text-stone-200 border-stone-700 hover:text-amber-200'
             }`}
-            title="ስክሪን አጉላ"
+            title="ዋና ስክሪን አድርግ"
           >
-            <Pin className="w-3.5 h-3.5" />
+            <Pin className="w-4 h-4" />
+          </button>
+          <button
+            onClick={handleTileFullscreen}
+            className="p-1.5 rounded-lg bg-stone-900/90 text-amber-200 border border-amber-600/60 hover:bg-amber-700 hover:text-stone-950 transition"
+            title={isExpanded ? 'ሙሉ ስክሪን ዝጋ' : 'ሙሉ ስክሪን ክፈት'}
+          >
+            {isExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
           </button>
         </div>
       </div>
 
       {/* Bottom Info */}
-      <div className="relative z-10 p-2.5 flex items-center justify-between bg-gradient-to-t from-black/90 via-black/40 to-transparent text-[10px]">
-        <div className="flex items-center gap-1.5">
+      <div className="relative z-10 p-3 flex items-center justify-between bg-gradient-to-t from-black/90 via-black/45 to-transparent text-xs">
+        <div className="flex items-center gap-2">
           <span
             className={`p-1.5 rounded-md border ${
               peer.isMicOn
-                ? 'bg-emerald-950/80 border-emerald-500 text-emerald-300'
-                : 'bg-red-950/80 border-red-700 text-red-300'
+                ? 'bg-emerald-950/90 border-emerald-500 text-emerald-300'
+                : 'bg-red-950/90 border-red-700 text-red-300'
             }`}
           >
-            {peer.isMicOn ? <Mic className="w-3 h-3 animate-pulse" /> : <MicOff className="w-3 h-3" />}
+            {peer.isMicOn ? <Mic className="w-3.5 h-3.5 animate-pulse" /> : <MicOff className="w-3.5 h-3.5" />}
           </span>
-          <span className="text-stone-300">
+          <span className="text-stone-200 font-bold">
             {peer.isScreenSharing ? 'ስክሪን እያጋሩ ነው' : peer.isMicOn ? 'እየተናገሩ ነው' : 'ማይክ ዝግ ነው'}
           </span>
         </div>
 
         <span
-          className={`px-1.5 py-0.5 rounded font-mono ${
+          className={`px-2 py-0.5 rounded font-mono text-[11px] font-bold ${
             isConnected
-              ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-700/50'
-              : 'bg-amber-950/80 text-amber-300 border border-amber-700/50'
+              ? 'bg-emerald-950/90 text-emerald-300 border border-emerald-700/60'
+              : 'bg-amber-950/90 text-amber-300 border border-amber-700/60'
           }`}
         >
-          {isConnected ? 'ቀጥታ HD' : peer.connectionState}
+          {isConnected ? 'ቀጥታ Full HD' : peer.connectionState}
         </span>
       </div>
     </div>
@@ -203,8 +274,15 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const [viewMode, setViewMode] = useState<'gallery' | 'speaker'>('gallery');
   const [activeTabPanel, setActiveTabPanel] = useState<'chat' | 'participants' | 'none'>('chat');
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [expandedTileId, setExpandedTileId] = useState<string | null>(null);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
+  const [videoQuality, setVideoQuality] = useState<VideoQualityPreset>('1080p');
+
+  // Scalability & SFU Telemetry state
+  const [broadcastMode, setBroadcastMode] = useState<'interactive-mesh' | 'stage-broadcast' | 'livekit-sfu'>('interactive-mesh');
+  const [selfOnStage, setSelfOnStage] = useState(true);
+  const [serverClientCount, setServerClientCount] = useState<number>(1);
 
   // Media state
   const [isVideoOn, setIsVideoOn] = useState(true);
@@ -229,6 +307,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
   // Refs
   const selfPeerIdRef = useRef<string>(user.id || `peer-${Math.random().toString(36).slice(2, 9)}`);
+  const selfTileRef = useRef<HTMLDivElement | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -236,6 +315,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const liveKitRoomRef = useRef<any>(null);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const pendingIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const rtcConfigRef = useRef<RTCConfiguration>({
@@ -247,6 +327,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   });
   const isMicOnRef = useRef(isMicOn);
   isMicOnRef.current = isMicOn;
+  const videoQualityRef = useRef<VideoQualityPreset>(videoQuality);
+  videoQualityRef.current = videoQuality;
 
   const meetingContainerRef = useRef<HTMLDivElement | null>(null);
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
@@ -260,7 +342,6 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     }, 2800);
   }, []);
 
-  // Create or get RTCPeerConnection for a specific peer
   const createPeerConnection = useCallback((targetPeerId: string) => {
     const existing = peerConnectionsRef.current.get(targetPeerId);
     if (existing) {
@@ -270,7 +351,6 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     const pc = new RTCPeerConnection(rtcConfigRef.current);
     peerConnectionsRef.current.set(targetPeerId, pc);
 
-    // Add local tracks OR recvonly transceivers if user has no camera/mic
     const localStream = localStreamRef.current;
     if (localStream && localStream.getTracks().length > 0) {
       localStream.getTracks().forEach((track) => {
@@ -282,6 +362,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       if (localStream.getAudioTracks().length === 0) {
         pc.addTransceiver('audio', { direction: 'recvonly' });
       }
+      applyStudioEncoderTuning(pc, videoQualityRef.current);
     } else {
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -322,7 +403,6 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     return pc;
   }, []);
 
-  // Drain any queued ICE candidates once remoteDescription is set
   const flushIceCandidates = async (peerId: string, pc: RTCPeerConnection) => {
     const queue = pendingIceRef.current.get(peerId) || [];
     if (queue.length === 0) return;
@@ -330,35 +410,53 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     for (const cand of queue) {
       try {
         await pc.addIceCandidate(new RTCIceCandidate(cand));
-      } catch (e) {
-        console.warn('Queued ICE error:', e);
-      }
+      } catch {}
     }
   };
 
-  // Boot sequence: 1) WebRTC config, 2) Local Camera/Mic, 3) WebSocket Signaling
+  // Boot sequence: 1) High-Def 1080p Camera + 48kHz Studio Audio, 2) WebRTC / LiveKit SFU, 3) Signaling WS
   useEffect(() => {
     let isCancelled = false;
 
     const boot = async () => {
-      rtcConfigRef.current = await fetchWebRTCConfig();
+      const extConfig = await fetchWebRTCConfig();
+      rtcConfigRef.current = { iceServers: extConfig.iceServers };
 
-      // Acquire local camera/mic with graceful fallback
+      // 1. Acquire Full HD 1080p Video & 48kHz Studio Audio with progressive fallback
       let acquiredStream: MediaStream | null = null;
+      const hdAudioConstraints: MediaTrackConstraints = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+        sampleRate: 48000,
+      };
       try {
         acquiredStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: {
+            facingMode: 'user',
+            width: { ideal: 1920, min: 640 },
+            height: { ideal: 1080, min: 480 },
+            frameRate: { ideal: 30, min: 15 },
+          },
+          audio: hdAudioConstraints,
         });
       } catch {
         try {
-          acquiredStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          setIsVideoOn(false);
-          setMediaWarning('ካሜራ አልተገኘም ወይም አልተፈቀደም፤ በድምፅ ብቻ ተቀላቅለዋል።');
+          acquiredStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          });
         } catch {
-          setIsVideoOn(false);
-          setIsMicOn(false);
-          setMediaWarning('ካሜራ እና ማይክራፎን አልተፈቀደም፤ እንደ ተመልካች (Viewer Mode) ተቀላቅለዋል።');
+          try {
+            acquiredStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            setIsVideoOn(false);
+            setMediaWarning('ካሜራ አልተገኘም ወይም አልተፈቀደም፤ በድምፅ ብቻ ተቀላቅለዋል።');
+          } catch {
+            setIsVideoOn(false);
+            setIsMicOn(false);
+            setMediaWarning('ካሜራ እና ማይክራፎን አልተፈቀደም፤ እንደ ተመልካች (Viewer Mode) ተቀላቅለዋል።');
+          }
         }
       }
 
@@ -374,7 +472,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
           localVideoRef.current.play().catch(() => {});
         }
 
-        // Audio meter
+        // Studio Mic Meter
         try {
           const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
           const ctx = new AudioCtx();
@@ -402,7 +500,72 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         } catch {}
       }
 
-      // Connect WebSocket Signaling AFTER local media is ready
+      // 2. If LiveKit Enterprise SFU is configured on server, use SFU for 1,000 - 10,000+ concurrent viewers!
+      if (extConfig.sfuConfigured) {
+        try {
+          const lkData = await fetchLiveKitToken(
+            ROOM_ID,
+            selfPeerIdRef.current,
+            user.baptismalName || user.fullName || 'ተሳታፊ',
+            true
+          );
+          if (lkData.sfuConfigured && lkData.url && lkData.token) {
+            const { Room, RoomEvent } = await import('livekit-client');
+            const lkRoom = new Room({
+              adaptiveStream: true,
+              dynacast: true,
+            });
+            liveKitRoomRef.current = lkRoom;
+
+            const syncLkParticipants = () => {
+              const list: RemotePeer[] = [];
+              lkRoom.remoteParticipants.forEach((rp) => {
+                const tracks: MediaStreamTrack[] = [];
+                rp.trackPublications.forEach((pub) => {
+                  if (pub.track?.mediaStreamTrack) {
+                    tracks.push(pub.track.mediaStreamTrack);
+                  }
+                });
+                list.push({
+                  peerId: rp.identity,
+                  userName: rp.name || rp.identity,
+                  baptismalName: rp.name || rp.identity,
+                  role: 'attendee',
+                  stream: tracks.length > 0 ? new MediaStream(tracks) : null,
+                  connectionState: 'connected',
+                  isMicOn: rp.isMicrophoneEnabled,
+                  isVideoOn: rp.isCameraEnabled,
+                  isHandRaised: false,
+                  isScreenSharing: rp.isScreenShareEnabled,
+                  onStage: true,
+                });
+              });
+              setRemotePeers(list);
+              setServerClientCount(1 + lkRoom.remoteParticipants.size);
+            };
+
+            lkRoom
+              .on(RoomEvent.ParticipantConnected, syncLkParticipants)
+              .on(RoomEvent.ParticipantDisconnected, syncLkParticipants)
+              .on(RoomEvent.TrackSubscribed, syncLkParticipants)
+              .on(RoomEvent.TrackUnsubscribed, syncLkParticipants)
+              .on(RoomEvent.TrackMuted, syncLkParticipants)
+              .on(RoomEvent.TrackUnmuted, syncLkParticipants);
+
+            await lkRoom.connect(lkData.url, lkData.token);
+            if (acquiredStream) {
+              for (const t of acquiredStream.getTracks()) {
+                await lkRoom.localParticipant.publishTrack(t);
+              }
+            }
+            setBroadcastMode('livekit-sfu');
+          }
+        } catch (err) {
+          console.warn('LiveKit SFU fallback to built-in Relay/Stage WS:', err);
+        }
+      }
+
+      // 3. Connect High-Scale Anti-Congestion WebSocket Signaling (Chat, Stage Control, Reactions, & Relay Mesh)
       const ws = new WebSocket(getRealtimeWsUrl());
       wsRef.current = ws;
 
@@ -434,11 +597,21 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         try {
           const data = JSON.parse(event.data);
 
-          // 1. Received full room state -> Initiate Offers ONLY to existing peers
           if (data.type === 'room-state') {
             if (Array.isArray(data.chatHistory) && data.chatHistory.length > 0) {
               setChatMessages(data.chatHistory);
             }
+            if (typeof data.selfOnStage === 'boolean') {
+              setSelfOnStage(data.selfOnStage);
+            }
+            if (data.broadcastMode && !liveKitRoomRef.current) {
+              setBroadcastMode(data.broadcastMode);
+            }
+            if (typeof data.clientCount === 'number') {
+              setServerClientCount(data.clientCount);
+            }
+
+            if (liveKitRoomRef.current) return;
 
             const existing: any[] = data.existingPeers || [];
             setRemotePeers(
@@ -453,6 +626,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 isVideoOn: Boolean(p.isVideoOn),
                 isHandRaised: Boolean(p.isHandRaised),
                 isScreenSharing: Boolean(p.isScreenSharing),
+                onStage: p.onStage !== false,
               }))
             );
 
@@ -469,11 +643,36 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 })
               );
             }
-          }
+          } else if (data.type === 'peer-joined' && data.peer) {
+            if (typeof data.clientCount === 'number') setServerClientCount(data.clientCount);
+            if (data.broadcastMode && !liveKitRoomRef.current) setBroadcastMode(data.broadcastMode);
+            if (liveKitRoomRef.current) return;
 
-          // 2. A new peer joined -> Add them to grid (they will send us an offer)
-          else if (data.type === 'peer-joined' && data.peer) {
             const p = data.peer;
+            // In Mass Broadcast mode, only connect video feeds for Stage speakers (prevents N x N congestion)
+            if (data.broadcastMode === 'stage-broadcast' && !p.onStage && p.role !== 'priest') {
+              setRemotePeers((prev) => {
+                if (prev.some((x) => x.peerId === p.peerId)) return prev;
+                return [
+                  ...prev,
+                  {
+                    peerId: p.peerId,
+                    userName: p.userName,
+                    baptismalName: p.baptismalName || p.userName,
+                    role: p.role,
+                    stream: null,
+                    connectionState: 'listener',
+                    isMicOn: false,
+                    isVideoOn: false,
+                    isHandRaised: false,
+                    isScreenSharing: false,
+                    onStage: false,
+                  },
+                ];
+              });
+              return;
+            }
+
             setRemotePeers((prev) => {
               if (prev.some((x) => x.peerId === p.peerId)) return prev;
               return [
@@ -489,13 +688,12 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                   isVideoOn: Boolean(p.isVideoOn),
                   isHandRaised: Boolean(p.isHandRaised),
                   isScreenSharing: Boolean(p.isScreenSharing),
+                  onStage: p.onStage !== false,
                 },
               ];
             });
-          }
-
-          // 3. Targeted WebRTC SDP / ICE
-          else if (data.type === 'webrtc-signal' && data.signal && data.senderPeerId) {
+          } else if (data.type === 'webrtc-signal' && data.signal && data.senderPeerId) {
+            if (liveKitRoomRef.current) return;
             const senderId = data.senderPeerId;
             const pc = createPeerConnection(senderId);
             const { signal } = data;
@@ -524,10 +722,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 pendingIceRef.current.set(senderId, q);
               }
             }
-          }
-
-          // 4. Peer Media State Update (Mic, Video, Hand Raise, Screen Share)
-          else if (data.type === 'peer-media-state') {
+          } else if (data.type === 'peer-media-state') {
             setRemotePeers((prev) =>
               prev.map((p) =>
                 p.peerId === data.peerId
@@ -537,14 +732,27 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                       isVideoOn: data.isVideoOn,
                       isHandRaised: data.isHandRaised,
                       isScreenSharing: data.isScreenSharing,
+                      onStage: data.onStage,
                     }
                   : p
               )
             );
-          }
-
-          // 5. Peer Left
-          else if (data.type === 'peer-left') {
+          } else if (data.type === 'stage-updated') {
+            if (data.peerId === selfPeerIdRef.current) {
+              setSelfOnStage(Boolean(data.onStage));
+              if (!data.onStage) {
+                setIsMicOn(false);
+                localStreamRef.current?.getAudioTracks().forEach((t) => {
+                  t.enabled = false;
+                });
+              }
+            } else {
+              setRemotePeers((prev) =>
+                prev.map((p) => (p.peerId === data.peerId ? { ...p, onStage: Boolean(data.onStage) } : p))
+              );
+            }
+          } else if (data.type === 'peer-left') {
+            if (typeof data.clientCount === 'number') setServerClientCount(data.clientCount);
             const pc = peerConnectionsRef.current.get(data.peerId);
             if (pc) {
               pc.close();
@@ -552,10 +760,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             }
             pendingIceRef.current.delete(data.peerId);
             setRemotePeers((prev) => prev.filter((p) => p.peerId !== data.peerId));
-          }
-
-          // 6. Live Chat
-          else if (data.type === 'assembly-chat-message') {
+          } else if (data.type === 'assembly-chat-message') {
             setChatMessages((prev) => [
               ...prev,
               {
@@ -566,22 +771,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 isPriest: data.isPriest,
               },
             ]);
-          }
-
-          // 7. Reactions
-          else if (data.type === 'assembly-reaction-broadcast') {
+          } else if (data.type === 'assembly-reaction-broadcast') {
             triggerReaction(data.emoji, data.sender);
-          }
-
-          // 8. Host Mute All
-          else if (data.type === 'force-mute') {
+          } else if (data.type === 'force-mute') {
             setIsMicOn(false);
             localStreamRef.current?.getAudioTracks().forEach((t) => {
               t.enabled = false;
             });
           }
         } catch (err) {
-          console.warn('WS message parse/handle error:', err);
+          console.warn('WS message handle error:', err);
         }
       };
     };
@@ -590,6 +789,12 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
     return () => {
       isCancelled = true;
+      if (liveKitRoomRef.current) {
+        try {
+          liveKitRoomRef.current.disconnect();
+        } catch {}
+        liveKitRoomRef.current = null;
+      }
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'leave-room' }));
         wsRef.current.close();
@@ -612,13 +817,14 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
-  // Sync media state to peers
-  const broadcastMediaState = (overrides: Partial<{
-    isMicOn: boolean;
-    isVideoOn: boolean;
-    isHandRaised: boolean;
-    isScreenSharing: boolean;
-  }>) => {
+  const broadcastMediaState = (
+    overrides: Partial<{
+      isMicOn: boolean;
+      isVideoOn: boolean;
+      isHandRaised: boolean;
+      isScreenSharing: boolean;
+    }>
+  ) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
@@ -630,6 +836,24 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         })
       );
     }
+  };
+
+  const handleChangeQuality = async (nextQuality: VideoQualityPreset) => {
+    setVideoQuality(nextQuality);
+    const spec = QUALITY_MAP[nextQuality];
+    const videoTrack = localStreamRef.current?.getVideoTracks()[0];
+    if (videoTrack) {
+      try {
+        await videoTrack.applyConstraints({
+          width: { ideal: spec.width },
+          height: { ideal: spec.height },
+          frameRate: { ideal: 30 },
+        });
+      } catch {}
+    }
+    peerConnectionsRef.current.forEach((pc) => {
+      applyStudioEncoderTuning(pc, nextQuality);
+    });
   };
 
   const handleToggleMic = () => {
@@ -661,12 +885,17 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     broadcastMediaState({ isVideoOn: next });
   };
 
-  // Flip camera seamlessly WITHOUT dropping existing WebRTC connections
   const handleFlipCamera = async () => {
     const nextFacing = facingMode === 'user' ? 'environment' : 'user';
+    const spec = QUALITY_MAP[videoQuality];
     try {
       const newCamStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: nextFacing },
+        video: {
+          facingMode: nextFacing,
+          width: { ideal: spec.width },
+          height: { ideal: spec.height },
+          frameRate: { ideal: 30 },
+        },
       });
       const newVideoTrack = newCamStream.getVideoTracks()[0];
       const oldVideoTrack = localStreamRef.current?.getVideoTracks()[0];
@@ -683,6 +912,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         peerConnectionsRef.current.forEach((pc) => {
           const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
           if (sender) sender.replaceTrack(newVideoTrack).catch(() => {});
+          applyStudioEncoderTuning(pc, videoQuality);
         });
         setFacingMode(nextFacing);
       }
@@ -691,7 +921,6 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     }
   };
 
-  // Real Screen Share sent to ALL peers via replaceTrack
   const handleToggleScreenShare = async () => {
     if (isScreenSharing) {
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -738,9 +967,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             }
           }
         };
-      } catch {
-        // User cancelled screen picker
-      }
+      } catch {}
     }
   };
 
@@ -752,6 +979,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       triggerReaction('✋', user.baptismalName || user.fullName);
     }
     broadcastMediaState({ isHandRaised: next });
+  };
+
+  const handlePromoteStage = (peerId: string, onStage: boolean) => {
+    wsRef.current?.send(
+      JSON.stringify({
+        type: 'stage-control',
+        targetPeerId: peerId,
+        onStage,
+      })
+    );
   };
 
   const handleSendReaction = (emoji: string) => {
@@ -809,56 +1046,102 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     }
   };
 
-  const totalLiveParticipants = 1 + remotePeers.length;
-  const pinnedPeer = remotePeers.find((p) => p.peerId === pinnedPeerId) || remotePeers[0] || null;
+  const handleToggleSelfFullscreen = async () => {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen().catch(() => {});
+      setExpandedTileId(null);
+      return;
+    }
+    if (expandedTileId === 'self') {
+      setExpandedTileId(null);
+      return;
+    }
+    setExpandedTileId('self');
+    const el = selfTileRef.current;
+    const vid = localVideoRef.current as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | null;
+    if (el?.requestFullscreen) {
+      el.requestFullscreen().catch(() => {});
+    } else if (vid?.webkitEnterFullscreen) {
+      try {
+        vid.webkitEnterFullscreen();
+      } catch {}
+    }
+  };
+
+  const stageRemotePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest' || p.stream !== null);
+  const totalLiveParticipants = Math.max(serverClientCount, 1 + remotePeers.length);
+  const pinnedPeer = stageRemotePeers.find((p) => p.peerId === pinnedPeerId) || stageRemotePeers[0] || null;
+  const isSelfExpanded = expandedTileId === 'self';
 
   return (
     <div
       ref={meetingContainerRef}
-      className="max-w-[1560px] mx-auto px-2 sm:px-4 lg:px-6 py-4 space-y-3 min-h-[calc(100vh-80px)] flex flex-col justify-between"
+      className="max-w-[1560px] mx-auto px-2 sm:px-4 lg:px-6 py-4 space-y-3 min-h-[calc(100vh-80px)] flex flex-col justify-between bg-stone-950"
     >
       {/* 1. TOP CONFERENCE HEADER */}
       <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-2xl bg-stone-950/90 border border-amber-800/40 backdrop-blur-md shadow-xl">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2 px-3 py-1 rounded-xl bg-red-950/80 border border-red-700/60 text-red-300 font-bold text-xs">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex items-center gap-2 px-3 py-1 rounded-xl bg-red-950/80 border border-red-700/60 text-red-200 font-extrabold text-xs">
             <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
-            <span>ቀጥታ የዙም ጉባኤ</span>
+            <span>ቀጥታ HD ዙም ጉባኤ</span>
           </div>
-          <h2 className="text-base sm:text-lg font-heading font-bold text-amber-100">
+          <h2 className="text-base sm:text-lg font-heading font-extrabold text-amber-100">
             የቀሲስ ሄኖክ የቀጥታ ቪዲዮ አስተምህሮ
           </h2>
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-emerald-950/70 border border-emerald-700/50 text-[11px] text-emerald-300 font-bold">
+            <Sparkles className="w-3 h-3" />
+            <span>
+              {broadcastMode === 'livekit-sfu'
+                ? 'LiveKit SFU (10,000+ Ready)'
+                : broadcastMode === 'stage-broadcast'
+                ? 'Stage + Audience Anti-Congestion'
+                : 'HD 1080p · Studio 48kHz'}
+            </span>
+          </span>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {/* HD Quality Selector */}
+          <select
+            value={videoQuality}
+            onChange={(e) => handleChangeQuality(e.target.value as VideoQualityPreset)}
+            className="bg-stone-900 border border-amber-700/50 text-amber-200 text-xs font-bold rounded-lg px-2 py-1 focus:outline-none"
+            title="የቪዲዮ ጥራት ምረጥ"
+          >
+            <option value="1080p">Full HD 1080p</option>
+            <option value="720p">HD 720p</option>
+            <option value="360p">ፈጣን 360p</option>
+          </select>
+
           <div
-            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-medium ${
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-bold ${
               wsConnected
                 ? 'bg-emerald-950/60 border-emerald-700/50 text-emerald-300'
                 : 'bg-red-950/60 border-red-700/50 text-red-300'
             }`}
           >
             <Wifi className="w-3.5 h-3.5" />
-            <span>{wsConnected ? 'ሰርቨር ተገናኝቷል' : 'በመገናኘት ላይ...'}</span>
+            <span>{wsConnected ? 'ሰርቨር ዝግጁ ነው' : 'በመገናኘት ላይ...'}</span>
           </div>
 
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-stone-900 border border-stone-800 text-xs text-amber-200">
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-stone-900 border border-stone-800 text-xs text-amber-200 font-bold">
             <Users className="w-3.5 h-3.5 text-amber-400" />
-            <span className="font-bold">{totalLiveParticipants} ቀጥታ ተሳታፊ</span>
+            <span>{totalLiveParticipants} ቀጥታ ተሳታፊ</span>
           </div>
 
           <button
             onClick={handleCopyInviteLink}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-950/80 hover:bg-amber-900 border border-amber-600/50 text-amber-200 text-xs transition"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-950/80 hover:bg-amber-900 border border-amber-600/50 text-amber-200 text-xs font-bold transition"
           >
             {linkCopied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-            <span>{linkCopied ? 'ሊንኩ ተቀድቷል' : 'ሊንክ ቅዳ'}</span>
+            <span>{linkCopied ? 'ተቀድቷል' : 'ሊንክ ቅዳ'}</span>
           </button>
 
           <div className="flex items-center p-1 rounded-xl bg-stone-900 border border-stone-800">
             <button
               onClick={() => setViewMode('gallery')}
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition ${
-                viewMode === 'gallery' ? 'bg-amber-900/80 text-amber-200 font-bold' : 'text-stone-400'
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold transition ${
+                viewMode === 'gallery' ? 'bg-amber-900/80 text-amber-100' : 'text-stone-400'
               }`}
             >
               <LayoutGrid className="w-3.5 h-3.5" />
@@ -866,8 +1149,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             </button>
             <button
               onClick={() => setViewMode('speaker')}
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition ${
-                viewMode === 'speaker' ? 'bg-amber-900/80 text-amber-200 font-bold' : 'text-stone-400'
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold transition ${
+                viewMode === 'speaker' ? 'bg-amber-900/80 text-amber-100' : 'text-stone-400'
               }`}
             >
               <Square className="w-3.5 h-3.5" />
@@ -877,17 +1160,27 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
           <button
             onClick={handleToggleFullscreen}
-            className="p-2 rounded-xl bg-stone-900 border border-stone-800 text-stone-300 hover:text-amber-200 transition"
+            title="ሙሉ ስክሪን"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-amber-800/80 hover:bg-amber-700 border border-amber-400/70 text-white text-xs font-extrabold transition"
           >
             {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+            <span className="hidden sm:inline">{isFullscreen ? 'ዝጋ' : 'ሙሉ ስክሪን'}</span>
           </button>
         </div>
       </div>
 
       {mediaWarning && (
-        <div className="p-2.5 rounded-xl bg-amber-950/70 border border-amber-700/60 text-xs text-amber-200 flex items-center gap-2">
+        <div className="p-2.5 rounded-xl bg-amber-950/70 border border-amber-700/60 text-xs text-amber-200 font-bold flex items-center gap-2">
           <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
           <span>{mediaWarning}</span>
+        </div>
+      )}
+
+      {!selfOnStage && (
+        <div className="p-2.5 rounded-xl bg-stone-900/90 border border-amber-700/50 text-xs text-amber-200 font-bold flex flex-wrap items-center justify-between gap-2">
+          <span>
+            🛡️ ጉባኤው በብዙ ተሳታፊዎች እንዳይጨናነቅ በ<b>ተመልካች (Listener Stage)</b> ሁኔታ እየተከታተሉ ነው። ለመናገር <b>«እጅ አውጣ»</b> የሚለውን ይጫኑ።
+          </span>
         </div>
       )}
 
@@ -900,7 +1193,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             style={{ left: `${r.x}%` }}
           >
             <span className="text-3xl filter drop-shadow-lg">{r.emoji}</span>
-            <span className="text-[10px] bg-stone-950/90 text-amber-200 px-1.5 py-0.5 rounded border border-amber-700/40">
+            <span className="text-[11px] font-bold bg-stone-950/90 text-amber-200 px-2 py-0.5 rounded border border-amber-700/40">
               {r.sender}
             </span>
           </div>
@@ -908,26 +1201,31 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       </div>
 
       {/* 2. MAIN ZOOM VIDEO STAGE & PARTICIPANT GRID */}
-      <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-[460px]">
+      <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-[520px]">
         <div
           className={`${
             activeTabPanel !== 'none' ? 'lg:col-span-8 xl:col-span-9' : 'lg:col-span-12'
           } flex flex-col justify-center space-y-3`}
         >
-          {/* GALLERY VIEW */}
+          {/* GALLERY VIEW (Taller cinema/portrait cards with 1080p HD clarity + individual fullscreen) */}
           {viewMode === 'gallery' && (
             <div
               className={`grid gap-3.5 w-full ${
-                remotePeers.length === 0
+                stageRemotePeers.length === 0
                   ? 'grid-cols-1 md:grid-cols-2'
-                  : remotePeers.length === 1
+                  : stageRemotePeers.length === 1
                   ? 'grid-cols-1 md:grid-cols-2'
-                  : 'grid-cols-1 sm:grid-cols-2 md:grid-cols-3'
+                  : 'grid-cols-1 sm:grid-cols-2 xl:grid-cols-3'
               }`}
             >
-              {/* MY OWN LIVE VIDEO TILE */}
+              {/* MY OWN LIVE HD VIDEO TILE */}
               <div
-                className={`relative rounded-2xl overflow-hidden bg-stone-950 border-2 transition-all shadow-xl aspect-[16/10] flex flex-col justify-between ${
+                ref={selfTileRef}
+                className={`overflow-hidden bg-stone-950 border-2 transition-all shadow-2xl flex flex-col justify-between ${
+                  isSelfExpanded
+                    ? 'fixed inset-0 z-50 rounded-none border-amber-500 h-screen w-screen'
+                    : 'relative rounded-2xl min-h-[340px] sm:min-h-[450px] lg:min-h-[520px]'
+                } ${
                   isMicOn && myVolume > 15
                     ? 'border-emerald-400 ring-2 ring-emerald-400/50'
                     : isHandRaised
@@ -940,98 +1238,114 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                   autoPlay
                   playsInline
                   muted
-                  className={`absolute inset-0 w-full h-full object-cover ${
+                  className={`absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.06] brightness-[1.02] ${
                     !isScreenSharing && facingMode === 'user' ? 'mirror' : ''
                   } ${isVideoOn || isScreenSharing ? 'block' : 'hidden'}`}
                 />
 
                 {!isVideoOn && !isScreenSharing && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-900 text-stone-400 p-4 text-center">
-                    <div className="w-14 h-14 rounded-full bg-stone-800 border border-stone-700 flex items-center justify-center text-lg font-bold text-amber-200 mb-2">
+                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-900 text-stone-300 p-4 text-center">
+                    <div className="w-16 h-16 rounded-full bg-stone-800 border-2 border-amber-600/50 flex items-center justify-center text-xl font-extrabold text-amber-200 mb-2">
                       {(user.baptismalName || user.fullName || 'እ').charAt(0)}
                     </div>
-                    <p className="text-xs text-stone-300 font-medium">{user.baptismalName} (ካሜራ ዝግ ነው)</p>
+                    <p className="text-sm text-stone-200 font-bold">{user.baptismalName} (ካሜራ ዝግ ነው)</p>
                   </div>
                 )}
 
-                <div className="relative z-10 p-2.5 flex items-center justify-between">
-                  <div className="flex items-center gap-1.5 bg-stone-950/85 backdrop-blur-md px-2.5 py-1 rounded-lg border border-amber-600/50 text-xs text-amber-200">
+                <div className="relative z-10 p-3 flex items-center justify-between bg-gradient-to-b from-black/70 via-black/25 to-transparent">
+                  <div className="flex items-center gap-1.5 bg-stone-950/90 backdrop-blur-md px-3 py-1 rounded-lg border border-amber-600/50 text-xs text-amber-200 font-extrabold">
                     <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                    <span className="font-bold">
+                    <span>
                       {user.baptismalName || user.fullName} (እኔ {user.role === 'priest' ? '· ቀሲስ' : ''})
                     </span>
                   </div>
-                  {isHandRaised && (
-                    <div className="flex items-center gap-1 bg-amber-500 text-stone-950 px-2 py-0.5 rounded-lg text-[10px] font-bold animate-bounce shadow">
-                      <Hand className="w-3 h-3" />
-                      <span>ሀሳብ አለኝ</span>
-                    </div>
-                  )}
+
+                  <div className="flex items-center gap-1.5">
+                    {isHandRaised && (
+                      <div className="flex items-center gap-1 bg-amber-500 text-stone-950 px-2.5 py-0.5 rounded-lg text-[11px] font-extrabold animate-bounce shadow">
+                        <Hand className="w-3 h-3" />
+                        <span>ሀሳብ አለኝ</span>
+                      </div>
+                    )}
+                    <button
+                      onClick={handleToggleSelfFullscreen}
+                      className="p-1.5 rounded-lg bg-stone-900/90 text-amber-200 border border-amber-600/60 hover:bg-amber-700 hover:text-stone-950 transition"
+                      title={isSelfExpanded ? 'ሙሉ ስክሪን ዝጋ' : 'ሙሉ ስክሪን ክፈት'}
+                    >
+                      {isSelfExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+                    </button>
+                  </div>
                 </div>
 
-                <div className="relative z-10 p-2.5 flex items-center justify-between bg-gradient-to-t from-black/90 via-black/40 to-transparent">
+                <div className="relative z-10 p-3 flex items-center justify-between bg-gradient-to-t from-black/90 via-black/45 to-transparent">
                   <div className="flex items-center gap-2">
                     <span
                       className={`p-1.5 rounded-md border ${
                         isMicOn
-                          ? 'bg-emerald-950/80 border-emerald-500 text-emerald-300'
-                          : 'bg-red-950/80 border-red-700 text-red-300'
+                          ? 'bg-emerald-950/90 border-emerald-500 text-emerald-300'
+                          : 'bg-red-950/90 border-red-700 text-red-300'
                       }`}
                     >
                       {isMicOn ? <Mic className="w-3.5 h-3.5 animate-pulse" /> : <MicOff className="w-3.5 h-3.5" />}
                     </span>
                     {isMicOn && (
-                      <div className="w-12 h-1.5 bg-stone-800 rounded-full overflow-hidden">
+                      <div className="w-16 h-2 bg-stone-800 rounded-full overflow-hidden">
                         <div
                           className="h-full bg-emerald-400 transition-all duration-75"
                           style={{ width: `${myVolume}%` }}
                         />
                       </div>
                     )}
+                    <span className="text-[11px] text-emerald-300 font-mono font-bold">
+                      {QUALITY_MAP[videoQuality].label}
+                    </span>
                   </div>
                   <button
                     onClick={handleFlipCamera}
-                    className="p-1.5 rounded-lg bg-stone-900/80 text-stone-300 hover:text-amber-200 border border-stone-700 transition"
+                    className="p-1.5 rounded-lg bg-stone-900/90 text-stone-200 hover:text-amber-200 border border-stone-700 transition"
                     title="ካሜራ ቀይር"
                   >
-                    <RefreshCw className="w-3.5 h-3.5" />
+                    <RefreshCw className="w-4 h-4" />
                   </button>
                 </div>
               </div>
 
               {/* REAL REMOTE CONNECTED PEERS */}
-              {remotePeers.map((peer) => (
+              {stageRemotePeers.map((peer) => (
                 <RemoteVideoTile
                   key={peer.peerId}
                   peer={peer}
                   isGlobalAudioMuted={isGlobalAudioMuted}
                   isPinned={pinnedPeerId === peer.peerId}
+                  isExpanded={expandedTileId === peer.peerId}
                   onPin={(id) => {
                     setPinnedPeerId(id);
                     setViewMode('speaker');
                   }}
+                  onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
+                  tallStage={true}
                 />
               ))}
 
-              {/* HONEST WAITING CARD WHEN NO OTHER REAL USERS HAVE JOINED YET */}
-              {remotePeers.length === 0 && (
-                <div className="rounded-2xl bg-stone-900/50 border-2 border-dashed border-amber-800/40 aspect-[16/10] flex flex-col items-center justify-center p-6 text-center space-y-3">
-                  <div className="w-12 h-12 rounded-full bg-amber-950/80 border border-amber-600/40 flex items-center justify-center text-amber-300">
-                    <Users className="w-6 h-6" />
+              {/* HONEST WAITING CARD */}
+              {stageRemotePeers.length === 0 && (
+                <div className="rounded-2xl bg-stone-900/50 border-2 border-dashed border-amber-800/40 min-h-[340px] sm:min-h-[450px] lg:min-h-[520px] flex flex-col items-center justify-center p-6 text-center space-y-4">
+                  <div className="w-14 h-14 rounded-full bg-amber-950/80 border border-amber-600/40 flex items-center justify-center text-amber-300">
+                    <Users className="w-7 h-7" />
                   </div>
-                  <div className="space-y-1">
-                    <p className="text-sm font-heading font-bold text-amber-200">
+                  <div className="space-y-1.5">
+                    <p className="text-base font-heading font-extrabold text-amber-200">
                       ሌሎች ተሳታፊዎችን በመጠባበቅ ላይ...
                     </p>
-                    <p className="text-xs text-stone-400 max-w-xs mx-auto">
-                      የዚህን ድህረገፅ ሊንክ ለቀሲስ ወይም ለምዕመናን ሲልኩና ተመዝግበው ወደ ዙም ጉባኤው ሲገቡ ቪዲዮና ድምፃቸው እዚህ በቀጥታ ይታያል።
+                    <p className="text-xs text-stone-300 max-w-xs mx-auto font-semibold">
+                      የዚህን ድህረገፅ ሊንክ ለቀሲስ ወይም ለምዕመናን ሲልኩና ሲገቡ ቪዲዮና ድምፃቸው እዚህ በከፍተኛ HD ጥራት ይታያል።
                     </p>
                   </div>
                   <button
                     onClick={handleCopyInviteLink}
-                    className="px-4 py-2 rounded-xl bg-amber-900/70 hover:bg-amber-800 border border-amber-600/60 text-amber-100 text-xs font-bold flex items-center gap-2 transition"
+                    className="px-5 py-2.5 rounded-xl bg-amber-800 hover:bg-amber-700 border border-amber-500/70 text-white text-xs font-extrabold flex items-center gap-2 transition"
                   >
-                    {linkCopied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                    {linkCopied ? <Check className="w-4 h-4 text-emerald-300" /> : <Copy className="w-4 h-4" />}
                     <span>{linkCopied ? 'ሊንኩ ተቀድቷል — ይላኩላቸው' : 'የመግቢያ ሊንክ ቅዳ'}</span>
                   </button>
                 </div>
@@ -1039,7 +1353,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             </div>
           )}
 
-          {/* SPEAKER VIEW */}
+          {/* SPEAKER VIEW (Huge Tall Stage + Fullscreen) */}
           {viewMode === 'speaker' && (
             <div className="space-y-3">
               <div className="grid grid-cols-1 gap-3">
@@ -1048,14 +1362,17 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     peer={pinnedPeer}
                     isGlobalAudioMuted={isGlobalAudioMuted}
                     isPinned={true}
+                    isExpanded={expandedTileId === pinnedPeer.peerId}
                     onPin={() => setViewMode('gallery')}
+                    onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
+                    tallStage={true}
                   />
                 ) : (
-                  <div className="p-8 rounded-2xl bg-stone-900/60 border border-amber-800/40 text-center space-y-2">
-                    <p className="text-sm text-amber-200 font-bold">ሌላ ተናጋሪ ገና አልተቀላቀለም</p>
+                  <div className="p-8 rounded-2xl bg-stone-900/60 border border-amber-800/40 text-center space-y-3 min-h-[420px] flex flex-col items-center justify-center">
+                    <p className="text-base text-amber-200 font-extrabold">ሌላ ተናጋሪ ገና አልተቀላቀለም</p>
                     <button
                       onClick={() => setViewMode('gallery')}
-                      className="px-4 py-1.5 rounded-lg bg-amber-900 text-amber-100 text-xs"
+                      className="px-5 py-2 rounded-xl bg-amber-800 text-white text-xs font-extrabold"
                     >
                       ወደ ጋለሪ ተመለስ
                     </button>
@@ -1063,21 +1380,22 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 )}
               </div>
 
-              {/* Strip of remaining participants */}
               <div className="flex items-center gap-3 overflow-x-auto pb-2">
-                {remotePeers
+                {stageRemotePeers
                   .filter((p) => p.peerId !== pinnedPeer?.peerId)
                   .map((p) => (
                     <div
                       key={p.peerId}
                       onClick={() => setPinnedPeerId(p.peerId)}
-                      className="w-44 shrink-0 cursor-pointer"
+                      className="w-52 shrink-0 cursor-pointer"
                     >
                       <RemoteVideoTile
                         peer={p}
                         isGlobalAudioMuted={isGlobalAudioMuted}
                         isPinned={false}
+                        isExpanded={expandedTileId === p.peerId}
                         onPin={(id) => setPinnedPeerId(id)}
+                        onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
                       />
                     </div>
                   ))}
@@ -1086,14 +1404,14 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
           )}
         </div>
 
-        {/* 3. RIGHT SIDE PANEL: LIVE CHAT & REAL PARTICIPANTS ROSTER */}
+        {/* 3. RIGHT SIDE PANEL: LIVE CHAT & REAL PARTICIPANTS ROSTER WITH STAGE CONTROL */}
         {activeTabPanel !== 'none' && (
-          <div className="lg:col-span-4 xl:col-span-3 flex flex-col h-[500px] rounded-2xl bg-stone-950/90 border border-amber-900/40 overflow-hidden shadow-2xl">
+          <div className="lg:col-span-4 xl:col-span-3 flex flex-col h-[520px] rounded-2xl bg-stone-950/90 border border-amber-900/40 overflow-hidden shadow-2xl">
             <div className="flex items-center justify-between p-2.5 bg-stone-900 border-b border-stone-800">
               <div className="flex items-center gap-1">
                 <button
                   onClick={() => setActiveTabPanel('chat')}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                  className={`px-3 py-1.5 rounded-lg text-xs font-extrabold transition ${
                     activeTabPanel === 'chat'
                       ? 'bg-amber-950 text-amber-200 border border-amber-700/60'
                       : 'text-stone-400 hover:text-stone-200'
@@ -1103,7 +1421,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 </button>
                 <button
                   onClick={() => setActiveTabPanel('participants')}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                  className={`px-3 py-1.5 rounded-lg text-xs font-extrabold transition ${
                     activeTabPanel === 'participants'
                       ? 'bg-amber-950 text-amber-200 border border-amber-700/60'
                       : 'text-stone-400 hover:text-stone-200'
@@ -1114,7 +1432,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               </div>
               <button
                 onClick={() => setActiveTabPanel('none')}
-                className="text-stone-500 hover:text-stone-300 p-1 rounded"
+                className="text-stone-400 hover:text-stone-200 p-1 rounded font-bold"
               >
                 ✕
               </button>
@@ -1124,7 +1442,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               <div className="flex-1 flex flex-col justify-between overflow-hidden">
                 <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
                   {chatMessages.length === 0 && (
-                    <p className="text-xs text-stone-500 text-center py-8">
+                    <p className="text-xs text-stone-400 text-center py-8 font-bold">
                       መልእክቶችዎ ለሁሉም የጉባኤው ተሳታፊዎች በቀጥታ ይታያሉ።
                     </p>
                   )}
@@ -1134,16 +1452,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                       className={`p-2.5 rounded-xl border text-xs space-y-1 ${
                         msg.isPriest
                           ? 'bg-amber-950/60 border-amber-600/50 text-amber-100'
-                          : 'bg-stone-900/80 border-stone-800 text-stone-200'
+                          : 'bg-stone-900/80 border-stone-800 text-stone-100'
                       }`}
                     >
                       <div className="flex items-center justify-between">
-                        <span className={`font-bold ${msg.isPriest ? 'text-amber-300' : 'text-stone-300'}`}>
+                        <span className={`font-extrabold ${msg.isPriest ? 'text-amber-300' : 'text-stone-200'}`}>
                           {msg.sender}
                         </span>
-                        <span className="text-[10px] text-stone-500 font-mono">{msg.time}</span>
+                        <span className="text-[10px] text-stone-400 font-mono">{msg.time}</span>
                       </div>
-                      <p className="leading-relaxed">{msg.text}</p>
+                      <p className="leading-relaxed font-semibold">{msg.text}</p>
                     </div>
                   ))}
                   <div ref={chatBottomRef} />
@@ -1154,7 +1472,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     <button
                       key={phrase}
                       onClick={() => sendChatText(phrase)}
-                      className="px-2 py-1 rounded bg-stone-950 border border-stone-800 hover:border-amber-600/50 text-amber-200 whitespace-nowrap transition"
+                      className="px-2.5 py-1 rounded bg-stone-950 border border-stone-800 hover:border-amber-600/50 text-amber-200 font-bold whitespace-nowrap transition"
                     >
                       {phrase}
                     </button>
@@ -1183,13 +1501,13 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               <div className="flex-1 overflow-y-auto p-3 space-y-2">
                 <div className="p-2.5 rounded-xl bg-amber-950/40 border border-amber-800/40 flex items-center justify-between text-xs">
                   <div className="flex items-center gap-2">
-                    <div className="w-7 h-7 rounded-full bg-amber-500 text-stone-950 font-bold flex items-center justify-center text-xs">
+                    <div className="w-7 h-7 rounded-full bg-amber-500 text-stone-950 font-extrabold flex items-center justify-center text-xs">
                       {(user.baptismalName || user.fullName || 'እ').charAt(0)}
                     </div>
                     <div>
-                      <p className="font-bold text-amber-200">{user.baptismalName || user.fullName} (እኔ)</p>
-                      <p className="text-[10px] text-stone-400">
-                        {user.role === 'priest' ? 'ቀሲስ / አስተማሪ' : 'ምዕመን'}
+                      <p className="font-extrabold text-amber-200">{user.baptismalName || user.fullName} (እኔ)</p>
+                      <p className="text-[10px] text-stone-300 font-bold">
+                        {user.role === 'priest' ? 'ቀሲስ / አስተማሪ' : selfOnStage ? 'መድረክ ላይ' : 'ተመልካች'}
                       </p>
                     </div>
                   </div>
@@ -1202,18 +1520,33 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 {remotePeers.map((p) => (
                   <div
                     key={p.peerId}
-                    className="p-2.5 rounded-xl bg-stone-900/60 border border-stone-800 flex items-center justify-between text-xs"
+                    className="p-2.5 rounded-xl bg-stone-900/60 border border-stone-800 flex items-center justify-between gap-2 text-xs"
                   >
-                    <div className="flex items-center gap-2">
-                      <div className="w-7 h-7 rounded-full bg-stone-800 text-amber-200 font-bold flex items-center justify-center text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <div className="w-7 h-7 rounded-full bg-stone-800 text-amber-200 font-extrabold flex items-center justify-center text-xs shrink-0">
                         {(p.baptismalName || p.userName || 'ተ').charAt(0)}
                       </div>
-                      <div>
-                        <p className="text-stone-200 font-medium">{p.baptismalName || p.userName}</p>
-                        <p className="text-[10px] text-stone-500">{p.role === 'priest' ? 'ቀሲስ' : 'የንስሐ ልጅ'}</p>
+                      <div className="min-w-0">
+                        <p className="text-stone-100 font-bold truncate">{p.baptismalName || p.userName}</p>
+                        <p className="text-[10px] text-stone-400 font-bold">
+                          {p.role === 'priest' ? 'ቀሲስ' : p.onStage !== false ? 'መድረክ' : 'ተመልካች'}
+                        </p>
                       </div>
                     </div>
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {user.role === 'priest' && (
+                        <button
+                          onClick={() => handlePromoteStage(p.peerId, p.onStage === false)}
+                          title={p.onStage === false ? 'ወደ መድረክ አውጣ' : 'ከመድረክ አውርድ'}
+                          className="p-1 rounded bg-amber-950/70 border border-amber-700/50 text-amber-300 hover:bg-amber-800"
+                        >
+                          {p.onStage === false ? (
+                            <ArrowUpCircle className="w-3.5 h-3.5" />
+                          ) : (
+                            <ArrowDownCircle className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      )}
                       {p.isHandRaised && <Hand className="w-3.5 h-3.5 text-amber-400 animate-bounce" />}
                       {p.isMicOn ? <Mic className="w-3.5 h-3.5 text-emerald-400" /> : <MicOff className="w-3.5 h-3.5 text-stone-500" />}
                     </div>
@@ -1225,7 +1558,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     onClick={() => {
                       wsRef.current?.send(JSON.stringify({ type: 'host-mute-all' }));
                     }}
-                    className="w-full py-2 mt-2 rounded-xl bg-red-950 hover:bg-red-900 border border-red-700 text-red-200 text-xs font-bold"
+                    className="w-full py-2.5 mt-2 rounded-xl bg-red-950 hover:bg-red-900 border border-red-700 text-red-200 text-xs font-extrabold"
                   >
                     ሁሉንም ማይኮች ዝጋ (Mute All)
                   </button>
@@ -1241,7 +1574,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         <div className="flex items-center gap-2">
           <button
             onClick={handleToggleMic}
-            className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs font-bold border transition shadow-lg ${
+            className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs font-extrabold border transition shadow-lg ${
               isMicOn
                 ? 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-400'
                 : 'bg-stone-900 hover:bg-stone-800 text-red-300 border-red-800/60'
@@ -1253,9 +1586,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
           <button
             onClick={handleToggleVideo}
-            className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs font-bold border transition shadow-lg ${
+            className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs font-extrabold border transition shadow-lg ${
               isVideoOn
-                ? 'bg-stone-900 hover:bg-stone-800 text-stone-200 border-stone-700'
+                ? 'bg-stone-900 hover:bg-stone-800 text-stone-100 border-stone-700'
                 : 'bg-red-950/80 hover:bg-red-900 text-red-200 border-red-700'
             }`}
           >
@@ -1268,7 +1601,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             className={`p-2.5 rounded-xl border transition ${
               isGlobalAudioMuted
                 ? 'bg-red-950 border-red-700 text-red-300'
-                : 'bg-stone-900 border-stone-700 text-stone-300 hover:text-amber-200'
+                : 'bg-stone-900 border-stone-700 text-stone-200 hover:text-amber-200'
             }`}
             title={isGlobalAudioMuted ? 'የተሳታፊዎችን ድምፅ ክፈት' : 'የተሳታፊዎችን ድምፅ ዝጋ'}
           >
@@ -1279,7 +1612,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         <div className="flex items-center gap-2">
           <button
             onClick={handleToggleHand}
-            className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs font-bold border transition shadow-lg ${
+            className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs font-extrabold border transition shadow-lg ${
               isHandRaised
                 ? 'bg-amber-500 hover:bg-amber-400 text-stone-950 border-amber-300 animate-bounce'
                 : 'bg-stone-900 hover:bg-stone-800 text-amber-200 border-amber-700/60'
@@ -1291,10 +1624,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
           <button
             onClick={handleToggleScreenShare}
-            className={`flex items-center gap-2 px-3 py-2.5 rounded-xl text-xs font-medium border transition hidden sm:flex ${
+            className={`flex items-center gap-2 px-3 py-2.5 rounded-xl text-xs font-bold border transition hidden sm:flex ${
               isScreenSharing
-                ? 'bg-emerald-950 text-emerald-200 border-emerald-500 font-bold'
-                : 'bg-stone-900 hover:bg-stone-800 text-stone-300 border-stone-700'
+                ? 'bg-emerald-950 text-emerald-200 border-emerald-500'
+                : 'bg-stone-900 hover:bg-stone-800 text-stone-200 border-stone-700'
             }`}
           >
             <Share2 className="w-4 h-4 text-amber-400" />
@@ -1304,7 +1637,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
           <div className="relative">
             <button
               onClick={() => setShowReactionsMenu(!showReactionsMenu)}
-              className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl bg-stone-900 hover:bg-stone-800 text-amber-200 border border-stone-700 text-xs font-medium transition"
+              className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl bg-stone-900 hover:bg-stone-800 text-amber-200 border border-stone-700 text-xs font-bold transition"
             >
               <Smile className="w-4 h-4 text-amber-400" />
               <span className="hidden md:inline">ምላሾች</span>
@@ -1327,10 +1660,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
           <button
             onClick={() => toggleSpiritualHymn((playing) => setAudioHymnPlaying(playing))}
-            className={`flex items-center gap-1.5 px-3 py-2.5 rounded-xl border text-xs font-medium transition hidden lg:flex ${
+            className={`flex items-center gap-1.5 px-3 py-2.5 rounded-xl border text-xs font-bold transition hidden lg:flex ${
               audioHymnPlaying
-                ? 'bg-amber-950 border-amber-500 text-amber-200 font-bold animate-pulse'
-                : 'bg-stone-900 border-stone-800 text-stone-400 hover:text-amber-200'
+                ? 'bg-amber-950 border-amber-500 text-amber-200 animate-pulse'
+                : 'bg-stone-900 border-stone-800 text-stone-300 hover:text-amber-200'
             }`}
           >
             <Volume2 className="w-4 h-4 text-amber-400" />
@@ -1368,7 +1701,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               if (onLeaveMeeting) onLeaveMeeting();
               else window.location.reload();
             }}
-            className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl bg-red-950/80 hover:bg-red-900 border border-red-700/70 text-red-200 text-xs font-bold transition shadow"
+            className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl bg-red-950/80 hover:bg-red-900 border border-red-700/70 text-red-200 text-xs font-extrabold transition shadow"
           >
             <PhoneOff className="w-4 h-4 text-red-300" />
             <span className="hidden sm:inline">ውጣ</span>

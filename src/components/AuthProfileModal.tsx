@@ -100,7 +100,7 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
         fullName: formData.fullName,
         baptismalName: formData.baptismalName,
         phone: formData.phone,
-        email: formData.email,
+        email: '',
         password: formData.password,
         role: formData.role === 'priest' ? 'priest' : formData.role === 'deacon' ? 'deacon' : 'child',
         confessorPriest: formData.confessorPriest,
@@ -311,13 +311,13 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
         {mode === 'signin' && (
           <form onSubmit={handleSignIn} className="space-y-4 text-xs">
             <div>
-              <label className="block text-stone-300 font-semibold mb-1">ስልክ ቁጥር ወይም ኢሜይል</label>
+              <label className="block text-stone-300 font-semibold mb-1">ስልክ ቁጥር</label>
               <input
                 type="text"
                 required
                 value={loginIdentifier}
                 onChange={(e) => setLoginIdentifier(e.target.value)}
-                placeholder="0911... ወይም email@example.com"
+                placeholder="0911..."
                 className="w-full bg-stone-900 border border-stone-700 rounded-xl px-3 py-2.5 text-stone-100 focus:outline-none focus:border-amber-500"
               />
             </div>
@@ -387,29 +387,16 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-stone-300 font-semibold mb-1">ስልክ ቁጥር *</label>
-                <input
-                  type="tel"
-                  required
-                  value={formData.phone}
-                  onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-                  placeholder="09..."
-                  className="w-full bg-stone-900 border border-stone-700 rounded-xl px-3 py-2 text-stone-100"
-                />
-              </div>
-
-              <div>
-                <label className="block text-stone-300 font-semibold mb-1">ኢሜይል (አማራጭ)</label>
-                <input
-                  type="email"
-                  value={formData.email}
-                  onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-                  placeholder="name@example.com"
-                  className="w-full bg-stone-900 border border-stone-700 rounded-xl px-3 py-2 text-stone-100"
-                />
-              </div>
+            <div>
+              <label className="block text-stone-300 font-semibold mb-1">ስልክ ቁጥር *</label>
+              <input
+                type="tel"
+                required
+                value={formData.phone}
+                onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                placeholder="09..."
+                className="w-full bg-stone-900 border border-stone-700 rounded-xl px-3 py-2 text-stone-100"
+              />
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">

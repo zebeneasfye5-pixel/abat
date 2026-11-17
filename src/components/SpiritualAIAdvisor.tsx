@@ -65,15 +65,16 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [sharedKey, setSharedKey] = useState<string | null>(null);
 
-  // Fast Orthodox Universal Search
+  // Fast Orthodox Universal Search (Auto-Search defaults off so partial keystrokes don't exhaust Free Tier daily quota)
   const [scriptureQuery, setScriptureQuery] = useState('');
   const [searchCategory, setSearchCategory] = useState(SEARCH_CATEGORIES[0]);
-  const [autoSearchEnabled, setAutoSearchEnabled] = useState(true);
+  const [autoSearchEnabled, setAutoSearchEnabled] = useState(false);
   const [scriptureResult, setScriptureResult] = useState<string | null>(null);
   const [scriptureLoading, setScriptureLoading] = useState(false);
 
   const chatAbortRef = useRef<AbortController | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
+  const searchLocalCacheRef = useRef<Map<string, string>>(new Map());
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const promptInputRef = useRef<HTMLInputElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -148,14 +149,22 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
     const clean = queryText.trim();
     if (clean.length < 2) return;
 
+    const localKey = `${cat}:${clean.toLowerCase()}`;
+    const cached = searchLocalCacheRef.current.get(localKey);
+    if (cached) {
+      setScriptureResult(cached);
+      return;
+    }
+
     searchAbortRef.current?.abort();
     const controller = new AbortController();
     searchAbortRef.current = controller;
 
     setScriptureLoading(true);
     setScriptureResult('');
+    let finalAccumulated = '';
     try {
-      await streamOrthodoxSearch(
+      finalAccumulated = await streamOrthodoxSearch(
         clean,
         cat,
         (accumulated) => {
@@ -163,6 +172,9 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
         },
         controller.signal
       );
+      if (finalAccumulated && !finalAccumulated.startsWith('⚠️')) {
+        searchLocalCacheRef.current.set(localKey, finalAccumulated);
+      }
     } catch (err: any) {
       if (err?.name === 'AbortError') return;
       setScriptureResult(`⚠️ ${err?.message || 'መረጃውን ከኤአይ ማምጣት አልተቻለም።'}`);
@@ -171,14 +183,14 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
     }
   };
 
-  // Automatic Debounced Search while typing when Auto-Search is enabled
+  // Optional Automatic Debounced Search (uses 1500ms pause & >=5 chars to conserve API quota)
   useEffect(() => {
     if (!autoSearchEnabled) return;
     const trimmed = scriptureQuery.trim();
-    if (trimmed.length < 3) return;
+    if (trimmed.length < 5) return;
     const timer = setTimeout(() => {
       executeOrthodoxSearch(trimmed, searchCategory);
-    }, 650);
+    }, 1500);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scriptureQuery, searchCategory, autoSearchEnabled]);

@@ -36,7 +36,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               <button
                 onClick={onGoBack}
                 title="ወደ ኋላ ተመለስ (Back)"
-                className="p-2 shrink-0 rounded-lg bg-amber-950/70 border border-amber-600/50 text-amber-200 hover:bg-amber-900 hover:text-white transition-colors"
+                className="hidden sm:inline-flex p-2 shrink-0 rounded-lg bg-amber-950/70 border border-amber-600/50 text-amber-200 hover:bg-amber-900 hover:text-white transition-colors"
               >
                 <ArrowLeft className="w-4 h-4 sm:w-5 sm:h-5" />
               </button>
@@ -132,27 +132,28 @@ export const Navbar: React.FC<NavbarProps> = ({
           </nav>
 
           {/* Zone 3: Primary Action & Install / User Profile */}
-          <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
+          <div className="flex items-center gap-1 sm:gap-2.5 shrink-0">
             {/* Install to Phone Quick Button */}
             <button
               onClick={onOpenInstall}
               title="አፕሊኬሽኑን ወደ ስልክ ጫን"
-              className="flex items-center gap-1 px-2 sm:px-3 py-1.5 rounded-lg bg-gradient-to-r from-amber-950 to-stone-900 border border-amber-600/50 text-amber-200 text-[11px] sm:text-xs font-bold hover:text-white hover:border-amber-400 transition-colors shadow-sm"
+              className="flex items-center gap-1 px-2 sm:px-3 py-1.5 rounded-lg bg-gradient-to-r from-amber-950 to-stone-900 border border-amber-600/50 text-amber-200 text-xs font-bold hover:text-white hover:border-amber-400 transition-colors shadow-sm"
             >
               <Smartphone className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-              <span className="whitespace-nowrap">አፑን ጫን</span>
+              <span className="whitespace-nowrap sm:hidden">ጫን</span>
+              <span className="whitespace-nowrap hidden sm:inline">አፑን ጫን</span>
             </button>
 
             {/* User Profile / Sign In trigger */}
             <button
               onClick={onOpenAuth}
-              className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1.5 rounded-lg bg-gradient-to-r from-red-950/70 to-amber-950/70 border border-amber-700/50 text-amber-200 hover:border-amber-400 transition-colors text-[11px] sm:text-xs font-medium shadow-sm"
+              className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1.5 rounded-lg bg-gradient-to-r from-red-950/70 to-amber-950/70 border border-amber-700/50 text-amber-200 hover:border-amber-400 transition-colors text-xs font-medium shadow-sm"
             >
               <div className="w-5 h-5 sm:w-6 sm:h-6 shrink-0 rounded-full bg-amber-600/30 flex items-center justify-center text-amber-300 font-bold border border-amber-500/30">
                 {user.isAuthenticated ? user.baptismalName.charAt(0) : <User className="w-3 h-3 sm:w-3.5 sm:h-3.5" />}
               </div>
-              <span className="whitespace-nowrap max-w-[78px] sm:max-w-[120px] truncate">
-                {user.isAuthenticated ? user.baptismalName : 'ግባ / ተመዝገብ'}
+              <span className="whitespace-nowrap max-w-[68px] sm:max-w-[120px] truncate">
+                {user.isAuthenticated ? user.baptismalName : 'ግባ'}
               </span>
             </button>
           </div>

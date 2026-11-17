@@ -126,6 +126,7 @@ interface DatabaseSchema {
     sharesCount: number;
   };
   contacts: ContactRecord[];
+  aiCache?: Record<string, string>;
 }
 
 const DEFAULT_MINISTRY_BANKS: MinistryBanksRecord = {
@@ -165,6 +166,7 @@ function loadDatabase(): DatabaseSchema {
           sharesCount: Number(parsed.communityStats?.sharesCount ?? 0),
         },
         contacts: Array.isArray(parsed.contacts) ? parsed.contacts : [],
+        aiCache: parsed.aiCache && typeof parsed.aiCache === 'object' ? parsed.aiCache : {},
       };
     }
   } catch (err) {
@@ -190,6 +192,7 @@ function loadDatabase(): DatabaseSchema {
       sharesCount: 0,
     },
     contacts: [],
+    aiCache: {},
   };
 }
 
@@ -363,8 +366,8 @@ function getAiClient(): GoogleGenAI {
   return sharedAiClient;
 }
 
-// Instant in-memory LRU cache (max 200 queries) for near-zero latency on repeated Orthodox questions
-const aiResponseCache = new Map<string, string>();
+// Persistent + in-memory LRU cache (max 300 queries) so repeated questions consume zero API quota
+const aiResponseCache = new Map<string, string>(Object.entries(db.aiCache || {}));
 function getCachedAi(key: string): string | undefined {
   const val = aiResponseCache.get(key);
   if (val !== undefined) {
@@ -374,11 +377,13 @@ function getCachedAi(key: string): string | undefined {
   return val;
 }
 function setCachedAi(key: string, value: string) {
-  if (aiResponseCache.size >= 200) {
+  if (aiResponseCache.size >= 300) {
     const oldest = aiResponseCache.keys().next().value;
     if (oldest) aiResponseCache.delete(oldest);
   }
   aiResponseCache.set(key, value);
+  db.aiCache = Object.fromEntries(aiResponseCache.entries());
+  saveDatabase();
 }
 
 const ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION = `
@@ -397,6 +402,45 @@ const ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION = `
 - አላስፈላጊ ረጅም መግቢያ ሳትዘረጋ በቀጥታ ዋናውን ትምህርት፣ ማስረጃ (ጥቅስ/አበው/ቀኖና) እና ተግባራዊ መመሪያ አቅርብ።
 `;
 
+const GEMINI_MODEL_CANDIDATES: Array<{ model: string; thinkingLevel: ThinkingLevel }> = [
+  { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW },
+  { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL },
+];
+
+function isQuotaOrRateLimitError(err: any): boolean {
+  const raw = `${err?.status || ''} ${err?.code || ''} ${err?.message || ''}`.toLowerCase();
+  return (
+    err?.status === 429 ||
+    err?.status === 503 ||
+    raw.includes('429') ||
+    raw.includes('503') ||
+    raw.includes('resource_exhausted') ||
+    raw.includes('unavailable') ||
+    raw.includes('high demand') ||
+    raw.includes('overloaded') ||
+    raw.includes('quota') ||
+    raw.includes('rate limit')
+  );
+}
+
+function formatReadableGeminiError(error: any): string {
+  if (error?.code === 'GEMINI_API_KEY_MISSING') {
+    return 'የኤአይ ቁልፍ (GEMINI_API_KEY) በሰርቨሩ ላይ አልተሞላም። በSettings > Secrets ወይም Render Environment ላይ GEMINI_API_KEY ያስገቡ።';
+  }
+  const raw = String(error?.message || '');
+  const lower = raw.toLowerCase();
+  if (error?.status === 429 || lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota')) {
+    return 'የነጻው ኤአይ ዕለታዊ የጥያቄ ገደብ (Free Tier Daily Limit) ለዛሬ ሞልቷል። ነገ ገደቡ ሲታደስ ይሰራል፤ ወይም በGoogle AI Studio (Settings > Secrets / Billing) የሚከፈልበትን (Pay-as-you-go) ቁልፍ መምረጥ ይችላሉ።';
+  }
+  if (error?.status === 503 || lower.includes('503') || lower.includes('high demand') || lower.includes('unavailable')) {
+    return 'የኤአይ ሰርቨሩ በአሁኑ ሰዓት በብዙ ተጠቃሚዎች ተጨናንቋል (High Demand)። እባክዎ ከጥቂት ሰከንዶች በኋላ እንደገና ይሞክሩ።';
+  }
+  if (raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED') || raw.includes('403')) {
+    return 'የGEMINI_API_KEY ትክክለኛ አለመሆኑን በSettings > Secrets ወይም Render Environment ላይ ያረጋግጡ።';
+  }
+  return 'የኤአይ አገልግሎት ጊዜያዊ መቋረጥ አጋጥሞታል፤ እባክዎ ከጥቂት ሰከንዶች በኋላ እንደገና ይሞክሩ።';
+}
+
 async function generateWithGemini(prompt: string, systemInstruction: string, cacheKey?: string): Promise<string> {
   if (cacheKey) {
     const cached = getCachedAi(cacheKey);
@@ -404,21 +448,36 @@ async function generateWithGemini(prompt: string, systemInstruction: string, cac
   }
 
   const ai = getAiClient();
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: prompt,
-    config: {
-      systemInstruction,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-    },
-  });
+  let lastError: any = null;
 
-  const text = response.text?.trim();
-  if (!text) {
-    throw new Error('Empty response from Gemini API');
+  for (const candidate of GEMINI_MODEL_CANDIDATES) {
+    try {
+      const response = await ai.models.generateContent({
+        model: candidate.model,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          thinkingConfig: { thinkingLevel: candidate.thinkingLevel },
+        },
+      });
+
+      const text = response.text?.trim();
+      if (!text) {
+        throw new Error('Empty response from Gemini API');
+      }
+      if (cacheKey) setCachedAi(cacheKey, text);
+      return text;
+    } catch (err: any) {
+      lastError = err;
+      if (isQuotaOrRateLimitError(err)) {
+        console.warn(`Gemini quota limit on ${candidate.model}, failing over to next model...`);
+        continue;
+      }
+      throw err;
+    }
   }
-  if (cacheKey) setCachedAi(cacheKey, text);
-  return text;
+
+  throw lastError;
 }
 
 async function streamWithGemini(
@@ -443,35 +502,48 @@ async function streamWithGemini(
 
   try {
     const ai = getAiClient();
-    const stream = await ai.models.generateContentStream({
-      model: 'gemini-4-hydrogen',
-      contents: prompt,
-      config: {
-        systemInstruction,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      },
-    });
+    let lastError: any = null;
 
-    let fullText = '';
-    for await (const chunk of stream) {
-      const part = chunk.text || '';
-      if (part) {
-        fullText += part;
-        res.write(`data: ${JSON.stringify({ chunk: part })}\n\n`);
+    for (const candidate of GEMINI_MODEL_CANDIDATES) {
+      try {
+        const stream = await ai.models.generateContentStream({
+          model: candidate.model,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            thinkingConfig: { thinkingLevel: candidate.thinkingLevel },
+          },
+        });
+
+        let fullText = '';
+        for await (const chunk of stream) {
+          const part = chunk.text || '';
+          if (part) {
+            fullText += part;
+            res.write(`data: ${JSON.stringify({ chunk: part })}\n\n`);
+          }
+        }
+
+        if (cacheKey && fullText.trim()) {
+          setCachedAi(cacheKey, fullText.trim());
+        }
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+        res.end();
+        return;
+      } catch (err: any) {
+        lastError = err;
+        if (isQuotaOrRateLimitError(err)) {
+          console.warn(`Gemini stream quota on ${candidate.model}, failing over to next model...`);
+          continue;
+        }
+        throw err;
       }
     }
 
-    if (cacheKey && fullText.trim()) {
-      setCachedAi(cacheKey, fullText.trim());
-    }
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
+    throw lastError;
   } catch (error: any) {
     console.error('Gemini Stream Error:', error);
-    const message =
-      error?.code === 'GEMINI_API_KEY_MISSING'
-        ? 'የኤአይ ቁልፍ (GEMINI_API_KEY) በሰርቨሩ ላይ አልተሞላም። በRender Environment ላይ GEMINI_API_KEY ያስገቡ።'
-        : `የኤአይ አገልግሎት ስህተት (${error?.message || 'Unknown Error'})።`;
+    const message = formatReadableGeminiError(error);
     res.write(`data: ${JSON.stringify({ error: message, done: true })}\n\n`);
     res.end();
   }
@@ -774,13 +846,13 @@ app.post('/api/gemini/spiritual-counsel', async (req: Request, res: Response): P
     if (error?.code === 'GEMINI_API_KEY_MISSING') {
       res.status(503).json({
         error: 'GEMINI_API_KEY_MISSING',
-        message: 'የኤአይ ቁልፍ (GEMINI_API_KEY) በሰርቨሩ ላይ አልተሞላም። እባክዎ በRender Environment Variables ላይ GEMINI_API_KEY ያስገቡ።',
+        message: formatReadableGeminiError(error),
       });
       return;
     }
-    res.status(500).json({
-      error: 'AI_REQUEST_FAILED',
-      message: `የኤአይ አገልግሎት ስህተት አጋጥሞታል (${error?.message || 'Unknown Error'})።`,
+    res.status(isQuotaOrRateLimitError(error) ? 429 : 500).json({
+      error: isQuotaOrRateLimitError(error) ? 'QUOTA_EXCEEDED' : 'AI_REQUEST_FAILED',
+      message: formatReadableGeminiError(error),
     });
   }
 });
@@ -817,13 +889,13 @@ app.post('/api/gemini/scripture-search', async (req: Request, res: Response): Pr
     if (error?.code === 'GEMINI_API_KEY_MISSING') {
       res.status(503).json({
         error: 'GEMINI_API_KEY_MISSING',
-        message: 'የኤአይ ቁልፍ (GEMINI_API_KEY) በሰርቨሩ ላይ ስላልተሞላ ፍለጋው አልተቻለም። በRender Environment ላይ GEMINI_API_KEY ያስገቡ።',
+        message: formatReadableGeminiError(error),
       });
       return;
     }
-    res.status(500).json({
-      error: 'AI_SEARCH_FAILED',
-      message: `የፍለጋው ስህተት አጋጥሞታል (${error?.message || 'Unknown Error'})።`,
+    res.status(isQuotaOrRateLimitError(error) ? 429 : 500).json({
+      error: isQuotaOrRateLimitError(error) ? 'QUOTA_EXCEEDED' : 'AI_SEARCH_FAILED',
+      message: formatReadableGeminiError(error),
     });
   }
 });

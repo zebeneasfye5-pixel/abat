@@ -444,14 +444,14 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
               <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-700/50 space-y-1.5">
                 <label className="flex items-center gap-1.5 text-amber-300 font-semibold">
                   <Shield className="w-3.5 h-3.5" />
-                  <span>የቀሲስ ማረጋገጫ ኮድ (ኮድ፡ 777)</span>
+                  <span>የቀሲስ ማረጋገጫ ሚስጥር ኮድ</span>
                 </label>
                 <input
                   type="password"
                   required
                   value={formData.priestCode}
                   onChange={(e) => setFormData({ ...formData, priestCode: e.target.value })}
-                  placeholder="የቀሲስ ኮድ ያስገቡ (777)"
+                  placeholder="የቀሲስ ማረጋገጫ ኮድ ያስገቡ"
                   className="w-full bg-stone-900 border border-amber-700/60 rounded-xl px-3 py-2 text-stone-100"
                 />
               </div>

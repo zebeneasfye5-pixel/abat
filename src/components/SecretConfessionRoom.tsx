@@ -33,6 +33,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const [remoteUserName, setRemoteUserName] = useState<string>('');
   const [iceState, setIceState] = useState<string>('waiting');
   const [isVideoFullscreen, setIsVideoFullscreen] = useState(false);
+  const [swapVideoFeed, setSwapVideoFeed] = useState(false);
   const [mediaPermissionMsg, setMediaPermissionMsg] = useState<string | null>(null);
   const [requestingMedia, setRequestingMedia] = useState(false);
 
@@ -72,7 +73,11 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       remoteVideoRef.current.srcObject = remoteStreamRef.current;
       remoteVideoRef.current.play().catch(() => {});
     }
-  }, [remoteUserConnected]);
+    if (localVideoRef.current && streamRef.current) {
+      localVideoRef.current.srcObject = streamRef.current;
+      localVideoRef.current.play().catch(() => {});
+    }
+  }, [remoteUserConnected, swapVideoFeed, isVideoOn]);
 
   useEffect(() => {
     if (!isAuthenticated || !roomId) return;
@@ -522,7 +527,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         setIsAuthenticated(true);
         playChurchBell();
       } else {
-        setErrorMsg(result.error || 'የተሳሳተ የሚስጥር ቁጥር! ቢያንስ 3 አሃዝ የጋራ ኮድ ያስገቡ (ለምሳሌ፡ 777)።');
+        setErrorMsg(result.error || 'የተሳሳተ የሚስጥር ቁጥር! ቢያንስ 3 አሃዝ የጋራ ሚስጥር ኮድ ያስገቡ።');
       }
     } catch {
       setErrorMsg('ከሰርቨር ጋር መገናኘት አልተቻለም።');
@@ -585,10 +590,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               <KeyRound className="w-5 h-5 absolute left-3.5 top-1/2 -translate-y-1/2 text-amber-400" />
               <input
                 type="password"
-                maxLength={6}
+                maxLength={8}
                 value={passcode}
                 onChange={(e) => setPasscode(e.target.value)}
-                placeholder="የሚስጥር ቁጥር (ለምሳሌ፡ 777)"
+                placeholder="የጋራ የሚስጥር ቁጥርዎን ያስገቡ"
                 className="w-full bg-stone-900 border border-amber-700/60 rounded-xl pl-11 pr-4 py-3 text-center text-lg font-mono tracking-widest text-amber-200 placeholder-stone-500 focus:outline-none focus:ring-2 focus:ring-amber-500"
               />
             </div>
@@ -601,14 +606,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
 
             <button
               type="submit"
-              className="w-full py-3.5 rounded-xl bg-gradient-to-r from-red-900 via-amber-900 to-red-900 border border-amber-500/50 text-white font-medium text-sm hover:from-red-800 hover:to-amber-800 shadow-xl transition-all hover:scale-[1.01]"
+              className="w-full py-3.5 rounded-xl bg-gradient-to-r from-red-900 via-amber-900 to-red-900 border border-amber-500/50 text-white font-bold text-sm hover:from-red-800 hover:to-amber-800 shadow-xl transition-all hover:scale-[1.01]"
             >
               በበረከት ወደ ሚስጥር ቤቱ ግባ
             </button>
-
-            <div className="text-[11px] text-stone-500">
-              የሙከራ ቁጥር፡ <button type="button" onClick={() => setPasscode('777')} className="text-amber-400 underline">777</button> ወይም <button type="button" onClick={() => setPasscode('7729')} className="text-amber-400 underline">7729</button>
-            </div>
           </form>
 
         </div>
@@ -621,42 +622,40 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
       
       {/* Top Security Banner */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 rounded-xl bg-stone-950 border border-red-900/40">
-        <div className="flex items-center gap-2.5">
-          <div className="p-2 rounded-lg bg-red-950/80 text-red-400">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 p-3.5 sm:p-4 rounded-xl bg-stone-950 border border-red-900/40">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="p-2 rounded-lg bg-red-950/80 text-red-400 shrink-0">
             <Shield className="w-5 h-5 text-emerald-400" />
           </div>
-          <div>
-            <h3 className="text-sm font-semibold font-heading text-amber-200">
-              የንስሐ ሚስጥር ቤት — የቀሲስ ሄኖክ እና የ{user.baptismalName} 1-ለ-1 ቪዲዮ
-            </h3>
-          </div>
+          <h3 className="text-sm font-bold font-heading text-amber-200 truncate">
+            የንስሐ ሚስጥር ቤት — የቀሲስ ሄኖክ እና የ{user.baptismalName} 1-ለ-1 ቪዲዮ
+          </h3>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {/* Real Audio Volume Visualizer Meter */}
-          <div className="flex items-center gap-1.5 px-3 py-1 rounded-md bg-stone-900 border border-stone-800 text-[11px]">
+          <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-stone-900 border border-stone-800 text-xs shrink-0">
             <Volume2 className="w-3.5 h-3.5 text-amber-400" />
-            <div className="w-16 h-2 bg-stone-950 rounded-full overflow-hidden">
+            <div className="w-14 h-2 bg-stone-950 rounded-full overflow-hidden">
               <div
                 className="h-full bg-emerald-400 transition-all duration-75"
                 style={{ width: `${micVolumeLevel}%` }}
               />
             </div>
-            <span className="font-mono text-stone-400 text-[10px]">{micVolumeLevel}%</span>
+            <span className="font-mono text-stone-300 text-xs">{micVolumeLevel}%</span>
           </div>
 
           {/* Real Peer-to-Peer Connection Status */}
-          <span className={`px-2.5 py-1 rounded-md border text-xs font-mono flex items-center gap-1.5 ${
+          <span className={`px-2.5 py-1.5 rounded-lg border text-xs flex items-center gap-1.5 ${
             remoteUserConnected
               ? 'bg-emerald-950/80 border-emerald-500 text-emerald-200'
-              : 'bg-amber-950/60 border-amber-700/50 text-amber-300'
+              : 'bg-amber-950/60 border-amber-700/50 text-amber-200'
           }`}>
-            <span className={`w-2 h-2 rounded-full ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+            <span className={`w-2 h-2 rounded-full shrink-0 ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
             <span>
               {remoteUserConnected
-                ? `ቀጥታ ከ${remoteUserName} ጋር ተገናኝቷል (${iceState})`
-                : 'ሌላኛውን ሰው በተመሳሳይ ኮድ በመጠባበቅ ላይ...'}
+                ? `ቀጥታ ከ${remoteUserName} ጋር ተገናኝቷል`
+                : 'ሌላኛውን ሰው በመጠባበቅ ላይ...'}
             </span>
           </span>
 
@@ -667,7 +666,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               if (wsRef.current) wsRef.current.close();
               setIsAuthenticated(false);
             }}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-950/70 border border-red-700/60 text-red-200 text-xs hover:bg-red-900 transition"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-950/80 border border-red-700/70 text-red-200 text-xs hover:bg-red-900 transition shrink-0"
           >
             <PhoneOff className="w-3.5 h-3.5" />
             <span>ከቤቱ ውጣ</span>
@@ -678,26 +677,51 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       {/* Video & Ritual Workspace Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
-        {/* Left: 1-on-1 Real HD Video Interface */}
-        <div className="lg:col-span-7 space-y-4">
+        {/* Left: Unobstructed 1-on-1 Real HD Video Interface */}
+        <div className="lg:col-span-7 space-y-3">
           
           <div
             ref={videoBoxRef}
-            className={`overflow-hidden bg-black border-2 border-amber-700/40 shadow-2xl ${
+            className={`overflow-hidden bg-black border-2 border-amber-700/50 shadow-2xl ${
               isVideoFullscreen
                 ? 'fixed inset-0 z-50 h-screen w-screen rounded-none'
-                : 'relative rounded-2xl h-[440px] sm:h-[580px]'
+                : 'relative rounded-2xl h-[460px] sm:h-[580px]'
             }`}
           >
-            
-            {/* Always keep remote video element in DOM so WebRTC stream attaches with zero latency */}
+            {/* Remote Video Layer (Main stage when connected and not swapped; PiP when swapped) */}
             <video
               ref={remoteVideoRef}
               autoPlay
               playsInline
-              className={`w-full h-full object-cover contrast-[1.03] saturate-[1.06] ${remoteUserConnected ? 'block' : 'hidden'}`}
+              onClick={() => {
+                if (remoteUserConnected && swapVideoFeed) setSwapVideoFeed(false);
+              }}
+              className={`object-cover contrast-[1.03] saturate-[1.06] ${
+                !remoteUserConnected
+                  ? 'hidden'
+                  : swapVideoFeed
+                  ? 'absolute bottom-3 right-3 w-32 sm:w-44 h-44 sm:h-52 rounded-2xl border-2 border-amber-400 shadow-2xl z-20 cursor-pointer'
+                  : 'w-full h-full block'
+              }`}
             />
-            {!remoteUserConnected && (
+
+            {/* Self Video Layer (Full clear main view while waiting OR when swapped; generous unobstructed PiP when remote is main) */}
+            {isVideoOn ? (
+              <video
+                ref={localVideoRef}
+                autoPlay
+                playsInline
+                muted
+                onClick={() => {
+                  if (remoteUserConnected && !swapVideoFeed) setSwapVideoFeed(true);
+                }}
+                className={`object-cover contrast-[1.03] saturate-[1.05] mirror ${
+                  !remoteUserConnected || swapVideoFeed
+                    ? 'w-full h-full block'
+                    : 'absolute bottom-3 right-3 w-32 sm:w-44 h-44 sm:h-52 rounded-2xl border-2 border-amber-400/90 shadow-2xl z-20 cursor-pointer'
+                }`}
+              />
+            ) : !remoteUserConnected ? (
               <div className="relative w-full h-full">
                 <img
                   src={sacredSanctuaryImg}
@@ -705,34 +729,77 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                   decoding="async"
                   className="w-full h-full object-cover filter brightness-50"
                 />
-                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center space-y-2">
-                  <Lock className="w-10 h-10 text-amber-400 animate-pulse" />
+                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center space-y-3">
+                  <Lock className="w-10 h-10 text-amber-400" />
                   <p className="text-sm font-heading font-bold text-amber-100">
-                    የክፍል ኮድ #{passcode} ተከፍቷል
+                    የንስሐ ሚስጥር ቤት ክፍት ነው
                   </p>
-                  <p className="text-xs text-stone-300 max-w-sm">
-                    የንስሐ አባትዎ (ወይም የንስሐ ልጅዎ) በሌላ ስልክ ተመሳሳዩን ኮድ (#{passcode}) አስገብተው ሲገቡ ቪዲዮና ድምፃቸው እዚህ በቀጥታ ይመጣል።
-                  </p>
+                  <button
+                    type="button"
+                    onClick={handleToggleVideo}
+                    disabled={requestingMedia}
+                    className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 border border-emerald-400 text-white text-xs font-extrabold inline-flex items-center gap-2 shadow-lg transition"
+                  >
+                    <Video className="w-4 h-4" />
+                    <span>{requestingMedia ? 'በመክፈት ላይ...' : 'ካሜራ ክፈት / ፍቀድ'}</span>
+                  </button>
                 </div>
+              </div>
+            ) : (
+              <div className="absolute bottom-3 right-3 w-32 sm:w-44 h-44 sm:h-52 rounded-2xl border-2 border-amber-400/70 bg-stone-950/95 z-20 flex flex-col items-center justify-center p-3 text-center gap-2 shadow-2xl">
+                <VideoOff className="w-6 h-6 text-red-400" />
+                <button
+                  type="button"
+                  onClick={handleToggleVideo}
+                  disabled={requestingMedia}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold transition"
+                >
+                  {requestingMedia ? 'በመክፈት ላይ...' : 'ካሜራ ፍቀድ'}
+                </button>
               </div>
             )}
 
-            {/* Remote User Label */}
-            <div className="absolute top-3 left-3 bg-stone-950/85 px-2.5 py-1 rounded-lg border border-amber-700/40 text-xs font-bold text-amber-200 flex items-center gap-1.5 z-10">
-              <span className={`w-2 h-2 rounded-full ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-500 animate-pulse'}`} />
-              <span>{remoteUserConnected ? `${remoteUserName} (በቀጥታ HD ቪዲዮ)` : `ሚስጥር ቤት #${passcode}`}</span>
+            {/* Main View Top-Left Live Badge */}
+            <div className="absolute top-3 left-3 bg-stone-950/85 backdrop-blur-sm px-3 py-1.5 rounded-lg border border-amber-700/50 text-xs font-bold text-amber-200 flex items-center gap-1.5 z-10">
+              <span className={`w-2 h-2 rounded-full ${remoteUserConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400 animate-pulse'}`} />
+              <span>
+                {!remoteUserConnected
+                  ? `${user.baptismalName || user.fullName} (ካሜራዎ ዝግጁ ነው · በመጠባበቅ ላይ)`
+                  : swapVideoFeed
+                  ? `${user.baptismalName || user.fullName} (እኔ)`
+                  : `${remoteUserName} (በቀጥታ HD ቪዲዮ)`}
+              </span>
             </div>
 
-            {/* Fullscreen Toggle Button */}
-            <button
-              type="button"
-              onClick={handleToggleFullscreen}
-              className="absolute top-3 right-3 p-2.5 rounded-lg bg-stone-950/85 hover:bg-amber-900 border border-amber-600/50 text-amber-200 transition z-20 flex items-center gap-1.5 text-xs font-bold"
-              title={isVideoFullscreen ? 'ሙሉ ስክሪን ዝጋ' : 'ሙሉ ስክሪን ክፈት'}
-            >
-              {isVideoFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
-              <span className="hidden sm:inline">{isVideoFullscreen ? 'መደበኛ' : 'ሙሉ ስክሪን'}</span>
-            </button>
+            {/* Fullscreen & Swap Controls Top-Right */}
+            <div className="absolute top-3 right-3 z-20 flex items-center gap-1.5">
+              {remoteUserConnected && (
+                <button
+                  type="button"
+                  onClick={() => setSwapVideoFeed((v) => !v)}
+                  className="px-2.5 py-2 rounded-lg bg-stone-950/85 hover:bg-amber-900 border border-amber-600/50 text-amber-200 transition text-xs font-bold"
+                  title="ዋናውንና የራስዎን ቪዲዮ አቀያይር"
+                >
+                  አቀያይር
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleToggleFullscreen}
+                className="p-2 rounded-lg bg-stone-950/85 hover:bg-amber-900 border border-amber-600/50 text-amber-200 transition flex items-center gap-1.5 text-xs font-bold"
+                title={isVideoFullscreen ? 'ሙሉ ስክሪን ዝጋ' : 'ሙሉ ስክሪን ክፈት'}
+              >
+                {isVideoFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+                <span className="hidden sm:inline">{isVideoFullscreen ? 'መደበኛ' : 'ሙሉ ስክሪን'}</span>
+              </button>
+            </div>
+
+            {/* PiP Corner Name Pill (only when remote connected and inset visible) */}
+            {remoteUserConnected && isVideoOn && (
+              <div className="absolute bottom-4 right-4 z-30 bg-stone-950/85 px-2.5 py-0.5 rounded-md border border-amber-700/40 text-[10px] text-amber-200 pointer-events-none">
+                {swapVideoFeed ? remoteUserName : `${user.baptismalName || user.fullName} (እኔ)`}
+              </div>
+            )}
 
             {/* Radiant Blessing Overlay when Priest Absolves */}
             {isBlessed && (
@@ -745,40 +812,6 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                 </h4>
               </div>
             )}
-
-            {/* Child's Self Camera Inset (PiP) */}
-            <div className="absolute bottom-16 right-4 w-36 sm:w-48 h-26 sm:h-34 rounded-xl overflow-hidden border-2 border-amber-400/70 shadow-2xl bg-stone-900 z-10">
-              {isVideoOn ? (
-                <video
-                  ref={localVideoRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className="w-full h-full object-cover mirror"
-                />
-              ) : (
-                <div className="w-full h-full flex flex-col items-center justify-center bg-stone-950 text-stone-200 p-2 text-center gap-1.5">
-                  <VideoOff className="w-5 h-5 text-red-400" />
-                  <button
-                    type="button"
-                    onClick={handleToggleVideo}
-                    disabled={requestingMedia}
-                    className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-extrabold transition"
-                  >
-                    {requestingMedia ? 'በመክፈት ላይ...' : 'ካሜራ ፍቀድ'}
-                  </button>
-                </div>
-              )}
-              
-              <div className="absolute bottom-1.5 left-1.5 right-1.5 flex items-center justify-between bg-stone-950/80 px-2 py-0.5 rounded text-[10px] text-amber-200">
-                <span>{user.baptismalName} (እኔ)</span>
-                {isMicOn ? (
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                ) : (
-                  <span className="w-2 h-2 rounded-full bg-red-400" />
-                )}
-              </div>
-            </div>
 
             {mediaPermissionMsg && (
               <div className="absolute top-14 left-3 right-3 z-20 p-2.5 rounded-xl bg-amber-950/90 border border-amber-500/70 text-xs text-amber-100 font-bold flex flex-wrap items-center justify-between gap-2 shadow-xl">
@@ -793,55 +826,56 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                 </button>
               </div>
             )}
+          </div>
 
-            {/* Video & Audio Controls Bar */}
-            <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between p-3 rounded-xl bg-stone-950/85 backdrop-blur-md border border-amber-900/40 z-10">
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleToggleMic}
-                  className={`p-2.5 rounded-lg border transition ${
-                    isMicOn ? 'bg-emerald-950 border-emerald-600 text-emerald-300' : 'bg-red-950 border-red-700 text-red-300'
-                  }`}
-                  title={isMicOn ? 'ማይክ ክፍት ነው' : 'ማይክ ዝጋ'}
-                >
-                  {isMicOn ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
-                </button>
+          {/* Clean Controls Bar Placed Below the Video Frame (Zero Face Overlap!) */}
+          <div className="flex flex-wrap items-center justify-between gap-2 p-3 rounded-2xl bg-stone-950 border border-amber-900/40 shadow-lg">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={handleToggleMic}
+                className={`p-2.5 rounded-xl border transition flex items-center gap-1.5 text-xs ${
+                  isMicOn ? 'bg-emerald-950 border-emerald-600 text-emerald-300' : 'bg-red-950 border-red-700 text-red-300'
+                }`}
+                title={isMicOn ? 'ማይክ ክፍት ነው' : 'ማይክ ዝጋ'}
+              >
+                {isMicOn ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
+                <span className="hidden sm:inline">{isMicOn ? 'ማይክ ክፍት' : 'ማይክ ዝግ'}</span>
+              </button>
 
-                <button
-                  onClick={handleToggleVideo}
-                  className={`p-2.5 rounded-lg border transition ${
-                    isVideoOn ? 'bg-stone-900 border-stone-700 text-stone-200' : 'bg-red-950 border-red-700 text-red-300'
-                  }`}
-                  title={isVideoOn ? 'ካሜራ ክፍት ነው' : 'ካሜራ ዝጋ'}
-                >
-                  {isVideoOn ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
-                </button>
+              <button
+                onClick={handleToggleVideo}
+                className={`p-2.5 rounded-xl border transition flex items-center gap-1.5 text-xs ${
+                  isVideoOn ? 'bg-stone-900 border-stone-700 text-stone-200' : 'bg-red-950 border-red-700 text-red-300'
+                }`}
+                title={isVideoOn ? 'ካሜራ ክፍት ነው' : 'ካሜራ ዝጋ'}
+              >
+                {isVideoOn ? <Video className="w-4 h-4 text-emerald-400" /> : <VideoOff className="w-4 h-4" />}
+                <span className="hidden sm:inline">{isVideoOn ? 'ካሜራ ክፍት' : 'ካሜራ ዝግ'}</span>
+              </button>
 
-                <button
-                  onClick={handleSwitchCamera}
-                  className="p-2.5 rounded-lg bg-stone-900 border border-stone-700 text-stone-300 hover:text-amber-200 transition"
-                  title="ካሜራ ቀይር (Flip Camera)"
-                >
-                  <RefreshCw className="w-4 h-4" />
-                </button>
+              <button
+                onClick={handleSwitchCamera}
+                className="p-2.5 rounded-xl bg-stone-900 border border-stone-700 text-stone-300 hover:text-amber-200 transition"
+                title="ካሜራ ቀይር (Flip Camera)"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
 
-                <button
-                  onClick={() => {
-                    speakBlessingPrayer('በእግዚአብሔር ስም ሰላም ለእናንተ ይሁን። ልጄ ኃጢአትህን ያለመደበቅ ተናዘዝ፤ እግዚአብሔር መሐሪና ይቅር ባይ ነው።');
-                  }}
-                  className="px-2.5 py-1.5 rounded-lg bg-stone-900 border border-stone-700 text-xs text-amber-300 hover:bg-stone-800 transition flex items-center gap-1.5"
-                >
-                  <Volume2 className="w-3.5 h-3.5 text-amber-400" />
-                  <span>ቀሲሱን አድምጥ</span>
-                </button>
-              </div>
-
-              <div className="flex items-center gap-1.5 text-xs text-stone-300">
-                <Flame className="w-4 h-4 text-amber-400 animate-candle" />
-                <span className="hidden sm:inline">የንስሐ ጧፍ በርቷል</span>
-              </div>
+              <button
+                onClick={() => {
+                  speakBlessingPrayer('በእግዚአብሔር ስም ሰላም ለእናንተ ይሁን። ልጄ ኃጢአትህን ያለመደበቅ ተናዘዝ፤ እግዚአብሔር መሐሪና ይቅር ባይ ነው።');
+                }}
+                className="px-3 py-2 rounded-xl bg-stone-900 border border-stone-700 text-xs text-amber-300 hover:bg-stone-800 transition flex items-center gap-1.5"
+              >
+                <Volume2 className="w-3.5 h-3.5 text-amber-400" />
+                <span>ቀሲሱን አድምጥ</span>
+              </button>
             </div>
 
+            <div className="flex items-center gap-1.5 text-xs text-stone-300">
+              <Flame className="w-4 h-4 text-amber-400 animate-candle" />
+              <span className="hidden sm:inline">የንስሐ ጧፍ በርቷል</span>
+            </div>
           </div>
 
         </div>

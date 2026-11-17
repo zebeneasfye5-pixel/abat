@@ -8,14 +8,14 @@
   }
 
   html {
-    font-size: 16.5px;
+    font-size: 17.5px;
   }
 
   body {
     font-family: var(--font-amharic);
-    font-weight: 600;
-    line-height: 1.65;
-    letter-spacing: 0.012em;
+    font-weight: 700;
+    line-height: 1.7;
+    letter-spacing: 0.015em;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
@@ -25,16 +25,42 @@
   h1, h2, h3, h4, .font-heading {
     font-family: var(--font-heading);
     font-weight: 800;
-    letter-spacing: 0.015em;
+    letter-spacing: 0.018em;
   }
 
-  p, span, li, a, button, input, textarea, select, label {
-    font-weight: 600;
+  p, span, li, a, button, input, textarea, select, label, td, th, div {
+    font-weight: 700;
   }
 
   strong, b {
     font-weight: 800;
   }
+}
+
+/* Strengthen thin Tailwind font utilities on Amharic body copy without flattening heavy headings */
+.font-normal,
+.font-medium {
+  font-weight: 700 !important;
+}
+
+.font-semibold {
+  font-weight: 700 !important;
+}
+
+.text-\[10px\],
+.text-\[11px\] {
+  font-size: 0.78rem !important;
+  line-height: 1.4 !important;
+}
+
+.text-xs {
+  font-size: 0.85rem !important;
+  line-height: 1.5 !important;
+}
+
+.text-sm {
+  font-size: 0.95rem !important;
+  line-height: 1.6 !important;
 }
 
 /* Custom scrollbar for ecclesiastical dark theme */

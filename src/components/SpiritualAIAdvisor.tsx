@@ -11,6 +11,8 @@ import {
   Share2,
   Download,
   Zap,
+  X,
+  RotateCcw,
 } from 'lucide-react';
 import { streamOrthodoxSearch, streamSpiritualCounsel } from '../services/api';
 import { UserProfile } from '../types';
@@ -73,6 +75,8 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
   const chatAbortRef = useRef<AbortController | null>(null);
   const searchAbortRef = useRef<AbortController | null>(null);
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
+  const promptInputRef = useRef<HTMLInputElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   const presetQuestions = [
     'ሰባቱ ምሥጢራተ ቤተክርስቲያን ምንድን ናቸው?',
@@ -232,6 +236,32 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
     downloadAsTextFile('የኤአይ መንፈሳዊ ውይይት ማህደር', transcript);
   };
 
+  const handleClearPrompt = () => {
+    setPrompt('');
+    promptInputRef.current?.focus();
+  };
+
+  const handleClearSearch = () => {
+    searchAbortRef.current?.abort();
+    setScriptureQuery('');
+    setScriptureResult(null);
+    setScriptureLoading(false);
+    searchInputRef.current?.focus();
+  };
+
+  const handleClearConversation = () => {
+    chatAbortRef.current?.abort();
+    setLoading(false);
+    setPrompt('');
+    setConversation([
+      {
+        role: 'priest_ai',
+        text: `ሰላም ${user.baptismalName || 'ልጄ'}። የቀድሞ ውይይቱ ጸድቷል፤ አዲስ መንፈሳዊ ጥያቄ መጻፍ ይችላሉ።`,
+      },
+    ]);
+    promptInputRef.current?.focus();
+  };
+
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
       {/* Title Header */}
@@ -247,13 +277,24 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
             </h2>
           </div>
 
-          <button
-            onClick={handleDownloadFullChat}
-            className="px-3.5 py-2 rounded-xl bg-stone-950 hover:bg-stone-800 border border-amber-600/60 text-amber-200 text-xs font-extrabold inline-flex items-center gap-2 transition"
-          >
-            <Download className="w-4 h-4 text-amber-400" />
-            <span>ሙሉ ውይይቱን ዳውንሎድ አድርግ</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleClearConversation}
+              className="px-3 py-2 rounded-xl bg-stone-950 hover:bg-red-950/60 border border-stone-700 hover:border-red-700/60 text-stone-200 hover:text-red-200 text-xs font-extrabold inline-flex items-center gap-1.5 transition"
+              title="ውይይቱን በአንድ ንክኪ አጽዳ"
+            >
+              <RotateCcw className="w-3.5 h-3.5 text-amber-400" />
+              <span>ውይይት አጽዳ</span>
+            </button>
+            <button
+              onClick={handleDownloadFullChat}
+              className="px-3.5 py-2 rounded-xl bg-stone-950 hover:bg-stone-800 border border-amber-600/60 text-amber-200 text-xs font-extrabold inline-flex items-center gap-2 transition"
+            >
+              <Download className="w-4 h-4 text-amber-400" />
+              <span>ሙሉ ውይይቱን ዳውንሎድ አድርግ</span>
+            </button>
+          </div>
         </div>
 
         {/* Comprehensive Orthodox Topic Selector Tabs */}
@@ -366,7 +407,7 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
             ))}
           </div>
 
-          {/* User Input Bar */}
+          {/* User Input Bar with 1-Tap Clear Button */}
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -374,17 +415,31 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
             }}
             className="p-3 bg-stone-950 border-t border-stone-800 flex gap-2"
           >
-            <input
-              type="text"
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              placeholder="ማንኛውንም የኦርቶዶክስ እምነት፣ ቀኖና፣ ታሪክ ወይም መንፈሳዊ ጥያቄ ይጻፉ..."
-              className="flex-1 bg-stone-900 border border-stone-700 rounded-xl px-4 py-3 text-sm text-stone-100 placeholder-stone-400 focus:outline-none focus:border-amber-500"
-            />
+            <div className="relative flex-1 flex items-center">
+              <input
+                ref={promptInputRef}
+                type="text"
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                placeholder="ማንኛውንም የኦርቶዶክስ እምነት፣ ቀኖና፣ ታሪክ ወይም መንፈሳዊ ጥያቄ ይጻፉ..."
+                className="w-full bg-stone-900 border border-stone-700 rounded-xl pl-4 pr-20 py-3 text-sm text-stone-100 placeholder-stone-400 focus:outline-none focus:border-amber-500"
+              />
+              {prompt.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleClearPrompt}
+                  className="absolute right-2 px-2.5 py-1 rounded-lg bg-stone-800 hover:bg-red-950 border border-stone-600 hover:border-red-500 text-amber-200 hover:text-red-200 text-xs font-extrabold flex items-center gap-1 transition"
+                  title="የጻፉትን አጽዳ (Clear)"
+                >
+                  <X className="w-3.5 h-3.5" />
+                  <span>አጽዳ</span>
+                </button>
+              )}
+            </div>
             <button
               type="submit"
               disabled={loading || !prompt.trim()}
-              className="px-5 py-3 rounded-xl bg-gradient-to-r from-red-900 to-amber-800 border border-amber-500 text-white font-extrabold text-sm hover:border-amber-300 disabled:opacity-50 transition flex items-center gap-1.5"
+              className="px-5 py-3 rounded-xl bg-gradient-to-r from-red-900 to-amber-800 border border-amber-500 text-white font-extrabold text-sm hover:border-amber-300 disabled:opacity-50 transition flex items-center gap-1.5 shrink-0"
             >
               <Send className="w-4 h-4" />
               <span>ጠይቅ</span>
@@ -434,20 +489,32 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
             </select>
 
             <form onSubmit={handleSearchSubmit} className="flex gap-2">
-              <div className="relative flex-1">
-                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
+              <div className="relative flex-1 flex items-center">
+                <Search className="w-4 h-4 absolute left-3 text-stone-400 pointer-events-none" />
                 <input
+                  ref={searchInputRef}
                   type="text"
                   value={scriptureQuery}
                   onChange={(e) => setScriptureQuery(e.target.value)}
                   placeholder="ቃል ወይም ርዕስ ይጻፉ (ምሳሌ፡ ሥላሴ፣ ጥምቀት፣ ኪዳነ ምሕረት...)"
-                  className="w-full bg-stone-950 border border-stone-700 rounded-xl pl-9 pr-3 py-2.5 text-sm text-stone-100 placeholder-stone-500 focus:outline-none focus:border-amber-500"
+                  className="w-full bg-stone-950 border border-stone-700 rounded-xl pl-9 pr-20 py-2.5 text-sm text-stone-100 placeholder-stone-500 focus:outline-none focus:border-amber-500"
                 />
+                {scriptureQuery.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleClearSearch}
+                    className="absolute right-1.5 px-2 py-1 rounded-lg bg-stone-900 hover:bg-red-950 border border-stone-700 hover:border-red-500 text-amber-200 hover:text-red-200 text-xs font-extrabold flex items-center gap-1 transition"
+                    title="የፍለጋ ጽሑፉን አጽዳ (Clear)"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>አጽዳ</span>
+                  </button>
+                )}
               </div>
               <button
                 type="submit"
                 disabled={scriptureLoading || !scriptureQuery.trim()}
-                className="px-4 py-2.5 rounded-xl bg-amber-700 hover:bg-amber-600 border border-amber-500 text-stone-950 text-xs font-extrabold disabled:opacity-50 transition"
+                className="px-4 py-2.5 rounded-xl bg-amber-700 hover:bg-amber-600 border border-amber-500 text-stone-950 text-xs font-extrabold disabled:opacity-50 transition shrink-0"
               >
                 ፈልግ
               </button>

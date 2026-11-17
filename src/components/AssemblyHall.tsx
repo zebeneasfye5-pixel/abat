@@ -293,6 +293,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const [audioHymnPlaying, setAudioHymnPlaying] = useState(false);
   const [isGlobalAudioMuted, setIsGlobalAudioMuted] = useState(false);
   const [mediaWarning, setMediaWarning] = useState<string | null>(null);
+  const [requestingMedia, setRequestingMedia] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
 
   // Real Connected Remote Peers
@@ -418,12 +419,14 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   useEffect(() => {
     let isCancelled = false;
 
-    const boot = async () => {
-      const extConfig = await fetchWebRTCConfig();
-      rtcConfigRef.current = { iceServers: extConfig.iceServers };
+    const acquireInitialMedia = async (): Promise<MediaStream | null> => {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setIsVideoOn(false);
+        setIsMicOn(false);
+        setMediaWarning('ካሜራ ለመክፈት HTTPS ደህንነቱ የተጠበቀ ግንኙነት ያስፈልጋል።');
+        return null;
+      }
 
-      // 1. Acquire Full HD 1080p Video & 48kHz Studio Audio with progressive fallback
-      let acquiredStream: MediaStream | null = null;
       const hdAudioConstraints: MediaTrackConstraints = {
         echoCancellation: true,
         noiseSuppression: true,
@@ -431,34 +434,80 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         channelCount: 1,
         sampleRate: 48000,
       };
-      try {
-        acquiredStream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: 'user',
-            width: { ideal: 1920, min: 640 },
-            height: { ideal: 1080, min: 480 },
-            frameRate: { ideal: 30, min: 15 },
+
+      const attempts: Array<{ constraints: MediaStreamConstraints; label: string }> = [
+        {
+          label: '1080p',
+          constraints: {
+            video: {
+              facingMode: 'user',
+              width: { ideal: 1920, min: 640 },
+              height: { ideal: 1080, min: 480 },
+              frameRate: { ideal: 30, min: 15 },
+            },
+            audio: hdAudioConstraints,
           },
-          audio: hdAudioConstraints,
-        });
-      } catch {
-        try {
-          acquiredStream = await navigator.mediaDevices.getUserMedia({
+        },
+        {
+          label: '720p',
+          constraints: {
             video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
             audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          });
-        } catch {
-          try {
-            acquiredStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            setIsVideoOn(false);
-            setMediaWarning('ካሜራ አልተገኘም ወይም አልተፈቀደም፤ በድምፅ ብቻ ተቀላቅለዋል።');
-          } catch {
-            setIsVideoOn(false);
-            setIsMicOn(false);
-            setMediaWarning('ካሜራ እና ማይክራፎን አልተፈቀደም፤ እንደ ተመልካች (Viewer Mode) ተቀላቅለዋል።');
+          },
+        },
+        {
+          label: 'standard-cam-mic',
+          constraints: { video: { facingMode: 'user' }, audio: true },
+        },
+        {
+          label: 'any-cam-mic',
+          constraints: { video: true, audio: true },
+        },
+        {
+          label: 'video-only',
+          constraints: { video: true },
+        },
+        {
+          label: 'audio-only',
+          constraints: { audio: true },
+        },
+      ];
+
+      let lastErrName = '';
+      for (const attempt of attempts) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia(attempt.constraints);
+          const hasVideo = stream.getVideoTracks().length > 0;
+          const hasAudio = stream.getAudioTracks().length > 0;
+          setIsVideoOn(hasVideo);
+          setIsMicOn(hasAudio);
+          if (!hasVideo) {
+            setMediaWarning('ካሜራ አልተገኘም ወይም ፍቃድ ይፈልጋል፤ «ካሜራ ፍቀድ» የሚለውን ይጫኑ።');
+          } else {
+            setMediaWarning(null);
           }
+          return stream;
+        } catch (err: any) {
+          lastErrName = err?.name || '';
         }
       }
+
+      setIsVideoOn(false);
+      setIsMicOn(false);
+      if (lastErrName === 'NotAllowedError' || lastErrName === 'PermissionDeniedError') {
+        setMediaWarning('የስልክዎ/ብራውዘርዎ ካሜራ ፍቃድ ተዘግቷል፤ ከታች «ካሜራና ማይክ ፍቀድ» የሚለውን ይንኩ ወይም በብራውዘር አድራሻ አሞሌ 🔒 ላይ ካሜራን Allow ያድርጉ።');
+      } else {
+        setMediaWarning('ካሜራ ለማብራት «ካሜራና ማይክ ፍቀድ» የሚለውን ይጫኑ።');
+      }
+      return null;
+    };
+
+    const boot = async () => {
+      const extConfig = await fetchWebRTCConfig();
+      rtcConfigRef.current = { iceServers: extConfig.iceServers };
+
+      // 1. Acquire Video & Audio with universal fallbacks
+      const acquiredStream = await acquireInitialMedia();
 
       if (isCancelled) {
         acquiredStream?.getTracks().forEach((t) => t.stop());
@@ -473,31 +522,33 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         }
 
         // Studio Mic Meter
-        try {
-          const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-          const ctx = new AudioCtx();
-          audioContextRef.current = ctx;
-          const source = ctx.createMediaStreamSource(acquiredStream);
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 64;
-          analyserRef.current = analyser;
-          source.connect(analyser);
+        if (acquiredStream.getAudioTracks().length > 0) {
+          try {
+            const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+            const ctx = new AudioCtx();
+            audioContextRef.current = ctx;
+            const source = ctx.createMediaStreamSource(acquiredStream);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 64;
+            analyserRef.current = analyser;
+            source.connect(analyser);
 
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-          const updateVol = () => {
-            if (isCancelled) return;
-            if (analyserRef.current && isMicOnRef.current) {
-              analyserRef.current.getByteFrequencyData(dataArray);
-              let sum = 0;
-              for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-              setMyVolume(Math.min(100, Math.round((sum / dataArray.length / 128) * 100)));
-            } else {
-              setMyVolume(0);
-            }
-            animFrameRef.current = requestAnimationFrame(updateVol);
-          };
-          updateVol();
-        } catch {}
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            const updateVol = () => {
+              if (isCancelled) return;
+              if (analyserRef.current && isMicOnRef.current) {
+                analyserRef.current.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                setMyVolume(Math.min(100, Math.round((sum / dataArray.length / 128) * 100)));
+              } else {
+                setMyVolume(0);
+              }
+              animFrameRef.current = requestAnimationFrame(updateVol);
+            };
+            updateVol();
+          } catch {}
+        }
       }
 
       // 2. If LiveKit Enterprise SFU is configured on server, use SFU for 1,000 - 10,000+ concurrent viewers!
@@ -856,10 +907,103 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     });
   };
 
-  const handleToggleMic = () => {
+  const handleRequestCameraPermission = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMediaWarning('ብራውዘርዎ ካሜራ አይደግፍም ወይም HTTPS ግንኙነት ያስፈልጋል።');
+      return;
+    }
+    setRequestingMedia(true);
+    try {
+      const spec = QUALITY_MAP[videoQuality];
+      const candidates: MediaStreamConstraints[] = [
+        {
+          video: { facingMode, width: { ideal: spec.width }, height: { ideal: spec.height }, frameRate: { ideal: 30 } },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        },
+        { video: { facingMode }, audio: true },
+        { video: true, audio: true },
+        { video: true },
+      ];
+
+      let stream: MediaStream | null = null;
+      let lastErr: any = null;
+      for (const c of candidates) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(c);
+          break;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      if (!stream) {
+        const name = lastErr?.name || '';
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          setMediaWarning('ካሜራው በብራውዘር ቅንብር ተከልክሏል። ከላይ ያለውን 🔒 (Site Settings) ነክተው Camera → Allow ያድርጉና «ካሜራ ፍቀድ» ይጫኑ።');
+        } else if (name === 'NotReadableError') {
+          setMediaWarning('ካሜራው በሌላ አፕ (ለምሳሌ Zoom/WhatsApp) እየተጠቀመ ነው፤ እሱን ዘግተው እንደገና ይሞክሩ።');
+        } else {
+          setMediaWarning('ካሜራ መክፈት አልተቻለም። እባክዎ የስልክዎን ካሜራ ፍቃድ ያረጋግጡ።');
+        }
+        return;
+      }
+
+      // Preserve/stop old tracks cleanly and attach new tracks
+      localStreamRef.current?.getTracks().forEach((t) => t.stop());
+      localStreamRef.current = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+        localVideoRef.current.play().catch(() => {});
+      }
+
+      const hasVideo = stream.getVideoTracks().length > 0;
+      const hasAudio = stream.getAudioTracks().length > 0;
+      setIsVideoOn(hasVideo);
+      setIsMicOn(hasAudio);
+      setMediaWarning(null);
+
+      // Push new tracks to LiveKit if connected
+      if (liveKitRoomRef.current) {
+        for (const t of stream.getTracks()) {
+          await liveKitRoomRef.current.localParticipant.publishTrack(t).catch(() => {});
+        }
+      }
+
+      // Push/renegotiate new tracks across all WebRTC peer connections
+      for (const [peerId, pc] of peerConnectionsRef.current.entries()) {
+        for (const t of stream.getTracks()) {
+          const existingSender = pc.getSenders().find((s) => s.track?.kind === t.kind);
+          if (existingSender) {
+            await existingSender.replaceTrack(t).catch(() => {});
+          } else {
+            pc.addTrack(t, stream);
+          }
+        }
+        await applyStudioEncoderTuning(pc, videoQuality);
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          wsRef.current?.send(
+            JSON.stringify({
+              type: 'webrtc-signal',
+              roomId: ROOM_ID,
+              targetPeerId: peerId,
+              signal: { sdp: offer },
+            })
+          );
+        } catch {}
+      }
+
+      broadcastMediaState({ isVideoOn: hasVideo, isMicOn: hasAudio });
+    } finally {
+      setRequestingMedia(false);
+    }
+  };
+
+  const handleToggleMic = async () => {
     const tracks = localStreamRef.current?.getAudioTracks() || [];
     if (tracks.length === 0) {
-      alert('ማይክራፎን አልተገኘም ወይም በብራውዘርዎ አልተፈቀደም።');
+      await handleRequestCameraPermission();
       return;
     }
     const next = !isMicOn;
@@ -871,10 +1015,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     broadcastMediaState({ isMicOn: next });
   };
 
-  const handleToggleVideo = () => {
+  const handleToggleVideo = async () => {
     const tracks = localStreamRef.current?.getVideoTracks() || [];
     if (tracks.length === 0) {
-      alert('ካሜራ አልተገኘም ወይም በብራውዘርዎ አልተፈቀደም።');
+      await handleRequestCameraPermission();
       return;
     }
     const next = !isVideoOn;
@@ -1170,9 +1314,20 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       </div>
 
       {mediaWarning && (
-        <div className="p-2.5 rounded-xl bg-amber-950/70 border border-amber-700/60 text-xs text-amber-200 font-bold flex items-center gap-2">
-          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-          <span>{mediaWarning}</span>
+        <div className="p-3 rounded-xl bg-amber-950/80 border border-amber-600/70 text-xs text-amber-100 font-bold flex flex-wrap items-center justify-between gap-2.5 shadow-lg">
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>{mediaWarning}</span>
+          </div>
+          <button
+            type="button"
+            onClick={handleRequestCameraPermission}
+            disabled={requestingMedia}
+            className="px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 border border-emerald-400 text-white text-xs font-extrabold inline-flex items-center gap-1.5 transition shrink-0"
+          >
+            <Video className="w-3.5 h-3.5" />
+            <span>{requestingMedia ? 'በመፍቀድ ላይ...' : 'ካሜራና ማይክ ፍቀድ / ክፈት'}</span>
+          </button>
         </div>
       )}
 
@@ -1244,11 +1399,22 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 />
 
                 {!isVideoOn && !isScreenSharing && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-900 text-stone-300 p-4 text-center">
-                    <div className="w-16 h-16 rounded-full bg-stone-800 border-2 border-amber-600/50 flex items-center justify-center text-xl font-extrabold text-amber-200 mb-2">
+                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-900 text-stone-200 p-4 text-center space-y-3">
+                    <div className="w-16 h-16 rounded-full bg-stone-800 border-2 border-amber-600/50 flex items-center justify-center text-xl font-extrabold text-amber-200">
                       {(user.baptismalName || user.fullName || 'እ').charAt(0)}
                     </div>
-                    <p className="text-sm text-stone-200 font-bold">{user.baptismalName} (ካሜራ ዝግ ነው)</p>
+                    <p className="text-sm text-stone-100 font-extrabold">
+                      {user.baptismalName || user.fullName} (ካሜራ ዝግ ነው)
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleToggleVideo}
+                      disabled={requestingMedia}
+                      className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 border border-emerald-400 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shadow-lg transition"
+                    >
+                      <Video className="w-4 h-4" />
+                      <span>{requestingMedia ? 'በመክፈት ላይ...' : 'ካሜራ ክፈት / ፍቀድ'}</span>
+                    </button>
                   </div>
                 )}
 

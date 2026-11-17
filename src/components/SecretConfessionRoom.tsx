@@ -33,6 +33,8 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const [remoteUserName, setRemoteUserName] = useState<string>('');
   const [iceState, setIceState] = useState<string>('waiting');
   const [isVideoFullscreen, setIsVideoFullscreen] = useState(false);
+  const [mediaPermissionMsg, setMediaPermissionMsg] = useState<string | null>(null);
+  const [requestingMedia, setRequestingMedia] = useState(false);
 
   // Confession Ritual Steps (1: ጸሎት, 2: መናዘዝ, 3: ቀኖና, 4: ፍትሐት)
   const [activeStep, setActiveStep] = useState<1 | 2 | 3 | 4>(1);
@@ -167,37 +169,30 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       const rtcConfig = await fetchWebRTCConfig();
 
       let stream: MediaStream | null = null;
-      const hdAudio: MediaTrackConstraints = {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        sampleRate: 48000,
-        channelCount: 1,
-      };
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: 'user',
-            width: { ideal: 1920, min: 640 },
-            height: { ideal: 1080, min: 480 },
-            frameRate: { ideal: 30 },
+      if (navigator.mediaDevices?.getUserMedia) {
+        const hdAudio: MediaTrackConstraints = {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 48000,
+          channelCount: 1,
+        };
+        const candidates: MediaStreamConstraints[] = [
+          {
+            video: { facingMode: 'user', width: { ideal: 1920, min: 640 }, height: { ideal: 1080, min: 480 }, frameRate: { ideal: 30 } },
+            audio: hdAudio,
           },
-          audio: hdAudio,
-        });
-      } catch {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
-            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          });
-        } catch {
+          { video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } },
+          { video: { facingMode: 'user' }, audio: true },
+          { video: true, audio: true },
+          { video: true },
+          { audio: true },
+        ];
+        for (const c of candidates) {
           try {
-            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            setIsVideoOn(false);
-          } catch {
-            setIsVideoOn(false);
-            setIsMicOn(false);
-          }
+            stream = await navigator.mediaDevices.getUserMedia(c);
+            break;
+          } catch {}
         }
       }
 
@@ -208,36 +203,47 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
 
       if (stream) {
         streamRef.current = stream;
+        const hasVideo = stream.getVideoTracks().length > 0;
+        const hasAudio = stream.getAudioTracks().length > 0;
+        setIsVideoOn(hasVideo);
+        setIsMicOn(hasAudio);
+        setMediaPermissionMsg(hasVideo ? null : 'ካሜራው አልተፈቀደም፤ ከታች «ካሜራ ፍቀድ» የሚለውን ይንኩ።');
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = stream;
           localVideoRef.current.play().catch(() => {});
         }
 
-        try {
-          const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-          const ctx = new AudioCtx();
-          audioContextRef.current = ctx;
-          const source = ctx.createMediaStreamSource(stream);
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 64;
-          analyserRef.current = analyser;
-          source.connect(analyser);
+        if (hasAudio) {
+          try {
+            const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+            const ctx = new AudioCtx();
+            audioContextRef.current = ctx;
+            const source = ctx.createMediaStreamSource(stream);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 64;
+            analyserRef.current = analyser;
+            source.connect(analyser);
 
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-          const updateVolume = () => {
-            if (isCancelled) return;
-            if (analyserRef.current && isMicOnRef.current) {
-              analyserRef.current.getByteFrequencyData(dataArray);
-              let sum = 0;
-              for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-              setMicVolumeLevel(Math.min(100, Math.round((sum / dataArray.length / 128) * 100)));
-            } else {
-              setMicVolumeLevel(0);
-            }
-            animationFrameRef.current = requestAnimationFrame(updateVolume);
-          };
-          updateVolume();
-        } catch {}
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            const updateVolume = () => {
+              if (isCancelled) return;
+              if (analyserRef.current && isMicOnRef.current) {
+                analyserRef.current.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                setMicVolumeLevel(Math.min(100, Math.round((sum / dataArray.length / 128) * 100)));
+              } else {
+                setMicVolumeLevel(0);
+              }
+              animationFrameRef.current = requestAnimationFrame(updateVolume);
+            };
+            updateVolume();
+          } catch {}
+        }
+      } else {
+        setIsVideoOn(false);
+        setIsMicOn(false);
+        setMediaPermissionMsg('የቪዲዮ ካሜራ ፍቃድ አልተሰጠም፤ «ካሜራና ማይክ ፍቀድ» የሚለውን ይጫኑ።');
       }
 
       const ws = new WebSocket(getRealtimeWsUrl());
@@ -356,26 +362,104 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     };
   }, [isAuthenticated, roomId, user.id, user.fullName, user.baptismalName, user.role]);
 
-  // Toggle Video Track
-  const handleToggleVideo = () => {
-    const newState = !isVideoOn;
-    setIsVideoOn(newState);
-    if (streamRef.current) {
-      streamRef.current.getVideoTracks().forEach((track) => {
-        track.enabled = newState;
-      });
+  const handleRequestSecretMedia = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMediaPermissionMsg('ካሜራ ለመክፈት HTTPS ደህንነቱ የተጠበቀ ግንኙነት ያስፈልጋል።');
+      return;
+    }
+    setRequestingMedia(true);
+    try {
+      const candidates: MediaStreamConstraints[] = [
+        { video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true },
+        { video: { facingMode }, audio: true },
+        { video: true, audio: true },
+        { video: true },
+      ];
+      let stream: MediaStream | null = null;
+      let lastErr: any = null;
+      for (const c of candidates) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(c);
+          break;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      if (!stream) {
+        if (lastErr?.name === 'NotAllowedError' || lastErr?.name === 'PermissionDeniedError') {
+          setMediaPermissionMsg('የብራውዘር ካሜራ ፍቃድ ተከልክሏል። ከላይ 🔒 (Settings) ላይ Camera → Allow ያድርጉ።');
+        } else {
+          setMediaPermissionMsg('ካሜራ መክፈት አልተቻለም፤ ካሜራው በሌላ መተግበሪያ ክፍት አለመሆኑን ያረጋግጡ።');
+        }
+        return;
+      }
+
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+        localVideoRef.current.play().catch(() => {});
+      }
+      setIsVideoOn(stream.getVideoTracks().length > 0);
+      setIsMicOn(stream.getAudioTracks().length > 0);
+      setMediaPermissionMsg(null);
+
+      if (pcRef.current) {
+        for (const track of stream.getTracks()) {
+          const sender = pcRef.current.getSenders().find((s) => s.track?.kind === track.kind);
+          if (sender) {
+            await sender.replaceTrack(track).catch(() => {});
+          } else {
+            pcRef.current.addTrack(track, stream);
+          }
+        }
+        try {
+          const offer = await pcRef.current.createOffer();
+          await pcRef.current.setLocalDescription(offer);
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({
+                type: 'webrtc-signal',
+                roomId,
+                targetPeerId: remotePeerIdRef.current,
+                signal: { sdp: offer },
+              })
+            );
+          }
+        } catch {}
+      }
+    } finally {
+      setRequestingMedia(false);
     }
   };
 
+  // Toggle Video Track (auto-requests camera permission if none active)
+  const handleToggleVideo = async () => {
+    const tracks = streamRef.current?.getVideoTracks() || [];
+    if (tracks.length === 0) {
+      await handleRequestSecretMedia();
+      return;
+    }
+    const newState = !isVideoOn;
+    setIsVideoOn(newState);
+    tracks.forEach((track) => {
+      track.enabled = newState;
+    });
+  };
+
   // Toggle Audio Track
-  const handleToggleMic = () => {
+  const handleToggleMic = async () => {
+    const tracks = streamRef.current?.getAudioTracks() || [];
+    if (tracks.length === 0) {
+      await handleRequestSecretMedia();
+      return;
+    }
     const newState = !isMicOn;
     setIsMicOn(newState);
-    if (streamRef.current) {
-      streamRef.current.getAudioTracks().forEach((track) => {
-        track.enabled = newState;
-      });
-    }
+    tracks.forEach((track) => {
+      track.enabled = newState;
+    });
     if (!newState) setMicVolumeLevel(0);
   };
 
@@ -673,9 +757,16 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                   className="w-full h-full object-cover mirror"
                 />
               ) : (
-                <div className="w-full h-full flex flex-col items-center justify-center bg-stone-950 text-stone-400 p-2 text-center">
-                  <VideoOff className="w-6 h-6 text-stone-500 mb-1" />
-                  <span className="text-[10px]">ካሜራ ዝግ ነው</span>
+                <div className="w-full h-full flex flex-col items-center justify-center bg-stone-950 text-stone-200 p-2 text-center gap-1.5">
+                  <VideoOff className="w-5 h-5 text-red-400" />
+                  <button
+                    type="button"
+                    onClick={handleToggleVideo}
+                    disabled={requestingMedia}
+                    className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-extrabold transition"
+                  >
+                    {requestingMedia ? 'በመክፈት ላይ...' : 'ካሜራ ፍቀድ'}
+                  </button>
                 </div>
               )}
               
@@ -688,6 +779,20 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                 )}
               </div>
             </div>
+
+            {mediaPermissionMsg && (
+              <div className="absolute top-14 left-3 right-3 z-20 p-2.5 rounded-xl bg-amber-950/90 border border-amber-500/70 text-xs text-amber-100 font-bold flex flex-wrap items-center justify-between gap-2 shadow-xl">
+                <span>{mediaPermissionMsg}</span>
+                <button
+                  type="button"
+                  onClick={handleRequestSecretMedia}
+                  disabled={requestingMedia}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold"
+                >
+                  {requestingMedia ? 'በመክፈት ላይ...' : 'ካሜራና ማይክ ፍቀድ'}
+                </button>
+              </div>
+            )}
 
             {/* Video & Audio Controls Bar */}
             <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between p-3 rounded-xl bg-stone-950/85 backdrop-blur-md border border-amber-900/40 z-10">

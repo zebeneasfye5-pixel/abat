@@ -31,6 +31,7 @@ import {
 import { UserProfile } from '../types';
 import { fetchLiveKitToken, fetchWebRTCConfig, getRealtimeWsUrl } from '../services/api';
 import { toggleSpiritualHymn, stopSpiritualHymn, playChurchBell } from '../utils/audio';
+import { WsMediaAudioPlayer, WsMediaSender } from '../utils/wsMediaRelay';
 
 interface AssemblyHallProps {
   user: UserProfile;
@@ -51,6 +52,7 @@ interface RemotePeer {
   baptismalName: string;
   role: string;
   stream: MediaStream | null;
+  relayFrame?: string | null;
   connectionState: string;
   isMicOn: boolean;
   isVideoOn: boolean;
@@ -105,24 +107,51 @@ const RemoteVideoTile: React.FC<{
   isExpanded: boolean;
   onPin: (peerId: string) => void;
   onToggleExpand: (peerId: string) => void;
+  onUnlockAudio?: () => void;
   tallStage?: boolean;
-}> = ({ peer, isGlobalAudioMuted, isPinned, isExpanded, onPin, onToggleExpand, tallStage }) => {
+}> = ({ peer, isGlobalAudioMuted, isPinned, isExpanded, onPin, onToggleExpand, onUnlockAudio, tallStage }) => {
   const tileRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const [needsPlayTap, setNeedsPlayTap] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [needsAudioTap, setNeedsAudioTap] = useState(false);
+
+  const isWebRtcConnected = peer.connectionState === 'connected' || peer.connectionState === 'completed';
+  const hasWebRtcVideo = Boolean(
+    peer.stream &&
+      peer.stream.getVideoTracks().some((t) => t.readyState === 'live') &&
+      peer.isVideoOn !== false
+  );
+  const hasRelayVideo = Boolean(!hasWebRtcVideo && peer.relayFrame && peer.isVideoOn !== false);
+  const showVisualFeed = hasWebRtcVideo || hasRelayVideo;
 
   useEffect(() => {
     const videoEl = videoRef.current;
-    if (videoEl && peer.stream) {
-      if (videoEl.srcObject !== peer.stream) {
-        videoEl.srcObject = peer.stream;
+    const audioEl = audioRef.current;
+    if (peer.stream) {
+      if (videoEl) {
+        if (videoEl.srcObject !== peer.stream) {
+          videoEl.srcObject = peer.stream;
+        }
+        // Keep video element muted so mobile Chrome/Safari NEVER block video playback; audio plays via dedicated <audio>
+        videoEl.muted = true;
+        videoEl.play().catch(() => {});
       }
-      videoEl
-        .play()
-        .then(() => setNeedsPlayTap(false))
-        .catch(() => setNeedsPlayTap(true));
+      if (audioEl) {
+        if (audioEl.srcObject !== peer.stream) {
+          audioEl.srcObject = peer.stream;
+        }
+        audioEl.muted = isGlobalAudioMuted;
+        if (!isGlobalAudioMuted && peer.stream.getAudioTracks().length > 0) {
+          audioEl
+            .play()
+            .then(() => setNeedsAudioTap(false))
+            .catch(() => setNeedsAudioTap(true));
+        } else {
+          setNeedsAudioTap(false);
+        }
+      }
     }
-  }, [peer.stream, peer.isVideoOn]);
+  }, [peer.stream, peer.isVideoOn, isGlobalAudioMuted]);
 
   const handleTileFullscreen = async () => {
     if (document.fullscreenElement) {
@@ -142,7 +171,7 @@ const RemoteVideoTile: React.FC<{
     }
   };
 
-  const isConnected = peer.connectionState === 'connected' || peer.connectionState === 'completed';
+  const isConnected = isWebRtcConnected || Boolean(peer.relayFrame);
 
   return (
     <div
@@ -161,37 +190,54 @@ const RemoteVideoTile: React.FC<{
           : 'border-stone-800'
       }`}
     >
+      {/* Dedicated audio element so audio plays even when camera is off or hidden on mobile browsers */}
+      <audio ref={audioRef} autoPlay playsInline muted={isGlobalAudioMuted} />
+
+      {/* Live WebRTC Video (never display:none, uses opacity-0 so stream never freezes) */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
-        muted={isGlobalAudioMuted}
-        className={`absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.06] ${
-          peer.stream && peer.isVideoOn ? 'block' : 'hidden'
+        muted
+        className={`absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.06] transition-opacity ${
+          hasWebRtcVideo ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       />
 
-      {(!peer.stream || !peer.isVideoOn) && (
+      {/* Automatic 4G/CGNAT WebSocket Relay Video Fallback */}
+      {hasRelayVideo && peer.relayFrame && (
+        <img
+          src={peer.relayFrame}
+          alt={peer.baptismalName || peer.userName}
+          className="absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.06]"
+        />
+      )}
+
+      {!showVisualFeed && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-900/95 text-stone-300 p-4 text-center">
           <div className="w-16 h-16 rounded-full bg-amber-950 border-2 border-amber-500/60 flex items-center justify-center text-xl font-extrabold text-amber-200 mb-2">
             {(peer.baptismalName || peer.userName || 'ተ').charAt(0)}
           </div>
           <p className="text-sm font-extrabold text-amber-200">{peer.baptismalName || peer.userName}</p>
           <p className="text-xs text-stone-300 mt-1">
-            {!peer.stream ? 'ከፍተኛ ጥራት HD ቪዲዮ በመገናኘት ላይ...' : 'ካሜራ ዘግተዋል'}
+            {!peer.stream && !peer.relayFrame
+              ? 'ቪዲዮና ድምፅ በመገናኘት ላይ...'
+              : 'ካሜራ ዘግተዋል (ድምፅ ክፍት ነው)'}
           </p>
         </div>
       )}
 
-      {needsPlayTap && peer.stream && (
+      {needsAudioTap && peer.stream && !isGlobalAudioMuted && (
         <button
           onClick={() => {
-            videoRef.current?.play().then(() => setNeedsPlayTap(false)).catch(() => {});
+            onUnlockAudio?.();
+            videoRef.current?.play().catch(() => {});
+            audioRef.current?.play().then(() => setNeedsAudioTap(false)).catch(() => {});
           }}
-          className="absolute inset-0 z-20 bg-black/75 flex flex-col items-center justify-center text-amber-200 text-xs font-extrabold gap-2"
+          className="absolute top-14 left-1/2 -translate-x-1/2 z-20 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 border border-emerald-300 shadow-2xl flex items-center text-white text-xs font-extrabold gap-2 animate-pulse"
         >
-          <Volume2 className="w-8 h-8 text-amber-400 animate-pulse" />
-          <span>ድምፅና ምስል ለማብራት ይንኩ (Tap to Play)</span>
+          <Volume2 className="w-4 h-4" />
+          <span>ድምፅ ለመስማት ይንኩ (Unmute)</span>
         </button>
       )}
 
@@ -261,7 +307,7 @@ const RemoteVideoTile: React.FC<{
               : 'bg-amber-950/90 text-amber-300 border border-amber-700/60'
           }`}
         >
-          {isConnected ? 'ቀጥታ Full HD' : peer.connectionState}
+          {isWebRtcConnected ? 'ቀጥታ Full HD' : peer.relayFrame ? 'ቀጥታ 4G Relay' : peer.connectionState}
         </span>
       </div>
     </div>
@@ -295,6 +341,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const [mediaWarning, setMediaWarning] = useState<string | null>(null);
   const [requestingMedia, setRequestingMedia] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
+  const [wsDiagnostic, setWsDiagnostic] = useState<string | null>(null);
+  const [wsRelayActive, setWsRelayActive] = useState(false);
+  const [audioBlocked, setAudioBlocked] = useState(false);
+  const [wsReconnectNonce, setWsReconnectNonce] = useState(0);
 
   // Real Connected Remote Peers
   const [remotePeers, setRemotePeers] = useState<RemotePeer[]>([]);
@@ -306,8 +356,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const [newChatText, setNewChatText] = useState('');
   const [showReactionsMenu, setShowReactionsMenu] = useState(false);
 
-  // Refs
-  const selfPeerIdRef = useRef<string>(user.id || `peer-${Math.random().toString(36).slice(2, 9)}`);
+  // Refs — unique per browser tab/connection so two devices on same account NEVER collide!
+  const selfPeerIdRef = useRef<string>(
+    `${user.id || 'peer'}-${Math.random().toString(36).slice(2, 7)}`
+  );
   const selfTileRef = useRef<HTMLDivElement | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -318,7 +370,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const wsRef = useRef<WebSocket | null>(null);
   const liveKitRoomRef = useRef<any>(null);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const remoteStreamsMapRef = useRef<Map<string, MediaStream>>(new Map());
   const pendingIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  const wsAudioPlayerRef = useRef<WsMediaAudioPlayer | null>(null);
+  const wsMediaSenderRef = useRef<WsMediaSender | null>(null);
   const rtcConfigRef = useRef<RTCConfiguration>({
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -328,11 +383,24 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   });
   const isMicOnRef = useRef(isMicOn);
   isMicOnRef.current = isMicOn;
+  const isVideoOnRef = useRef(isVideoOn || isScreenSharing);
+  isVideoOnRef.current = isVideoOn || isScreenSharing;
+  const isGlobalAudioMutedRef = useRef(isGlobalAudioMuted);
+  isGlobalAudioMutedRef.current = isGlobalAudioMuted;
+  const remotePeersRef = useRef<RemotePeer[]>(remotePeers);
+  remotePeersRef.current = remotePeers;
   const videoQualityRef = useRef<VideoQualityPreset>(videoQuality);
   videoQualityRef.current = videoQuality;
 
   const meetingContainerRef = useRef<HTMLDivElement | null>(null);
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
+
+  const unlockRemoteAudio = useCallback(() => {
+    wsAudioPlayerRef.current?.unlock().then((ok) => {
+      if (ok) setAudioBlocked(false);
+    });
+    wsMediaSenderRef.current?.ensureAudioCapture();
+  }, []);
 
   const triggerReaction = useCallback((emoji: string, sender: string) => {
     const id = Date.now() + Math.random();
@@ -345,14 +413,14 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
   const createPeerConnection = useCallback((targetPeerId: string) => {
     const existing = peerConnectionsRef.current.get(targetPeerId);
-    if (existing) {
+    if (existing && existing.signalingState !== 'closed') {
       return existing;
     }
 
     const pc = new RTCPeerConnection(rtcConfigRef.current);
     peerConnectionsRef.current.set(targetPeerId, pc);
 
-    const localStream = localStreamRef.current;
+    const localStream = screenStreamRef.current || localStreamRef.current;
     if (localStream && localStream.getTracks().length > 0) {
       localStream.getTracks().forEach((track) => {
         pc.addTrack(track, localStream);
@@ -382,24 +450,78 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       }
     };
 
-    pc.ontrack = (event) => {
-      const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
-      setRemotePeers((prev) =>
-        prev.map((p) => (p.peerId === targetPeerId ? { ...p, stream } : p))
-      );
+    const syncStreamState = (track?: MediaStreamTrack) => {
+      let peerStream = remoteStreamsMapRef.current.get(targetPeerId);
+      if (!peerStream) {
+        peerStream = new MediaStream();
+        remoteStreamsMapRef.current.set(targetPeerId, peerStream);
+      }
+      if (track) {
+        peerStream.getTracks().forEach((t) => {
+          if (t.kind === track.kind && t.id !== track.id) {
+            peerStream!.removeTrack(t);
+          }
+        });
+        if (!peerStream.getTracks().some((t) => t.id === track.id)) {
+          peerStream.addTrack(track);
+        }
+      }
+      const wrapped = new MediaStream(peerStream.getTracks());
+      const hasLiveVid = wrapped.getVideoTracks().some((t) => t.readyState === 'live' && !t.muted);
+      setRemotePeers((prev) => {
+        const exists = prev.some((p) => p.peerId === targetPeerId);
+        if (!exists) {
+          return [
+            ...prev,
+            {
+              peerId: targetPeerId,
+              userName: 'ተሳታፊ',
+              baptismalName: 'ተሳታፊ',
+              role: 'child',
+              stream: wrapped,
+              connectionState: pc.iceConnectionState || 'connecting',
+              isMicOn: true,
+              isVideoOn: hasLiveVid || wrapped.getVideoTracks().length > 0,
+              isHandRaised: false,
+              isScreenSharing: false,
+              onStage: true,
+            },
+          ];
+        }
+        return prev.map((p) =>
+          p.peerId === targetPeerId
+            ? {
+                ...p,
+                stream: wrapped,
+                isVideoOn: p.isVideoOn || hasLiveVid,
+              }
+            : p
+        );
+      });
     };
 
-    pc.oniceconnectionstatechange = () => {
-      const state = pc.iceConnectionState;
+    pc.ontrack = (event) => {
+      syncStreamState(event.track);
+      event.track.onunmute = () => syncStreamState(event.track);
+    };
+
+    const handleConnState = () => {
+      const state = pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed'
+        ? pc.iceConnectionState
+        : pc.connectionState || pc.iceConnectionState;
       setRemotePeers((prev) =>
         prev.map((p) => (p.peerId === targetPeerId ? { ...p, connectionState: state } : p))
       );
-      if (state === 'failed') {
+      if (pc.iceConnectionState === 'failed' || pc.connectionState === 'failed') {
         try {
           pc.restartIce();
         } catch {}
+        setWsRelayActive(true);
       }
     };
+
+    pc.oniceconnectionstatechange = handleConnState;
+    pc.onconnectionstatechange = handleConnState;
 
     return pc;
   }, []);
@@ -616,92 +738,197 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         }
       }
 
-      // 3. Connect High-Scale Anti-Congestion WebSocket Signaling (Chat, Stage Control, Reactions, & Relay Mesh)
-      const ws = new WebSocket(getRealtimeWsUrl());
-      wsRef.current = ws;
+      // 3. Connect High-Scale Anti-Congestion WebSocket Signaling with Auto-Reconnect & 15s Keepalive
+      if (!wsAudioPlayerRef.current) {
+        wsAudioPlayerRef.current = new WsMediaAudioPlayer((blocked) => setAudioBlocked(blocked));
+      }
 
-      ws.onopen = () => {
-        if (isCancelled) {
-          ws.close();
-          return;
-        }
-        setWsConnected(true);
-        ws.send(
-          JSON.stringify({
-            type: 'join-room',
-            roomId: ROOM_ID,
-            userId: selfPeerIdRef.current,
-            userName: user.fullName,
-            baptismalName: user.baptismalName || user.fullName,
-            role: user.role,
-            isMicOn: isMicOnRef.current && Boolean(acquiredStream?.getAudioTracks().length),
-            isVideoOn: Boolean(acquiredStream?.getVideoTracks().length),
-          })
-        );
-      };
+      let reconnectTimer: number | null = null;
+      let keepaliveTimer: number | null = null;
+      let diagTimer: number | null = null;
 
-      ws.onclose = () => {
-        setWsConnected(false);
-      };
+      const connectWebSocket = () => {
+        if (isCancelled) return;
+        const ws = new WebSocket(getRealtimeWsUrl());
+        wsRef.current = ws;
 
-      ws.onmessage = async (event) => {
-        try {
-          const data = JSON.parse(event.data);
-
-          if (data.type === 'room-state') {
-            if (Array.isArray(data.chatHistory) && data.chatHistory.length > 0) {
-              setChatMessages(data.chatHistory);
-            }
-            if (typeof data.selfOnStage === 'boolean') {
-              setSelfOnStage(data.selfOnStage);
-            }
-            if (data.broadcastMode && !liveKitRoomRef.current) {
-              setBroadcastMode(data.broadcastMode);
-            }
-            if (typeof data.clientCount === 'number') {
-              setServerClientCount(data.clientCount);
-            }
-
-            if (liveKitRoomRef.current) return;
-
-            const existing: any[] = data.existingPeers || [];
-            setRemotePeers(
-              existing.map((p) => ({
-                peerId: p.peerId,
-                userName: p.userName,
-                baptismalName: p.baptismalName || p.userName,
-                role: p.role,
-                stream: null,
-                connectionState: 'connecting',
-                isMicOn: Boolean(p.isMicOn),
-                isVideoOn: Boolean(p.isVideoOn),
-                isHandRaised: Boolean(p.isHandRaised),
-                isScreenSharing: Boolean(p.isScreenSharing),
-                onStage: p.onStage !== false,
-              }))
+        if (diagTimer) clearTimeout(diagTimer);
+        diagTimer = window.setTimeout(() => {
+          if (!isCancelled && ws.readyState !== WebSocket.OPEN) {
+            const onVercelNoBackend =
+              typeof window !== 'undefined' &&
+              window.location.hostname.includes('vercel.app') &&
+              !(import.meta.env.VITE_API_URL || '').trim();
+            setWsDiagnostic(
+              onVercelNoBackend
+                ? 'ይህ የVercel ገፅ ከቪዲዮ ሰርቨር ጋር አልተገናኘም! በቀጥታ የRender ሊንክዎን (.onrender.com) ይክፈቱ።'
+                : 'ከቪዲዮ ሰርቨሩ ጋር ግንኙነት እየተሞከረ ነው... የኢንተርኔት ግንኙነትዎን ያረጋግጡ።'
             );
+          }
+        }, 4000);
 
-            for (const p of existing) {
-              const pc = createPeerConnection(p.peerId);
-              const offer = await pc.createOffer();
-              await pc.setLocalDescription(offer);
-              ws.send(
-                JSON.stringify({
-                  type: 'webrtc-signal',
-                  roomId: ROOM_ID,
-                  targetPeerId: p.peerId,
-                  signal: { sdp: offer },
-                })
-              );
+        ws.onopen = () => {
+          if (isCancelled) {
+            ws.close();
+            return;
+          }
+          if (diagTimer) clearTimeout(diagTimer);
+          setWsConnected(true);
+          setWsDiagnostic(null);
+
+          const activeStream = screenStreamRef.current || localStreamRef.current;
+          ws.send(
+            JSON.stringify({
+              type: 'join-room',
+              roomId: ROOM_ID,
+              userId: selfPeerIdRef.current,
+              userName: user.fullName,
+              baptismalName: user.baptismalName || user.fullName,
+              role: user.role,
+              isMicOn: isMicOnRef.current && Boolean(activeStream?.getAudioTracks().length),
+              isVideoOn: Boolean(activeStream?.getVideoTracks().length),
+            })
+          );
+
+          if (keepaliveTimer) clearInterval(keepaliveTimer);
+          keepaliveTimer = window.setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'ws-ping' }));
             }
-          } else if (data.type === 'peer-joined' && data.peer) {
-            if (typeof data.clientCount === 'number') setServerClientCount(data.clientCount);
-            if (data.broadcastMode && !liveKitRoomRef.current) setBroadcastMode(data.broadcastMode);
-            if (liveKitRoomRef.current) return;
+          }, 15000);
+        };
 
-            const p = data.peer;
-            // In Mass Broadcast mode, only connect video feeds for Stage speakers (prevents N x N congestion)
-            if (data.broadcastMode === 'stage-broadcast' && !p.onStage && p.role !== 'priest') {
+        ws.onclose = () => {
+          setWsConnected(false);
+          if (keepaliveTimer) clearInterval(keepaliveTimer);
+          if (!isCancelled) {
+            reconnectTimer = window.setTimeout(connectWebSocket, 2500);
+          }
+        };
+
+        ws.onerror = () => {
+          // onclose will trigger auto-reconnect
+        };
+
+        ws.onmessage = async (event) => {
+          try {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'ws-pong') {
+              return;
+            } else if (data.type === 'ws-video-frame') {
+              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              setRemotePeers((prev) =>
+                prev.map((p) =>
+                  p.peerId === data.senderPeerId
+                    ? { ...p, relayFrame: data.frame, isVideoOn: data.isVideoOn !== false }
+                    : p
+                )
+              );
+              return;
+            } else if (data.type === 'ws-audio-chunk') {
+              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              const senderPeer = remotePeersRef.current.find((p) => p.peerId === data.senderPeerId);
+              const hasWebRtcAudio =
+                senderPeer &&
+                (senderPeer.connectionState === 'connected' || senderPeer.connectionState === 'completed') &&
+                Boolean(senderPeer.stream?.getAudioTracks().some((t) => t.readyState === 'live'));
+              if (!hasWebRtcAudio) {
+                wsAudioPlayerRef.current?.playChunk(
+                  data.senderPeerId,
+                  data.pcm16,
+                  data.sr || 16000,
+                  isGlobalAudioMutedRef.current
+                );
+              }
+              return;
+            }
+
+            if (data.type === 'room-state') {
+              if (Array.isArray(data.chatHistory) && data.chatHistory.length > 0) {
+                setChatMessages(data.chatHistory);
+              }
+              if (typeof data.selfOnStage === 'boolean') {
+                setSelfOnStage(data.selfOnStage);
+              }
+              if (data.broadcastMode && !liveKitRoomRef.current) {
+                setBroadcastMode(data.broadcastMode);
+              }
+              if (typeof data.clientCount === 'number') {
+                setServerClientCount(data.clientCount);
+              }
+
+              if (liveKitRoomRef.current) return;
+
+              // Close any stale peer connections before creating fresh ones for reconnected room-state
+              peerConnectionsRef.current.forEach((pc) => pc.close());
+              peerConnectionsRef.current.clear();
+              remoteStreamsMapRef.current.clear();
+              pendingIceRef.current.clear();
+
+              const existing: any[] = data.existingPeers || [];
+              setRemotePeers(
+                existing.map((p) => ({
+                  peerId: p.peerId,
+                  userName: p.userName,
+                  baptismalName: p.baptismalName || p.userName,
+                  role: p.role,
+                  stream: null,
+                  relayFrame: null,
+                  connectionState: 'connecting',
+                  isMicOn: Boolean(p.isMicOn),
+                  isVideoOn: Boolean(p.isVideoOn),
+                  isHandRaised: Boolean(p.isHandRaised),
+                  isScreenSharing: Boolean(p.isScreenSharing),
+                  onStage: p.onStage !== false,
+                }))
+              );
+
+              for (const p of existing) {
+                const pc = createPeerConnection(p.peerId);
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                ws.send(
+                  JSON.stringify({
+                    type: 'webrtc-signal',
+                    roomId: ROOM_ID,
+                    targetPeerId: p.peerId,
+                    signal: { sdp: offer },
+                  })
+                );
+              }
+            } else if (data.type === 'peer-joined' && data.peer) {
+              if (typeof data.clientCount === 'number') setServerClientCount(data.clientCount);
+              if (data.broadcastMode && !liveKitRoomRef.current) setBroadcastMode(data.broadcastMode);
+              if (liveKitRoomRef.current) return;
+
+              const p = data.peer;
+              if (p.peerId === selfPeerIdRef.current) return;
+
+              if (data.broadcastMode === 'stage-broadcast' && !p.onStage && p.role !== 'priest') {
+                setRemotePeers((prev) => {
+                  if (prev.some((x) => x.peerId === p.peerId)) return prev;
+                  return [
+                    ...prev,
+                    {
+                      peerId: p.peerId,
+                      userName: p.userName,
+                      baptismalName: p.baptismalName || p.userName,
+                      role: p.role,
+                      stream: null,
+                      relayFrame: null,
+                      connectionState: 'listener',
+                      isMicOn: false,
+                      isVideoOn: false,
+                      isHandRaised: false,
+                      isScreenSharing: false,
+                      onStage: false,
+                    },
+                  ];
+                });
+                return;
+              }
+
               setRemotePeers((prev) => {
                 if (prev.some((x) => x.peerId === p.peerId)) return prev;
                 return [
@@ -712,134 +939,165 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     baptismalName: p.baptismalName || p.userName,
                     role: p.role,
                     stream: null,
-                    connectionState: 'listener',
-                    isMicOn: false,
-                    isVideoOn: false,
-                    isHandRaised: false,
-                    isScreenSharing: false,
-                    onStage: false,
+                    relayFrame: null,
+                    connectionState: 'connecting',
+                    isMicOn: Boolean(p.isMicOn),
+                    isVideoOn: Boolean(p.isVideoOn),
+                    isHandRaised: Boolean(p.isHandRaised),
+                    isScreenSharing: Boolean(p.isScreenSharing),
+                    onStage: p.onStage !== false,
                   },
                 ];
               });
-              return;
-            }
+            } else if (data.type === 'webrtc-signal' && data.signal && data.senderPeerId) {
+              if (liveKitRoomRef.current) return;
+              const senderId = data.senderPeerId;
+              if (senderId === selfPeerIdRef.current) return;
 
-            setRemotePeers((prev) => {
-              if (prev.some((x) => x.peerId === p.peerId)) return prev;
-              return [
-                ...prev,
-                {
-                  peerId: p.peerId,
-                  userName: p.userName,
-                  baptismalName: p.baptismalName || p.userName,
-                  role: p.role,
-                  stream: null,
-                  connectionState: 'connecting',
-                  isMicOn: Boolean(p.isMicOn),
-                  isVideoOn: Boolean(p.isVideoOn),
-                  isHandRaised: Boolean(p.isHandRaised),
-                  isScreenSharing: Boolean(p.isScreenSharing),
-                  onStage: p.onStage !== false,
-                },
-              ];
-            });
-          } else if (data.type === 'webrtc-signal' && data.signal && data.senderPeerId) {
-            if (liveKitRoomRef.current) return;
-            const senderId = data.senderPeerId;
-            const pc = createPeerConnection(senderId);
-            const { signal } = data;
+              // Guarantee sender tile exists even if signal arrived ahead of peer-joined
+              setRemotePeers((prev) => {
+                if (prev.some((x) => x.peerId === senderId)) return prev;
+                return [
+                  ...prev,
+                  {
+                    peerId: senderId,
+                    userName: data.senderName || 'ተሳታፊ',
+                    baptismalName: data.senderName || 'ተሳታፊ',
+                    role: data.senderRole || 'child',
+                    stream: null,
+                    relayFrame: null,
+                    connectionState: 'connecting',
+                    isMicOn: true,
+                    isVideoOn: true,
+                    isHandRaised: false,
+                    isScreenSharing: false,
+                    onStage: data.senderOnStage !== false,
+                  },
+                ];
+              });
 
-            if (signal.sdp) {
-              await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-              await flushIceCandidates(senderId, pc);
-              if (signal.sdp.type === 'offer') {
-                const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
-                ws.send(
-                  JSON.stringify({
-                    type: 'webrtc-signal',
-                    roomId: ROOM_ID,
-                    targetPeerId: senderId,
-                    signal: { sdp: answer },
-                  })
+              const pc = createPeerConnection(senderId);
+              const { signal } = data;
+
+              if (signal.sdp) {
+                const isOffer = signal.sdp.type === 'offer';
+                const polite = selfPeerIdRef.current < senderId;
+                if (isOffer && pc.signalingState !== 'stable') {
+                  if (!polite) return;
+                  await Promise.all([
+                    pc.setLocalDescription({ type: 'rollback' }),
+                    pc.setRemoteDescription(new RTCSessionDescription(signal.sdp)),
+                  ]);
+                } else {
+                  await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+                }
+                await flushIceCandidates(senderId, pc);
+                if (isOffer) {
+                  const answer = await pc.createAnswer();
+                  await pc.setLocalDescription(answer);
+                  ws.send(
+                    JSON.stringify({
+                      type: 'webrtc-signal',
+                      roomId: ROOM_ID,
+                      targetPeerId: senderId,
+                      signal: { sdp: answer },
+                    })
+                  );
+                }
+              } else if (signal.candidate) {
+                if (pc.remoteDescription && pc.remoteDescription.type) {
+                  await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+                } else {
+                  const q = pendingIceRef.current.get(senderId) || [];
+                  q.push(signal.candidate);
+                  pendingIceRef.current.set(senderId, q);
+                }
+              }
+            } else if (data.type === 'peer-media-state') {
+              setRemotePeers((prev) =>
+                prev.map((p) =>
+                  p.peerId === data.peerId
+                    ? {
+                        ...p,
+                        isMicOn: data.isMicOn,
+                        isVideoOn: data.isVideoOn,
+                        isHandRaised: data.isHandRaised,
+                        isScreenSharing: data.isScreenSharing,
+                        onStage: data.onStage,
+                      }
+                    : p
+                )
+              );
+            } else if (data.type === 'stage-updated') {
+              if (data.peerId === selfPeerIdRef.current) {
+                setSelfOnStage(Boolean(data.onStage));
+                if (!data.onStage) {
+                  setIsMicOn(false);
+                  localStreamRef.current?.getAudioTracks().forEach((t) => {
+                    t.enabled = false;
+                  });
+                }
+              } else {
+                setRemotePeers((prev) =>
+                  prev.map((p) => (p.peerId === data.peerId ? { ...p, onStage: Boolean(data.onStage) } : p))
                 );
               }
-            } else if (signal.candidate) {
-              if (pc.remoteDescription && pc.remoteDescription.type) {
-                await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
-              } else {
-                const q = pendingIceRef.current.get(senderId) || [];
-                q.push(signal.candidate);
-                pendingIceRef.current.set(senderId, q);
+            } else if (data.type === 'peer-left') {
+              if (typeof data.clientCount === 'number') setServerClientCount(data.clientCount);
+              const pc = peerConnectionsRef.current.get(data.peerId);
+              if (pc) {
+                pc.close();
+                peerConnectionsRef.current.delete(data.peerId);
               }
+              remoteStreamsMapRef.current.delete(data.peerId);
+              pendingIceRef.current.delete(data.peerId);
+              setRemotePeers((prev) => prev.filter((p) => p.peerId !== data.peerId));
+            } else if (data.type === 'assembly-chat-message') {
+              setChatMessages((prev) => [
+                ...prev,
+                {
+                  id: data.id || Date.now().toString(),
+                  sender: data.sender,
+                  text: data.text,
+                  time: data.time,
+                  isPriest: data.isPriest,
+                },
+              ]);
+            } else if (data.type === 'assembly-reaction-broadcast') {
+              triggerReaction(data.emoji, data.sender);
+            } else if (data.type === 'force-mute') {
+              setIsMicOn(false);
+              localStreamRef.current?.getAudioTracks().forEach((t) => {
+                t.enabled = false;
+              });
             }
-          } else if (data.type === 'peer-media-state') {
-            setRemotePeers((prev) =>
-              prev.map((p) =>
-                p.peerId === data.peerId
-                  ? {
-                      ...p,
-                      isMicOn: data.isMicOn,
-                      isVideoOn: data.isVideoOn,
-                      isHandRaised: data.isHandRaised,
-                      isScreenSharing: data.isScreenSharing,
-                      onStage: data.onStage,
-                    }
-                  : p
-              )
-            );
-          } else if (data.type === 'stage-updated') {
-            if (data.peerId === selfPeerIdRef.current) {
-              setSelfOnStage(Boolean(data.onStage));
-              if (!data.onStage) {
-                setIsMicOn(false);
-                localStreamRef.current?.getAudioTracks().forEach((t) => {
-                  t.enabled = false;
-                });
-              }
-            } else {
-              setRemotePeers((prev) =>
-                prev.map((p) => (p.peerId === data.peerId ? { ...p, onStage: Boolean(data.onStage) } : p))
-              );
-            }
-          } else if (data.type === 'peer-left') {
-            if (typeof data.clientCount === 'number') setServerClientCount(data.clientCount);
-            const pc = peerConnectionsRef.current.get(data.peerId);
-            if (pc) {
-              pc.close();
-              peerConnectionsRef.current.delete(data.peerId);
-            }
-            pendingIceRef.current.delete(data.peerId);
-            setRemotePeers((prev) => prev.filter((p) => p.peerId !== data.peerId));
-          } else if (data.type === 'assembly-chat-message') {
-            setChatMessages((prev) => [
-              ...prev,
-              {
-                id: data.id || Date.now().toString(),
-                sender: data.sender,
-                text: data.text,
-                time: data.time,
-                isPriest: data.isPriest,
-              },
-            ]);
-          } else if (data.type === 'assembly-reaction-broadcast') {
-            triggerReaction(data.emoji, data.sender);
-          } else if (data.type === 'force-mute') {
-            setIsMicOn(false);
-            localStreamRef.current?.getAudioTracks().forEach((t) => {
-              t.enabled = false;
-            });
+          } catch (err) {
+            console.warn('WS message handle error:', err);
           }
-        } catch (err) {
-          console.warn('WS message handle error:', err);
-        }
+        };
+      };
+
+      connectWebSocket();
+
+      return () => {
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (keepaliveTimer) clearInterval(keepaliveTimer);
+        if (diagTimer) clearTimeout(diagTimer);
       };
     };
 
-    boot();
+    let cleanupWsTimers: (() => void) | undefined;
+    boot().then((fn) => {
+      if (typeof fn === 'function') cleanupWsTimers = fn;
+    });
 
     return () => {
       isCancelled = true;
+      cleanupWsTimers?.();
+      wsMediaSenderRef.current?.stop();
+      wsMediaSenderRef.current = null;
+      wsAudioPlayerRef.current?.dispose();
+      wsAudioPlayerRef.current = null;
       if (liveKitRoomRef.current) {
         try {
           liveKitRoomRef.current.disconnect();
@@ -852,6 +1110,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       }
       peerConnectionsRef.current.forEach((pc) => pc.close());
       peerConnectionsRef.current.clear();
+      remoteStreamsMapRef.current.clear();
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
@@ -862,7 +1121,62 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       }
       stopSpiritualHymn();
     };
-  }, [createPeerConnection, triggerReaction, user.id, user.fullName, user.baptismalName, user.role]);
+  }, [createPeerConnection, triggerReaction, user.id, user.fullName, user.baptismalName, user.role, wsReconnectNonce]);
+
+  // Automatic 4.5s CGNAT / Symmetric-4G Relay Detection
+  useEffect(() => {
+    const activeStagePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest');
+    if (activeStagePeers.length === 0 || liveKitRoomRef.current) {
+      setWsRelayActive(false);
+      return;
+    }
+
+    const anyFailed = activeStagePeers.some((p) => p.connectionState === 'failed');
+    if (anyFailed) {
+      setWsRelayActive(true);
+      return;
+    }
+
+    const allWebRtcConnected = activeStagePeers.every(
+      (p) => p.connectionState === 'connected' || p.connectionState === 'completed'
+    );
+    if (allWebRtcConnected) {
+      setWsRelayActive(false);
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setWsRelayActive(true);
+    }, 4500);
+    return () => clearTimeout(timer);
+  }, [remotePeers]);
+
+  // Run WebSocket Media Sender whenever WS Relay Fallback is active
+  useEffect(() => {
+    if (!wsRelayActive || !wsConnected || !selfOnStage || liveKitRoomRef.current) {
+      wsMediaSenderRef.current?.stop();
+      wsMediaSenderRef.current = null;
+      return;
+    }
+
+    const sender = new WsMediaSender({
+      roomId: ROOM_ID,
+      getWs: () => wsRef.current,
+      getVideoElement: () => localVideoRef.current,
+      getLocalStream: () => screenStreamRef.current || localStreamRef.current,
+      isVideoEnabled: () => isVideoOnRef.current,
+      isMicEnabled: () => isMicOnRef.current,
+    });
+    wsMediaSenderRef.current = sender;
+    sender.start();
+
+    return () => {
+      sender.stop();
+      if (wsMediaSenderRef.current === sender) {
+        wsMediaSenderRef.current = null;
+      }
+    };
+  }, [wsRelayActive, wsConnected, selfOnStage]);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -969,31 +1283,40 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         }
       }
 
-      // Push/renegotiate new tracks across all WebRTC peer connections
+      // Push/upgrade transceivers & renegotiate new tracks cleanly across all WebRTC peer connections
       for (const [peerId, pc] of peerConnectionsRef.current.entries()) {
         for (const t of stream.getTracks()) {
-          const existingSender = pc.getSenders().find((s) => s.track?.kind === t.kind);
-          if (existingSender) {
-            await existingSender.replaceTrack(t).catch(() => {});
+          const matchingTransceiver = pc.getTransceivers().find(
+            (tr) => tr.sender?.track?.kind === t.kind || tr.receiver?.track?.kind === t.kind
+          );
+          if (matchingTransceiver) {
+            try {
+              matchingTransceiver.direction = 'sendrecv';
+              await matchingTransceiver.sender.replaceTrack(t);
+            } catch {}
           } else {
             pc.addTrack(t, stream);
           }
         }
         await applyStudioEncoderTuning(pc, videoQuality);
-        try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          wsRef.current?.send(
-            JSON.stringify({
-              type: 'webrtc-signal',
-              roomId: ROOM_ID,
-              targetPeerId: peerId,
-              signal: { sdp: offer },
-            })
-          );
-        } catch {}
+        if (pc.signalingState === 'stable') {
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            wsRef.current?.send(
+              JSON.stringify({
+                type: 'webrtc-signal',
+                roomId: ROOM_ID,
+                targetPeerId: peerId,
+                signal: { sdp: offer },
+              })
+            );
+          } catch {}
+        }
       }
 
+      wsMediaSenderRef.current?.ensureAudioCapture();
+      unlockRemoteAudio();
       broadcastMediaState({ isVideoOn: hasVideo, isMicOn: hasAudio });
     } finally {
       setRequestingMedia(false);
@@ -1001,6 +1324,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   };
 
   const handleToggleMic = async () => {
+    unlockRemoteAudio();
     const tracks = localStreamRef.current?.getAudioTracks() || [];
     if (tracks.length === 0) {
       await handleRequestCameraPermission();
@@ -1016,6 +1340,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   };
 
   const handleToggleVideo = async () => {
+    unlockRemoteAudio();
     const tracks = localStreamRef.current?.getVideoTracks() || [];
     if (tracks.length === 0) {
       await handleRequestCameraPermission();
@@ -1212,7 +1537,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     }
   };
 
-  const stageRemotePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest' || p.stream !== null);
+  const stageRemotePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest' || p.stream !== null || Boolean(p.relayFrame));
   const totalLiveParticipants = Math.max(serverClientCount, 1 + remotePeers.length);
   const pinnedPeer = stageRemotePeers.find((p) => p.peerId === pinnedPeerId) || stageRemotePeers[0] || null;
   const isSelfExpanded = expandedTileId === 'self';
@@ -1312,6 +1637,35 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
           </button>
         </div>
       </div>
+
+      {wsDiagnostic && (
+        <div className="p-3 rounded-xl bg-red-950/85 border border-red-600/70 text-xs text-red-100 font-bold flex flex-wrap items-center justify-between gap-2.5 shadow-lg">
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+            <span>{wsDiagnostic}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setWsReconnectNonce((n) => n + 1)}
+            className="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-stone-950 text-xs font-extrabold transition shrink-0"
+          >
+            እንደገና አገናኝ
+          </button>
+        </div>
+      )}
+
+      {audioBlocked && (
+        <div className="p-3 rounded-xl bg-emerald-950/90 border border-emerald-500 text-xs text-emerald-100 font-extrabold flex flex-wrap items-center justify-between gap-2.5 shadow-lg">
+          <span>🔊 የሌሎችን ድምፅ ለመስማት የብራውዘሩን ድምፅ አንዴ ይክፈቱ</span>
+          <button
+            type="button"
+            onClick={unlockRemoteAudio}
+            className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-extrabold text-xs transition"
+          >
+            ድምፅ ክፈት (Unmute)
+          </button>
+        </div>
+      )}
 
       {mediaWarning && (
         <div className="p-3 rounded-xl bg-amber-950/80 border border-amber-600/70 text-xs text-amber-100 font-bold flex flex-wrap items-center justify-between gap-2.5 shadow-lg">
@@ -1489,6 +1843,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     setViewMode('speaker');
                   }}
                   onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
+                  onUnlockAudio={unlockRemoteAudio}
                   tallStage={true}
                 />
               ))}
@@ -1531,6 +1886,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     isExpanded={expandedTileId === pinnedPeer.peerId}
                     onPin={() => setViewMode('gallery')}
                     onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
+                    onUnlockAudio={unlockRemoteAudio}
                     tallStage={true}
                   />
                 ) : (
@@ -1562,6 +1918,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                         isExpanded={expandedTileId === p.peerId}
                         onPin={(id) => setPinnedPeerId(id)}
                         onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
+                        onUnlockAudio={unlockRemoteAudio}
                       />
                     </div>
                   ))}

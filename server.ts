@@ -1208,8 +1208,8 @@ app.post('/api/wallet/withdraw', (req: Request, res: Response) => {
 const wss = new WebSocketServer({
   server,
   path: '/ws/realtime',
-  maxPayload: 256 * 1024,
-  perMessageDeflate: true,
+  maxPayload: 512 * 1024,
+  perMessageDeflate: false,
 });
 
 interface RoomClient {
@@ -1302,6 +1302,14 @@ wss.on('connection', (ws: WebSocket) => {
           activeRooms.set(roomId, new Set());
         }
         const roomSet = activeRooms.get(roomId)!;
+
+        // Clean any stale entry sharing the same peer/session ID before inserting
+        roomSet.forEach((existing) => {
+          if (existing.userId === userId && existing.ws !== ws) {
+            removeClientFromRoom(existing);
+          }
+        });
+
         const role = (payload.role || 'attendee') as RoomClient['role'];
 
         // Anti-Congestion Stage Logic:
@@ -1526,7 +1534,55 @@ wss.on('connection', (ws: WebSocket) => {
         }
       }
 
-      // G. Explicit Leave Room
+      // G. Universal WebSocket Live Media Relay Fallback (when strict 4G CGNAT blocks UDP WebRTC)
+      else if (payload.type === 'ws-video-frame') {
+        if (!currentClient || typeof payload.frame !== 'string') return;
+        const roomSet = activeRooms.get(currentClient.roomId);
+        if (!roomSet) return;
+        const isMass = roomSet.size > MAX_DIRECT_MESH_PEERS;
+        if (isMass && !currentClient.onStage && currentClient.role !== 'priest') return;
+
+        const frameMsg = JSON.stringify({
+          type: 'ws-video-frame',
+          senderPeerId: currentClient.userId,
+          senderName: currentClient.baptismalName || currentClient.userName,
+          frame: payload.frame.slice(0, 180_000),
+          isVideoOn: Boolean(payload.isVideoOn),
+        });
+        roomSet.forEach((client) => {
+          if (client.ws !== ws) {
+            safeWsSend(client.ws, frameMsg);
+          }
+        });
+      }
+
+      else if (payload.type === 'ws-audio-chunk') {
+        if (!currentClient || typeof payload.pcm16 !== 'string') return;
+        const roomSet = activeRooms.get(currentClient.roomId);
+        if (!roomSet) return;
+        const isMass = roomSet.size > MAX_DIRECT_MESH_PEERS;
+        if (isMass && !currentClient.onStage && currentClient.role !== 'priest') return;
+
+        const audioMsg = JSON.stringify({
+          type: 'ws-audio-chunk',
+          senderPeerId: currentClient.userId,
+          pcm16: payload.pcm16.slice(0, 32_000),
+          sr: Number(payload.sr || 16000),
+        });
+        roomSet.forEach((client) => {
+          if (client.ws !== ws) {
+            safeWsSend(client.ws, audioMsg);
+          }
+        });
+      }
+
+      // H. Client Keepalive Ping (prevents NAT/proxy idle disconnect)
+      else if (payload.type === 'ws-ping') {
+        extWs.__isAlive = true;
+        safeWsSend(ws, JSON.stringify({ type: 'ws-pong' }));
+      }
+
+      // I. Explicit Leave Room
       else if (payload.type === 'leave-room') {
         removeClientFromRoom(currentClient);
         extWs.__clientRef = undefined;

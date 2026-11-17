@@ -38,7 +38,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const [mediaPermissionMsg, setMediaPermissionMsg] = useState<string | null>(null);
   const [requestingMedia, setRequestingMedia] = useState(false);
   const [remoteRelayFrame, setRemoteRelayFrame] = useState<string | null>(null);
+  const [remoteVideoHasFrames, setRemoteVideoHasFrames] = useState(false);
+  const [remoteIsVideoOn, setRemoteIsVideoOn] = useState<boolean>(true);
   const [wsRelayActive, setWsRelayActive] = useState(false);
+  const [videoRelayForced, setVideoRelayForced] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
 
@@ -72,6 +75,12 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   isMicOnRef.current = isMicOn;
   const isVideoOnRef = useRef(isVideoOn);
   isVideoOnRef.current = isVideoOn;
+  const wsRelayActiveRef = useRef(wsRelayActive);
+  wsRelayActiveRef.current = wsRelayActive;
+  const remoteVideoHasFramesRef = useRef(remoteVideoHasFrames);
+  remoteVideoHasFramesRef.current = remoteVideoHasFrames;
+  const remoteIsVideoOnRef = useRef(remoteIsVideoOn);
+  remoteIsVideoOnRef.current = remoteIsVideoOn;
 
   const unlockSecretAudio = () => {
     wsAudioPlayerRef.current?.unlock().then((ok) => {
@@ -140,9 +149,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               params.encodings = [{}];
             }
             if (sender.track.kind === 'video') {
-              params.encodings[0].maxBitrate = 2_500_000;
+              params.encodings[0].maxBitrate = 1_200_000;
               params.encodings[0].maxFramerate = 30;
-              (params as any).degradationPreference = 'maintain-resolution';
+              (params as any).degradationPreference = 'balanced';
             } else if (sender.track.kind === 'audio') {
               params.encodings[0].maxBitrate = 96_000;
             }
@@ -160,7 +169,6 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         if (stream.getAudioTracks().length === 0) {
           pc.addTransceiver('audio', { direction: 'recvonly' });
         }
-        applyEncoderParams(pc);
       } else {
         pc.addTransceiver('video', { direction: 'recvonly' });
         pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -221,7 +229,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
             ? pc.iceConnectionState
             : pc.connectionState || pc.iceConnectionState;
         setIceState(state);
-        if (pc.iceConnectionState === 'failed' || pc.connectionState === 'failed') {
+        if (state === 'connected' || state === 'completed') {
+          applyEncoderParams(pc);
+        } else if (pc.iceConnectionState === 'failed' || pc.connectionState === 'failed') {
           try {
             pc.restartIce();
           } catch {}
@@ -259,10 +269,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         };
         const candidates: MediaStreamConstraints[] = [
           {
-            video: { facingMode: 'user', width: { ideal: 1920, min: 640 }, height: { ideal: 1080, min: 480 }, frameRate: { ideal: 30 } },
+            video: { facingMode: 'user', width: { ideal: 1280, min: 320 }, height: { ideal: 720, min: 240 }, frameRate: { ideal: 24, max: 30 } },
             audio: hdAudio,
           },
-          { video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } },
           { video: { facingMode: 'user' }, audio: true },
           { video: true, audio: true },
           { video: true },
@@ -285,6 +294,8 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         streamRef.current = stream;
         const hasVideo = stream.getVideoTracks().length > 0;
         const hasAudio = stream.getAudioTracks().length > 0;
+        isVideoOnRef.current = hasVideo;
+        isMicOnRef.current = hasAudio;
         setIsVideoOn(hasVideo);
         setIsMicOn(hasAudio);
         setMediaPermissionMsg(hasVideo ? null : 'ካሜራው አልተፈቀደም፤ ከታች «ካሜራ ፍቀድ» የሚለውን ይንኩ።');
@@ -321,6 +332,8 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
           } catch {}
         }
       } else {
+        isVideoOnRef.current = false;
+        isMicOnRef.current = false;
         setIsVideoOn(false);
         setIsMicOn(false);
         setMediaPermissionMsg('የቪዲዮ ካሜራ ፍቃድ አልተሰጠም፤ «ካሜራና ማይክ ፍቀድ» የሚለውን ይጫኑ።');
@@ -378,9 +391,14 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
 
             if (data.type === 'ws-pong') {
               return;
+            } else if (data.type === 'request-video-relay') {
+              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              setVideoRelayForced(true);
+              return;
             } else if (data.type === 'ws-video-frame') {
               if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setRemoteRelayFrame(data.frame);
+              setRemoteIsVideoOn(data.isVideoOn !== false);
               if (data.senderName) setRemoteUserName(data.senderName);
               setRemoteUserConnected(true);
               return;
@@ -400,6 +418,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               if (target.peerId === selfPeerIdRef.current) return;
               remotePeerIdRef.current = target.peerId;
               setRemoteUserName(target.baptismalName || target.userName);
+              setRemoteIsVideoOn(target.isVideoOn !== false);
               const pc = createPC(rtcConfig, ws, target.peerId);
               const offer = await pc.createOffer();
               await pc.setLocalDescription(offer);
@@ -415,6 +434,12 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               if (data.peer.peerId === selfPeerIdRef.current) return;
               remotePeerIdRef.current = data.peer.peerId;
               setRemoteUserName(data.peer.baptismalName || data.peer.userName);
+              setRemoteIsVideoOn(data.peer.isVideoOn !== false);
+            } else if (data.type === 'peer-media-state' && data.peerId !== selfPeerIdRef.current) {
+              setRemoteIsVideoOn(data.isVideoOn !== false);
+              if (data.isVideoOn === false) {
+                setRemoteRelayFrame(null);
+              }
             } else if (data.type === 'webrtc-signal' && data.signal) {
               if (data.senderPeerId === selfPeerIdRef.current) return;
               if (data.senderPeerId) {
@@ -466,6 +491,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               setRemoteUserConnected(false);
               setRemoteUserName('');
               setRemoteRelayFrame(null);
+              setRemoteVideoHasFrames(false);
+              setRemoteIsVideoOn(true);
+              setVideoRelayForced(false);
               setIceState('waiting');
               remotePeerIdRef.current = null;
               remoteStreamRef.current = null;
@@ -524,6 +552,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   useEffect(() => {
     if (!isAuthenticated || !wsConnected) {
       setWsRelayActive(false);
+      setVideoRelayForced(false);
       return;
     }
     if (iceState === 'connected' || iceState === 'completed') {
@@ -540,8 +569,64 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     return () => clearTimeout(timer);
   }, [isAuthenticated, wsConnected, iceState]);
 
+  // Monitor decoded WebRTC video frames in Secret Room: trigger WS video relay if WebRTC audio works without video frames
   useEffect(() => {
-    if (!wsRelayActive || !wsConnected || !roomId) {
+    if (!isAuthenticated || !wsConnected || !remoteUserConnected) return;
+
+    const healthCheck = window.setInterval(() => {
+      const vid = remoteVideoRef.current;
+      const ready = Boolean(vid && vid.videoWidth > 0 && vid.videoHeight > 0);
+      setRemoteVideoHasFrames(ready);
+      if (vid && vid.paused && remoteStreamRef.current?.getVideoTracks().length) {
+        vid.play().catch(() => {});
+      }
+    }, 600);
+
+    const relayFallbackTimer = window.setTimeout(async () => {
+      const isConn = iceStateRef.current === 'connected' || iceStateRef.current === 'completed';
+      if (
+        isConn &&
+        !remoteVideoHasFramesRef.current &&
+        remoteIsVideoOnRef.current &&
+        wsRef.current?.readyState === WebSocket.OPEN &&
+        remotePeerIdRef.current
+      ) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'request-video-relay',
+            roomId,
+            targetPeerId: remotePeerIdRef.current,
+          })
+        );
+      }
+
+      if (isConn && isVideoOnRef.current && pcRef.current) {
+        try {
+          const stats = await pcRef.current.getStats();
+          let found = false;
+          let framesSent = 0;
+          stats.forEach((report) => {
+            if (report.type === 'outbound-rtp' && report.kind === 'video') {
+              found = true;
+              framesSent += report.framesSent || 0;
+            }
+          });
+          if (!found || framesSent === 0) {
+            setVideoRelayForced(true);
+          }
+        } catch {}
+      }
+    }, 3500);
+
+    return () => {
+      clearInterval(healthCheck);
+      clearTimeout(relayFallbackTimer);
+    };
+  }, [isAuthenticated, wsConnected, remoteUserConnected, roomId]);
+
+  useEffect(() => {
+    const needsSender = (wsRelayActive || videoRelayForced) && wsConnected && Boolean(roomId);
+    if (!needsSender) {
       wsMediaSenderRef.current?.stop();
       wsMediaSenderRef.current = null;
       return;
@@ -553,6 +638,8 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       getLocalStream: () => streamRef.current,
       isVideoEnabled: () => isVideoOnRef.current,
       isMicEnabled: () => isMicOnRef.current,
+      shouldSendVideo: () => isVideoOnRef.current,
+      shouldSendAudio: () => wsRelayActiveRef.current && isMicOnRef.current,
     });
     wsMediaSenderRef.current = sender;
     sender.start();
@@ -562,7 +649,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         wsMediaSenderRef.current = null;
       }
     };
-  }, [wsRelayActive, wsConnected, roomId]);
+  }, [wsRelayActive, videoRelayForced, wsConnected, roomId]);
 
   const handleRequestSecretMedia = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -603,8 +690,12 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         localVideoRef.current.srcObject = stream;
         localVideoRef.current.play().catch(() => {});
       }
-      setIsVideoOn(stream.getVideoTracks().length > 0);
-      setIsMicOn(stream.getAudioTracks().length > 0);
+      const hasVideo = stream.getVideoTracks().length > 0;
+      const hasAudio = stream.getAudioTracks().length > 0;
+      isVideoOnRef.current = hasVideo;
+      isMicOnRef.current = hasAudio;
+      setIsVideoOn(hasVideo);
+      setIsMicOn(hasAudio);
       setMediaPermissionMsg(null);
 
       if (pcRef.current) {
@@ -638,6 +729,15 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
           } catch {}
         }
       }
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'room-media-state',
+            isMicOn: hasAudio,
+            isVideoOn: hasVideo,
+          })
+        );
+      }
       wsMediaSenderRef.current?.ensureAudioCapture();
       unlockSecretAudio();
     } finally {
@@ -654,10 +754,20 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       return;
     }
     const newState = !isVideoOn;
+    isVideoOnRef.current = newState;
     setIsVideoOn(newState);
     tracks.forEach((track) => {
       track.enabled = newState;
     });
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'room-media-state',
+          isMicOn: isMicOnRef.current,
+          isVideoOn: newState,
+        })
+      );
+    }
   };
 
   // Toggle Audio Track
@@ -669,11 +779,21 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       return;
     }
     const newState = !isMicOn;
+    isMicOnRef.current = newState;
     setIsMicOn(newState);
     tracks.forEach((track) => {
       track.enabled = newState;
     });
     if (!newState) setMicVolumeLevel(0);
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'room-media-state',
+          isMicOn: newState,
+          isVideoOn: isVideoOnRef.current,
+        })
+      );
+    }
   };
 
   // Seamless HD camera flip without tearing down call
@@ -905,11 +1025,32 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               autoPlay
               playsInline
               muted
+              onLoadedMetadata={() => {
+                remoteVideoRef.current?.play().catch(() => {});
+                setRemoteVideoHasFrames(
+                  Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0)
+                );
+              }}
+              onLoadedData={() =>
+                setRemoteVideoHasFrames(
+                  Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0)
+                )
+              }
+              onPlaying={() =>
+                setRemoteVideoHasFrames(
+                  Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0)
+                )
+              }
+              onResize={() =>
+                setRemoteVideoHasFrames(
+                  Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0)
+                )
+              }
               onClick={() => {
                 if (remoteUserConnected && swapVideoFeed) setSwapVideoFeed(false);
               }}
               className={`object-cover contrast-[1.03] saturate-[1.06] ${
-                !remoteUserConnected || (!remoteStreamRef.current?.getVideoTracks().length && remoteRelayFrame)
+                !remoteUserConnected || !remoteVideoHasFrames
                   ? 'opacity-0 pointer-events-none absolute inset-0 w-full h-full'
                   : swapVideoFeed
                   ? 'absolute bottom-3 right-3 w-32 sm:w-44 h-44 sm:h-52 rounded-2xl border-2 border-amber-400 shadow-2xl z-20 cursor-pointer'
@@ -918,7 +1059,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
             />
 
             {/* 4G/CGNAT WebSocket Live Relay Fallback Video Image */}
-            {remoteUserConnected && !remoteStreamRef.current?.getVideoTracks().length && remoteRelayFrame && (
+            {remoteUserConnected && !remoteVideoHasFrames && remoteRelayFrame && (
               <img
                 src={remoteRelayFrame}
                 alt={remoteUserName || 'ተሳታፊ'}
@@ -931,6 +1072,21 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                     : 'w-full h-full block'
                 }`}
               />
+            )}
+
+            {/* Honest Remote Placeholder while connecting or when remote camera is off */}
+            {remoteUserConnected && !remoteVideoHasFrames && !remoteRelayFrame && !swapVideoFeed && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-950/95 text-stone-200 p-6 text-center space-y-2">
+                <div className="w-16 h-16 rounded-full bg-amber-950 border-2 border-amber-500/60 flex items-center justify-center text-2xl font-extrabold text-amber-200">
+                  {(remoteUserName || 'ተ').charAt(0)}
+                </div>
+                <p className="text-base font-extrabold text-amber-200">{remoteUserName || 'ተሳታፊ'}</p>
+                <p className="text-xs text-stone-300 max-w-xs">
+                  {remoteIsVideoOn
+                    ? 'የቪዲዮ ምስል ከሌላኛው ስልክ በመቀበል ላይ...'
+                    : 'ሌላኛው ተሳታፊ ካሜራውን ዘግቷል (ድምፅ ክፍት ነው)'}
+                </p>
+              </div>
             )}
 
             {audioBlocked && remoteUserConnected && (

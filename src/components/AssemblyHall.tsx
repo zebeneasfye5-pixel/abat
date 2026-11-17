@@ -88,7 +88,7 @@ async function applyStudioEncoderTuning(pc: RTCPeerConnection, quality: VideoQua
       if (sender.track.kind === 'video') {
         params.encodings[0].maxBitrate = targetBitrate;
         params.encodings[0].maxFramerate = 30;
-        (params as any).degradationPreference = 'maintain-framerate';
+        (params as any).degradationPreference = 'balanced';
       } else if (sender.track.kind === 'audio') {
         params.encodings[0].maxBitrate = 96_000;
       }
@@ -108,50 +108,114 @@ const RemoteVideoTile: React.FC<{
   onPin: (peerId: string) => void;
   onToggleExpand: (peerId: string) => void;
   onUnlockAudio?: () => void;
+  onVideoHealthChange?: (peerId: string, hasDecodedFrames: boolean) => void;
   tallStage?: boolean;
-}> = ({ peer, isGlobalAudioMuted, isPinned, isExpanded, onPin, onToggleExpand, onUnlockAudio, tallStage }) => {
+}> = ({
+  peer,
+  isGlobalAudioMuted,
+  isPinned,
+  isExpanded,
+  onPin,
+  onToggleExpand,
+  onUnlockAudio,
+  onVideoHealthChange,
+  tallStage,
+}) => {
   const tileRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [needsAudioTap, setNeedsAudioTap] = useState(false);
+  const [hasDecodedVideo, setHasDecodedVideo] = useState(false);
+  const [hasLiveVideoTrack, setHasLiveVideoTrack] = useState(false);
+  const [hasLiveAudioTrack, setHasLiveAudioTrack] = useState(false);
 
-  const isWebRtcConnected = peer.connectionState === 'connected' || peer.connectionState === 'completed';
-  const hasWebRtcVideo = Boolean(
-    peer.stream &&
-      peer.stream.getVideoTracks().some((t) => t.readyState === 'live') &&
-      peer.isVideoOn !== false
-  );
-  const hasRelayVideo = Boolean(!hasWebRtcVideo && peer.relayFrame && peer.isVideoOn !== false);
-  const showVisualFeed = hasWebRtcVideo || hasRelayVideo;
+  const checkVideoFrames = useCallback(() => {
+    const vid = videoRef.current;
+    const ready = Boolean(vid && vid.videoWidth > 0 && vid.videoHeight > 0);
+    setHasDecodedVideo((prev) => {
+      if (prev !== ready) {
+        onVideoHealthChange?.(peer.peerId, ready);
+      }
+      return ready;
+    });
+  }, [onVideoHealthChange, peer.peerId]);
 
   useEffect(() => {
+    const stream = peer.stream;
     const videoEl = videoRef.current;
     const audioEl = audioRef.current;
-    if (peer.stream) {
-      if (videoEl) {
-        if (videoEl.srcObject !== peer.stream) {
-          videoEl.srcObject = peer.stream;
-        }
-        // Keep video element muted so mobile Chrome/Safari NEVER block video playback; audio plays via dedicated <audio>
-        videoEl.muted = true;
-        videoEl.play().catch(() => {});
+
+    if (!stream) {
+      setHasDecodedVideo(false);
+      setHasLiveVideoTrack(false);
+      setHasLiveAudioTrack(false);
+      onVideoHealthChange?.(peer.peerId, false);
+      return;
+    }
+
+    const updateTrackStatus = () => {
+      setHasLiveVideoTrack(stream.getVideoTracks().some((t) => t.readyState === 'live' && !t.muted));
+      setHasLiveAudioTrack(stream.getAudioTracks().some((t) => t.readyState === 'live' && !t.muted));
+    };
+    updateTrackStatus();
+
+    const tracks = stream.getTracks();
+    tracks.forEach((t) => {
+      t.addEventListener('unmute', updateTrackStatus);
+      t.addEventListener('mute', updateTrackStatus);
+      t.addEventListener('ended', updateTrackStatus);
+    });
+
+    if (videoEl) {
+      if (videoEl.srcObject !== stream) {
+        videoEl.srcObject = stream;
       }
-      if (audioEl) {
-        if (audioEl.srcObject !== peer.stream) {
-          audioEl.srcObject = peer.stream;
-        }
-        audioEl.muted = isGlobalAudioMuted;
-        if (!isGlobalAudioMuted && peer.stream.getAudioTracks().length > 0) {
-          audioEl
-            .play()
-            .then(() => setNeedsAudioTap(false))
-            .catch(() => setNeedsAudioTap(true));
-        } else {
-          setNeedsAudioTap(false);
-        }
+      videoEl.defaultMuted = true;
+      videoEl.muted = true;
+      videoEl.play().catch(() => {});
+    }
+    if (audioEl) {
+      if (audioEl.srcObject !== stream) {
+        audioEl.srcObject = stream;
+      }
+      audioEl.muted = isGlobalAudioMuted;
+      if (!isGlobalAudioMuted && stream.getAudioTracks().length > 0) {
+        audioEl
+          .play()
+          .then(() => setNeedsAudioTap(false))
+          .catch(() => setNeedsAudioTap(true));
+      } else {
+        setNeedsAudioTap(false);
       }
     }
-  }, [peer.stream, peer.isVideoOn, isGlobalAudioMuted]);
+
+    checkVideoFrames();
+    const healthPoll = window.setInterval(() => {
+      updateTrackStatus();
+      checkVideoFrames();
+      if (videoEl && videoEl.paused && stream.getVideoTracks().length > 0) {
+        videoEl.play().catch(() => {});
+      }
+    }, 600);
+
+    return () => {
+      clearInterval(healthPoll);
+      tracks.forEach((t) => {
+        t.removeEventListener('unmute', updateTrackStatus);
+        t.removeEventListener('mute', updateTrackStatus);
+        t.removeEventListener('ended', updateTrackStatus);
+      });
+    };
+  }, [peer.stream, peer.peerId, isGlobalAudioMuted, checkVideoFrames, onVideoHealthChange]);
+
+  const isWebRtcConnected = peer.connectionState === 'connected' || peer.connectionState === 'completed';
+  // Never hide actual decoded WebRTC video pixels behind a stale boolean flag!
+  const hasWebRtcVideo = Boolean(
+    peer.stream && (hasDecodedVideo || (hasLiveVideoTrack && peer.isVideoOn !== false))
+  );
+  const hasRelayVideo = Boolean(!hasWebRtcVideo && peer.relayFrame);
+  const showVisualFeed = hasWebRtcVideo || hasRelayVideo;
+  const effectiveMicOn = peer.isMicOn || hasLiveAudioTrack;
 
   const handleTileFullscreen = async () => {
     if (document.fullscreenElement) {
@@ -183,7 +247,7 @@ const RemoteVideoTile: React.FC<{
           ? 'relative rounded-2xl min-h-[420px] sm:min-h-[540px] lg:min-h-[620px]'
           : 'relative rounded-2xl min-h-[320px] sm:min-h-[400px]'
       } ${
-        peer.isMicOn && isConnected
+        effectiveMicOn && isConnected
           ? 'border-emerald-500 ring-2 ring-emerald-500/40'
           : peer.isHandRaised
           ? 'border-amber-400 ring-2 ring-amber-400/40'
@@ -199,6 +263,13 @@ const RemoteVideoTile: React.FC<{
         autoPlay
         playsInline
         muted
+        onLoadedMetadata={() => {
+          videoRef.current?.play().catch(() => {});
+          checkVideoFrames();
+        }}
+        onLoadedData={checkVideoFrames}
+        onPlaying={checkVideoFrames}
+        onResize={checkVideoFrames}
         className={`absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.06] transition-opacity ${
           hasWebRtcVideo ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
@@ -219,10 +290,14 @@ const RemoteVideoTile: React.FC<{
             {(peer.baptismalName || peer.userName || 'ተ').charAt(0)}
           </div>
           <p className="text-sm font-extrabold text-amber-200">{peer.baptismalName || peer.userName}</p>
-          <p className="text-xs text-stone-300 mt-1">
+          <p className="text-xs text-stone-300 mt-1 max-w-xs leading-relaxed">
             {!peer.stream && !peer.relayFrame
               ? 'ቪዲዮና ድምፅ በመገናኘት ላይ...'
-              : 'ካሜራ ዘግተዋል (ድምፅ ክፍት ነው)'}
+              : peer.isVideoOn === false
+              ? effectiveMicOn
+                ? 'ካሜራ ዘግተዋል (ድምፅ ክፍት ነው) — ምስል እንዲታይ በእሳቸው ስልክ የካሜራ ቁልፍ (📹) መከፈት አለበት'
+                : 'በእሳቸው ስልክ ካሜራና ማይክ ተዘግቷል — እሳቸው ጋር «ካሜራና ማይክ ፍቀድ / ክፈት» መነካት አለበት'
+              : 'የቪዲዮ ምስል ከሌላኛው ስልክ እየተቀበለ ነው...'}
           </p>
         </div>
       )}
@@ -288,15 +363,15 @@ const RemoteVideoTile: React.FC<{
         <div className="flex items-center gap-2">
           <span
             className={`p-1.5 rounded-md border ${
-              peer.isMicOn
+              effectiveMicOn
                 ? 'bg-emerald-950/90 border-emerald-500 text-emerald-300'
                 : 'bg-red-950/90 border-red-700 text-red-300'
             }`}
           >
-            {peer.isMicOn ? <Mic className="w-3.5 h-3.5 animate-pulse" /> : <MicOff className="w-3.5 h-3.5" />}
+            {effectiveMicOn ? <Mic className="w-3.5 h-3.5 animate-pulse" /> : <MicOff className="w-3.5 h-3.5" />}
           </span>
           <span className="text-stone-200 font-bold">
-            {peer.isScreenSharing ? 'ስክሪን እያጋሩ ነው' : peer.isMicOn ? 'እየተናገሩ ነው' : 'ማይክ ዝግ ነው'}
+            {peer.isScreenSharing ? 'ስክሪን እያጋሩ ነው' : effectiveMicOn ? 'እየተናገሩ ነው' : 'ማይክ ዝግ ነው'}
           </span>
         </div>
 
@@ -307,7 +382,7 @@ const RemoteVideoTile: React.FC<{
               : 'bg-amber-950/90 text-amber-300 border border-amber-700/60'
           }`}
         >
-          {isWebRtcConnected ? 'ቀጥታ Full HD' : peer.relayFrame ? 'ቀጥታ 4G Relay' : peer.connectionState}
+          {hasWebRtcVideo ? 'ቀጥታ HD' : peer.relayFrame ? 'ቀጥታ 4G Relay' : isWebRtcConnected ? 'ቀጥታ ድምፅ' : peer.connectionState}
         </span>
       </div>
     </div>
@@ -323,7 +398,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const [expandedTileId, setExpandedTileId] = useState<string | null>(null);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
-  const [videoQuality, setVideoQuality] = useState<VideoQualityPreset>('1080p');
+  const [videoQuality, setVideoQuality] = useState<VideoQualityPreset>('720p');
 
   // Scalability & SFU Telemetry state
   const [broadcastMode, setBroadcastMode] = useState<'interactive-mesh' | 'stage-broadcast' | 'livekit-sfu'>('interactive-mesh');
@@ -343,6 +418,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const [wsConnected, setWsConnected] = useState(false);
   const [wsDiagnostic, setWsDiagnostic] = useState<string | null>(null);
   const [wsRelayActive, setWsRelayActive] = useState(false);
+  const [videoRelayForced, setVideoRelayForced] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
   const [wsReconnectNonce, setWsReconnectNonce] = useState(0);
 
@@ -372,6 +448,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const remoteStreamsMapRef = useRef<Map<string, MediaStream>>(new Map());
   const pendingIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  const webrtcVideoHealthRef = useRef<Map<string, boolean>>(new Map());
   const wsAudioPlayerRef = useRef<WsMediaAudioPlayer | null>(null);
   const wsMediaSenderRef = useRef<WsMediaSender | null>(null);
   const rtcConfigRef = useRef<RTCConfiguration>({
@@ -385,6 +462,12 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   isMicOnRef.current = isMicOn;
   const isVideoOnRef = useRef(isVideoOn || isScreenSharing);
   isVideoOnRef.current = isVideoOn || isScreenSharing;
+  const isHandRaisedRef = useRef(isHandRaised);
+  isHandRaisedRef.current = isHandRaised;
+  const isScreenSharingRef = useRef(isScreenSharing);
+  isScreenSharingRef.current = isScreenSharing;
+  const wsRelayActiveRef = useRef(wsRelayActive);
+  wsRelayActiveRef.current = wsRelayActive;
   const isGlobalAudioMutedRef = useRef(isGlobalAudioMuted);
   isGlobalAudioMutedRef.current = isGlobalAudioMuted;
   const remotePeersRef = useRef<RemotePeer[]>(remotePeers);
@@ -394,6 +477,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
   const meetingContainerRef = useRef<HTMLDivElement | null>(null);
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
+
+  const handlePeerVideoHealthChange = useCallback((peerId: string, hasDecodedFrames: boolean) => {
+    webrtcVideoHealthRef.current.set(peerId, hasDecodedFrames);
+  }, []);
 
   const unlockRemoteAudio = useCallback(() => {
     wsAudioPlayerRef.current?.unlock().then((ok) => {
@@ -431,7 +518,6 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       if (localStream.getAudioTracks().length === 0) {
         pc.addTransceiver('audio', { direction: 'recvonly' });
       }
-      applyStudioEncoderTuning(pc, videoQualityRef.current);
     } else {
       pc.addTransceiver('video', { direction: 'recvonly' });
       pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -450,7 +536,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       }
     };
 
-    const syncStreamState = (track?: MediaStreamTrack) => {
+    const syncStreamState = (track?: MediaStreamTrack, forceUnmutedVisual = false) => {
       let peerStream = remoteStreamsMapRef.current.get(targetPeerId);
       if (!peerStream) {
         peerStream = new MediaStream();
@@ -468,6 +554,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       }
       const wrapped = new MediaStream(peerStream.getTracks());
       const hasLiveVid = wrapped.getVideoTracks().some((t) => t.readyState === 'live' && !t.muted);
+      const hasLiveAud = wrapped.getAudioTracks().some((t) => t.readyState === 'live' && !t.muted);
       setRemotePeers((prev) => {
         const exists = prev.some((p) => p.peerId === targetPeerId);
         if (!exists) {
@@ -480,7 +567,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               role: 'child',
               stream: wrapped,
               connectionState: pc.iceConnectionState || 'connecting',
-              isMicOn: true,
+              isMicOn: hasLiveAud || wrapped.getAudioTracks().length > 0,
               isVideoOn: hasLiveVid || wrapped.getVideoTracks().length > 0,
               isHandRaised: false,
               isScreenSharing: false,
@@ -493,7 +580,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             ? {
                 ...p,
                 stream: wrapped,
-                isVideoOn: p.isVideoOn || hasLiveVid,
+                isVideoOn: forceUnmutedVisual && track?.kind === 'video' ? true : p.isVideoOn || hasLiveVid,
+                isMicOn: forceUnmutedVisual && track?.kind === 'audio' ? true : p.isMicOn || hasLiveAud,
               }
             : p
         );
@@ -501,8 +589,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     };
 
     pc.ontrack = (event) => {
-      syncStreamState(event.track);
-      event.track.onunmute = () => syncStreamState(event.track);
+      syncStreamState(event.track, !event.track.muted);
+      event.track.onunmute = () => syncStreamState(event.track, true);
     };
 
     const handleConnState = () => {
@@ -512,7 +600,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       setRemotePeers((prev) =>
         prev.map((p) => (p.peerId === targetPeerId ? { ...p, connectionState: state } : p))
       );
-      if (pc.iceConnectionState === 'failed' || pc.connectionState === 'failed') {
+      if (state === 'connected' || state === 'completed') {
+        applyStudioEncoderTuning(pc, videoQualityRef.current);
+      } else if (pc.iceConnectionState === 'failed' || pc.connectionState === 'failed') {
         try {
           pc.restartIce();
         } catch {}
@@ -559,22 +649,15 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
       const attempts: Array<{ constraints: MediaStreamConstraints; label: string }> = [
         {
-          label: '1080p',
+          label: '720p',
           constraints: {
             video: {
               facingMode: 'user',
-              width: { ideal: 1920, min: 640 },
-              height: { ideal: 1080, min: 480 },
-              frameRate: { ideal: 30, min: 15 },
+              width: { ideal: 1280, min: 320 },
+              height: { ideal: 720, min: 240 },
+              frameRate: { ideal: 24, max: 30 },
             },
             audio: hdAudioConstraints,
-          },
-        },
-        {
-          label: '720p',
-          constraints: {
-            video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
-            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
           },
         },
         {
@@ -601,10 +684,12 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
           const stream = await navigator.mediaDevices.getUserMedia(attempt.constraints);
           const hasVideo = stream.getVideoTracks().length > 0;
           const hasAudio = stream.getAudioTracks().length > 0;
+          isVideoOnRef.current = hasVideo;
+          isMicOnRef.current = hasAudio;
           setIsVideoOn(hasVideo);
           setIsMicOn(hasAudio);
           if (!hasVideo) {
-            setMediaWarning('ካሜራ አልተገኘም ወይም ፍቃድ ይፈልጋል፤ «ካሜራ ፍቀድ» የሚለውን ይጫኑ።');
+            setMediaWarning('ካሜራ አልተገኘም ወይም ፍቃድ ይፈልጋል፤ «ካሜራና ማይክ ፍቀድ / ክፈት» የሚለውን ይጫኑ።');
           } else {
             setMediaWarning(null);
           }
@@ -614,12 +699,14 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         }
       }
 
+      isVideoOnRef.current = false;
+      isMicOnRef.current = false;
       setIsVideoOn(false);
       setIsMicOn(false);
       if (lastErrName === 'NotAllowedError' || lastErrName === 'PermissionDeniedError') {
-        setMediaWarning('የስልክዎ/ብራውዘርዎ ካሜራ ፍቃድ ተዘግቷል፤ ከታች «ካሜራና ማይክ ፍቀድ» የሚለውን ይንኩ ወይም በብራውዘር አድራሻ አሞሌ 🔒 ላይ ካሜራን Allow ያድርጉ።');
+        setMediaWarning('የስልክዎ/ብራውዘርዎ ካሜራ ፍቃድ ተዘግቷል፤ ከላይ ያለውን «ካሜራና ማይክ ፍቀድ / ክፈት» ይንኩ ወይም በብራውዘር አድራሻ አሞሌ 🔒 ላይ Camera → Allow ያድርጉ።');
       } else {
-        setMediaWarning('ካሜራ ለማብራት «ካሜራና ማይክ ፍቀድ» የሚለውን ይጫኑ።');
+        setMediaWarning('ካሜራ ለማብራት «ካሜራና ማይክ ፍቀድ / ክፈት» የሚለውን ይጫኑ።');
       }
       return null;
     };
@@ -815,6 +902,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             const data = JSON.parse(event.data);
 
             if (data.type === 'ws-pong') {
+              return;
+            } else if (data.type === 'request-video-relay') {
+              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              setVideoRelayForced(true);
               return;
             } else if (data.type === 'ws-video-frame') {
               if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
@@ -1021,6 +1112,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                         ...p,
                         isMicOn: data.isMicOn,
                         isVideoOn: data.isVideoOn,
+                        relayFrame: data.isVideoOn === false ? null : p.relayFrame,
                         isHandRaised: data.isHandRaised,
                         isScreenSharing: data.isScreenSharing,
                         onStage: data.onStage,
@@ -1123,11 +1215,23 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     };
   }, [createPeerConnection, triggerReaction, user.id, user.fullName, user.baptismalName, user.role, wsReconnectNonce]);
 
-  // Automatic 4.5s CGNAT / Symmetric-4G Relay Detection
+  // Keep local self-view video bound whenever viewMode switches (gallery <-> speaker)
+  useEffect(() => {
+    const stream = screenStreamRef.current || localStreamRef.current;
+    if (localVideoRef.current && stream) {
+      if (localVideoRef.current.srcObject !== stream) {
+        localVideoRef.current.srcObject = stream;
+      }
+      localVideoRef.current.play().catch(() => {});
+    }
+  }, [viewMode, isVideoOn, isScreenSharing]);
+
+  // Automatic 4.5s CGNAT / Symmetric-4G Relay Detection + Video Frame Health Fallback
   useEffect(() => {
     const activeStagePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest');
     if (activeStagePeers.length === 0 || liveKitRoomRef.current) {
       setWsRelayActive(false);
+      setVideoRelayForced(false);
       return;
     }
 
@@ -1151,9 +1255,59 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     return () => clearTimeout(timer);
   }, [remotePeers]);
 
-  // Run WebSocket Media Sender whenever WS Relay Fallback is active
+  // Monitor WebRTC decoded video frames: if ICE is connected (audio works) yet video fails/stalls after 3.5s, trigger WS video relay!
   useEffect(() => {
-    if (!wsRelayActive || !wsConnected || !selfOnStage || liveKitRoomRef.current) {
+    const activeStagePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest');
+    if (activeStagePeers.length === 0 || !wsConnected || liveKitRoomRef.current) return;
+
+    const timer = window.setTimeout(async () => {
+      for (const peer of activeStagePeers) {
+        const isConn = peer.connectionState === 'connected' || peer.connectionState === 'completed';
+        const hasFrames = webrtcVideoHealthRef.current.get(peer.peerId) === true;
+        if (isConn && !hasFrames && peer.isVideoOn !== false && wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'request-video-relay',
+              roomId: ROOM_ID,
+              targetPeerId: peer.peerId,
+            })
+          );
+        }
+      }
+
+      // Also verify our own outbound video RTP frames: if ICE connected & our camera is on yet 0 framesSent, send WS frames!
+      if (isVideoOnRef.current) {
+        let outboundStalled = false;
+        for (const [, pc] of peerConnectionsRef.current.entries()) {
+          if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') continue;
+          try {
+            const stats = await pc.getStats();
+            let videoOutboundFound = false;
+            let framesSent = 0;
+            stats.forEach((report) => {
+              if (report.type === 'outbound-rtp' && report.kind === 'video') {
+                videoOutboundFound = true;
+                framesSent += report.framesSent || 0;
+              }
+            });
+            if (!videoOutboundFound || framesSent === 0) {
+              outboundStalled = true;
+            }
+          } catch {}
+        }
+        if (outboundStalled) {
+          setVideoRelayForced(true);
+        }
+      }
+    }, 3500);
+
+    return () => clearTimeout(timer);
+  }, [remotePeers, wsConnected]);
+
+  // Run WebSocket Media Sender whenever full WS Relay OR Video-Only Relay Fallback is active
+  useEffect(() => {
+    const needsSender = (wsRelayActive || videoRelayForced) && wsConnected && selfOnStage && !liveKitRoomRef.current;
+    if (!needsSender) {
       wsMediaSenderRef.current?.stop();
       wsMediaSenderRef.current = null;
       return;
@@ -1166,6 +1320,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       getLocalStream: () => screenStreamRef.current || localStreamRef.current,
       isVideoEnabled: () => isVideoOnRef.current,
       isMicEnabled: () => isMicOnRef.current,
+      shouldSendVideo: () => isVideoOnRef.current,
+      shouldSendAudio: () => wsRelayActiveRef.current && isMicOnRef.current,
     });
     wsMediaSenderRef.current = sender;
     sender.start();
@@ -1176,7 +1332,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         wsMediaSenderRef.current = null;
       }
     };
-  }, [wsRelayActive, wsConnected, selfOnStage]);
+  }, [wsRelayActive, videoRelayForced, wsConnected, selfOnStage]);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1194,10 +1350,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       wsRef.current.send(
         JSON.stringify({
           type: 'room-media-state',
-          isMicOn: overrides.isMicOn ?? isMicOn,
-          isVideoOn: overrides.isVideoOn ?? isVideoOn,
-          isHandRaised: overrides.isHandRaised ?? isHandRaised,
-          isScreenSharing: overrides.isScreenSharing ?? isScreenSharing,
+          isMicOn: overrides.isMicOn ?? isMicOnRef.current,
+          isVideoOn: overrides.isVideoOn ?? isVideoOnRef.current,
+          isHandRaised: overrides.isHandRaised ?? isHandRaisedRef.current,
+          isScreenSharing: overrides.isScreenSharing ?? isScreenSharingRef.current,
         })
       );
     }
@@ -1272,6 +1428,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
       const hasVideo = stream.getVideoTracks().length > 0;
       const hasAudio = stream.getAudioTracks().length > 0;
+      isVideoOnRef.current = hasVideo;
+      isMicOnRef.current = hasAudio;
       setIsVideoOn(hasVideo);
       setIsMicOn(hasAudio);
       setMediaWarning(null);
@@ -1334,6 +1492,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     tracks.forEach((t) => {
       t.enabled = next;
     });
+    isMicOnRef.current = next;
     setIsMicOn(next);
     if (!next) setMyVolume(0);
     broadcastMediaState({ isMicOn: next });
@@ -1350,6 +1509,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     tracks.forEach((t) => {
       t.enabled = next;
     });
+    isVideoOnRef.current = next || isScreenSharingRef.current;
     setIsVideoOn(next);
     broadcastMediaState({ isVideoOn: next });
   };
@@ -1844,6 +2004,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                   }}
                   onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
                   onUnlockAudio={unlockRemoteAudio}
+                  onVideoHealthChange={handlePeerVideoHealthChange}
                   tallStage={true}
                 />
               ))}
@@ -1887,6 +2048,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     onPin={() => setViewMode('gallery')}
                     onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
                     onUnlockAudio={unlockRemoteAudio}
+                    onVideoHealthChange={handlePeerVideoHealthChange}
                     tallStage={true}
                   />
                 ) : (
@@ -1919,6 +2081,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                         onPin={(id) => setPinnedPeerId(id)}
                         onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
                         onUnlockAudio={unlockRemoteAudio}
+                        onVideoHealthChange={handlePeerVideoHealthChange}
                       />
                     </div>
                   ))}

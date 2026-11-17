@@ -1534,6 +1534,25 @@ wss.on('connection', (ws: WebSocket) => {
         }
       }
 
+      // G0. Targeted Request for WS Video Relay (when WebRTC ICE connects for audio yet hardware/4G stalls video frames)
+      else if (payload.type === 'request-video-relay') {
+        if (!currentClient) return;
+        const roomId = String(payload.roomId || currentClient.roomId || '');
+        const targetPeerId = payload.targetPeerId ? String(payload.targetPeerId) : null;
+        const roomSet = activeRooms.get(roomId);
+        if (roomSet) {
+          const reqMsg = JSON.stringify({
+            type: 'request-video-relay',
+            senderPeerId: currentClient.userId,
+          });
+          roomSet.forEach((client) => {
+            if (client.ws !== ws && (!targetPeerId || client.userId === targetPeerId)) {
+              safeWsSend(client.ws, reqMsg);
+            }
+          });
+        }
+      }
+
       // G. Universal WebSocket Live Media Relay Fallback (when strict 4G CGNAT blocks UDP WebRTC)
       else if (payload.type === 'ws-video-frame') {
         if (!currentClient || typeof payload.frame !== 'string') return;

@@ -1,5 +1,6 @@
 // Universal HTTPS/WSS Port-443 Media Relay Fallback
-// Automatically activates if WebRTC ICE cannot traverse strict 4G/symmetric carrier NAT (CGNAT) without TURN.
+// Automatically activates if WebRTC ICE cannot traverse strict 4G/symmetric carrier NAT (CGNAT) without TURN,
+// or if WebRTC audio connects while video frames stall on mobile hardware encoders / poor 4G.
 
 function uint8ToBase64(bytes: Uint8Array): string {
   let binary = '';
@@ -114,12 +115,15 @@ export interface WsRelaySenderOptions {
   getLocalStream: () => MediaStream | null;
   isVideoEnabled: () => boolean;
   isMicEnabled: () => boolean;
+  shouldSendVideo?: () => boolean;
+  shouldSendAudio?: () => boolean;
 }
 
 export class WsMediaSender {
   private opts: WsRelaySenderOptions;
   private videoTimer: number | null = null;
   private canvas: HTMLCanvasElement | null = null;
+  private fallbackVideo: HTMLVideoElement | null = null;
   private audioCtx: AudioContext | null = null;
   private audioSource: MediaStreamAudioSourceNode | null = null;
   private processor: ScriptProcessorNode | null = null;
@@ -139,27 +143,56 @@ export class WsMediaSender {
       if (!this.running) return;
       this.sendVideoFrame();
       this.ensureAudioCapture();
-    }, 150);
+    }, 140);
 
     this.ensureAudioCapture();
   }
 
-  private sendVideoFrame() {
-    const ws = this.opts.getWs();
-    const videoEl = this.opts.getVideoElement();
-    if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 140_000) return;
-
-    if (!this.opts.isVideoEnabled() || !videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0) {
-      return;
+  private resolveReadyVideoElement(): HTMLVideoElement | null {
+    const domVideo = this.opts.getVideoElement();
+    if (domVideo && domVideo.readyState >= 2 && domVideo.videoWidth > 0) {
+      return domVideo;
     }
+
+    const stream = this.opts.getLocalStream();
+    if (!stream || stream.getVideoTracks().length === 0 || typeof document === 'undefined') {
+      return null;
+    }
+
+    if (!this.fallbackVideo) {
+      const vid = document.createElement('video');
+      vid.muted = true;
+      vid.playsInline = true;
+      vid.autoplay = true;
+      this.fallbackVideo = vid;
+    }
+    if (this.fallbackVideo.srcObject !== stream) {
+      this.fallbackVideo.srcObject = stream;
+      this.fallbackVideo.play().catch(() => {});
+    }
+    if (this.fallbackVideo.readyState >= 2 && this.fallbackVideo.videoWidth > 0) {
+      return this.fallbackVideo;
+    }
+    return null;
+  }
+
+  private sendVideoFrame() {
+    if (this.opts.shouldSendVideo && !this.opts.shouldSendVideo()) return;
+    if (!this.opts.isVideoEnabled()) return;
+
+    const ws = this.opts.getWs();
+    if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 160_000) return;
+
+    const videoEl = this.resolveReadyVideoElement();
+    if (!videoEl) return;
 
     try {
       if (!this.canvas) {
         this.canvas = document.createElement('canvas');
       }
-      const targetW = 320;
+      const targetW = 360;
       const ratio = videoEl.videoHeight > 0 ? videoEl.videoHeight / videoEl.videoWidth : 0.75;
-      const targetH = Math.max(180, Math.round(targetW * ratio));
+      const targetH = Math.max(200, Math.round(targetW * ratio));
       if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
         this.canvas.width = targetW;
         this.canvas.height = targetH;
@@ -167,7 +200,7 @@ export class WsMediaSender {
       const ctx = this.canvas.getContext('2d');
       if (!ctx) return;
       ctx.drawImage(videoEl, 0, 0, targetW, targetH);
-      const frame = this.canvas.toDataURL('image/jpeg', 0.55);
+      const frame = this.canvas.toDataURL('image/jpeg', 0.62);
       ws.send(
         JSON.stringify({
           type: 'ws-video-frame',
@@ -181,6 +214,9 @@ export class WsMediaSender {
 
   ensureAudioCapture() {
     if (!this.running) return;
+    if (this.opts.shouldSendAudio && !this.opts.shouldSendAudio()) {
+      return;
+    }
     const stream = this.opts.getLocalStream();
     if (!stream || stream.getAudioTracks().length === 0) return;
 
@@ -214,6 +250,7 @@ export class WsMediaSender {
 
       processor.onaudioprocess = (ev) => {
         if (!this.running || !this.opts.isMicEnabled()) return;
+        if (this.opts.shouldSendAudio && !this.opts.shouldSendAudio()) return;
         const ws = this.opts.getWs();
         if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 140_000) return;
 
@@ -273,6 +310,10 @@ export class WsMediaSender {
     if (this.videoTimer !== null) {
       clearInterval(this.videoTimer);
       this.videoTimer = null;
+    }
+    if (this.fallbackVideo) {
+      this.fallbackVideo.srcObject = null;
+      this.fallbackVideo = null;
     }
     this.teardownAudio();
   }

@@ -289,7 +289,7 @@ export async function fetchRegisteredUsers(): Promise<UserProfile[]> {
 }
 
 // --- 2. REAL GEMINI AI SPIRITUAL COUNSEL & ORTHODOX SEARCH (STREAMING + FAST CACHE) ---
-async function readSseStream(
+async function readSseStreamOnce(
   path: string,
   body: object,
   onChunk: (accumulatedText: string) => void,
@@ -305,11 +305,16 @@ async function readSseStream(
   if (!res.ok) {
     const text = await res.text();
     let msg = `የኤአይ ሰርቨር ስህተት (${res.status})`;
+    let retryable = res.status === 502 || res.status === 503 || res.status === 504;
     try {
       const parsed = JSON.parse(text);
       msg = parsed.message || parsed.error || msg;
+      if (parsed.retryable !== undefined) retryable = Boolean(parsed.retryable);
     } catch {}
-    throw new Error(msg);
+    const err: any = new Error(msg);
+    err.status = res.status;
+    err.retryable = retryable;
+    throw err;
   }
 
   const contentType = res.headers.get('content-type') || '';
@@ -339,7 +344,11 @@ async function readSseStream(
         if (!raw) continue;
         try {
           const parsed = JSON.parse(raw);
-          if (parsed.error) throw new Error(parsed.error);
+          if (parsed.error) {
+            const err: any = new Error(parsed.error);
+            err.retryable = Boolean(parsed.retryable) || String(parsed.error).includes('503') || String(parsed.error).includes('ተጨናንቋል');
+            throw err;
+          }
           if (parsed.chunk) {
             accumulated += parsed.chunk;
             onChunk(accumulated);
@@ -354,6 +363,34 @@ async function readSseStream(
   }
 
   return accumulated;
+}
+
+async function readSseStream(
+  path: string,
+  body: object,
+  onChunk: (accumulatedText: string) => void,
+  signal?: AbortSignal
+): Promise<string> {
+  try {
+    return await readSseStreamOnce(path, body, onChunk, signal);
+  } catch (err: any) {
+    if (err?.name === 'AbortError' || signal?.aborted) throw err;
+    const isTransient = Boolean(err?.retryable) || err?.status === 502 || err?.status === 503 || err?.status === 504;
+    if (!isTransient) throw err;
+    // Wait 1.6s and retry automatically once when Gemini server reports transient high demand (503)
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(resolve, 1600);
+      signal?.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(t);
+          reject(new DOMException('Aborted', 'AbortError'));
+        },
+        { once: true }
+      );
+    });
+    return readSseStreamOnce(path, body, onChunk, signal);
+  }
 }
 
 export async function streamSpiritualCounsel(

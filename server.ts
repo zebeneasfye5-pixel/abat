@@ -402,25 +402,48 @@ const ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION = `
 - አላስፈላጊ ረጅም መግቢያ ሳትዘረጋ በቀጥታ ዋናውን ትምህርት፣ ማስረጃ (ጥቅስ/አበው/ቀኖና) እና ተግባራዊ መመሪያ አቅርብ።
 `;
 
-const GEMINI_MODEL_CANDIDATES: Array<{ model: string; thinkingLevel: ThinkingLevel }> = [
+const GEMINI_MODEL_CANDIDATES: Array<{ model: string; thinkingLevel?: ThinkingLevel }> = [
   { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW },
+  { model: 'gemini-3.1-flash-lite' },
+  { model: 'gemini-4-hydrogen' },
   { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL },
 ];
 
-function isQuotaOrRateLimitError(err: any): boolean {
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientHighDemandError(err: any): boolean {
   const raw = `${err?.status || ''} ${err?.code || ''} ${err?.message || ''}`.toLowerCase();
   return (
-    err?.status === 429 ||
     err?.status === 503 ||
-    raw.includes('429') ||
+    err?.status === 502 ||
+    err?.status === 504 ||
+    err?.status === 500 ||
     raw.includes('503') ||
-    raw.includes('resource_exhausted') ||
     raw.includes('unavailable') ||
     raw.includes('high demand') ||
     raw.includes('overloaded') ||
+    raw.includes('try again') ||
+    raw.includes('fetch failed') ||
+    raw.includes('econnreset') ||
+    raw.includes('etimedout')
+  );
+}
+
+function isDailyQuotaError(err: any): boolean {
+  const raw = `${err?.status || ''} ${err?.code || ''} ${err?.message || ''}`.toLowerCase();
+  return (
+    err?.status === 429 ||
+    raw.includes('429') ||
+    raw.includes('resource_exhausted') ||
     raw.includes('quota') ||
     raw.includes('rate limit')
   );
+}
+
+function isQuotaOrRateLimitError(err: any): boolean {
+  return isTransientHighDemandError(err) || isDailyQuotaError(err);
 }
 
 function formatReadableGeminiError(error: any): string {
@@ -429,16 +452,24 @@ function formatReadableGeminiError(error: any): string {
   }
   const raw = String(error?.message || '');
   const lower = raw.toLowerCase();
-  if (error?.status === 429 || lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota')) {
-    return 'የነጻው ኤአይ ዕለታዊ የጥያቄ ገደብ (Free Tier Daily Limit) ለዛሬ ሞልቷል። ነገ ገደቡ ሲታደስ ይሰራል፤ ወይም በGoogle AI Studio (Settings > Secrets / Billing) የሚከፈልበትን (Pay-as-you-go) ቁልፍ መምረጥ ይችላሉ።';
+  if (isDailyQuotaError(error)) {
+    return 'የነጻው ኤአይ ዕለታዊ ወይም ደቂቃዊ የጥያቄ ገደብ (Free Tier Limit) ሞልቷል። እባክዎ ጥቂት ቆይተው እንደገና ይሞክሩ፤ ወይም በGoogle AI Studio Billing ማሻሻል ይችላሉ።';
   }
-  if (error?.status === 503 || lower.includes('503') || lower.includes('high demand') || lower.includes('unavailable')) {
-    return 'የኤአይ ሰርቨሩ በአሁኑ ሰዓት በብዙ ተጠቃሚዎች ተጨናንቋል (High Demand)። እባክዎ ከጥቂት ሰከንዶች በኋላ እንደገና ይሞክሩ።';
+  if (isTransientHighDemandError(error)) {
+    return 'የGoogle Gemini ኤአይ ሰርቨር በአሁኑ ሰዓት ብዙ ጥያቄዎችን እያስተናገደ ነው (503 High Demand)። እባክዎ «እንደገና ሞክር» የሚለውን ይንኩ።';
   }
-  if (raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED') || raw.includes('403')) {
+  if (raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED') || raw.includes('403') || lower.includes('api key not valid')) {
     return 'የGEMINI_API_KEY ትክክለኛ አለመሆኑን በSettings > Secrets ወይም Render Environment ላይ ያረጋግጡ።';
   }
   return 'የኤአይ አገልግሎት ጊዜያዊ መቋረጥ አጋጥሞታል፤ እባክዎ ከጥቂት ሰከንዶች በኋላ እንደገና ይሞክሩ።';
+}
+
+function buildGeminiConfig(systemInstruction: string, thinkingLevel?: ThinkingLevel) {
+  const config: Record<string, any> = { systemInstruction };
+  if (thinkingLevel) {
+    config.thinkingConfig = { thinkingLevel };
+  }
+  return config;
 }
 
 async function generateWithGemini(prompt: string, systemInstruction: string, cacheKey?: string): Promise<string> {
@@ -449,16 +480,19 @@ async function generateWithGemini(prompt: string, systemInstruction: string, cac
 
   const ai = getAiClient();
   let lastError: any = null;
+  const retryDelaysMs = [0, 650, 1400, 2200];
 
-  for (const candidate of GEMINI_MODEL_CANDIDATES) {
+  for (let pass = 0; pass < GEMINI_MODEL_CANDIDATES.length; pass++) {
+    const candidate = GEMINI_MODEL_CANDIDATES[pass];
+    const delay = retryDelaysMs[pass] ?? 1500;
+    if (delay > 0) {
+      await sleepMs(delay + Math.floor(Math.random() * 250));
+    }
     try {
       const response = await ai.models.generateContent({
         model: candidate.model,
         contents: prompt,
-        config: {
-          systemInstruction,
-          thinkingConfig: { thinkingLevel: candidate.thinkingLevel },
-        },
+        config: buildGeminiConfig(systemInstruction, candidate.thinkingLevel),
       });
 
       const text = response.text?.trim();
@@ -469,8 +503,12 @@ async function generateWithGemini(prompt: string, systemInstruction: string, cac
       return text;
     } catch (err: any) {
       lastError = err;
+      console.warn(
+        `Gemini attempt ${pass + 1}/${GEMINI_MODEL_CANDIDATES.length} (${candidate.model}) failed:`,
+        err?.status || err?.code || '',
+        String(err?.message || err).slice(0, 180)
+      );
       if (isQuotaOrRateLimitError(err)) {
-        console.warn(`Gemini quota limit on ${candidate.model}, failing over to next model...`);
         continue;
       }
       throw err;
@@ -503,28 +541,38 @@ async function streamWithGemini(
   try {
     const ai = getAiClient();
     let lastError: any = null;
+    const retryDelaysMs = [0, 650, 1400, 2200];
 
-    for (const candidate of GEMINI_MODEL_CANDIDATES) {
+    for (let pass = 0; pass < GEMINI_MODEL_CANDIDATES.length; pass++) {
+      const candidate = GEMINI_MODEL_CANDIDATES[pass];
+      const delay = retryDelaysMs[pass] ?? 1500;
+      if (delay > 0) {
+        await sleepMs(delay + Math.floor(Math.random() * 250));
+      }
+
+      let emittedAnyChunk = false;
       try {
         const stream = await ai.models.generateContentStream({
           model: candidate.model,
           contents: prompt,
-          config: {
-            systemInstruction,
-            thinkingConfig: { thinkingLevel: candidate.thinkingLevel },
-          },
+          config: buildGeminiConfig(systemInstruction, candidate.thinkingLevel),
         });
 
         let fullText = '';
         for await (const chunk of stream) {
           const part = chunk.text || '';
           if (part) {
+            emittedAnyChunk = true;
             fullText += part;
             res.write(`data: ${JSON.stringify({ chunk: part })}\n\n`);
           }
         }
 
-        if (cacheKey && fullText.trim()) {
+        if (!fullText.trim()) {
+          throw new Error('Empty stream response from Gemini API');
+        }
+
+        if (cacheKey) {
           setCachedAi(cacheKey, fullText.trim());
         }
         res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
@@ -532,8 +580,12 @@ async function streamWithGemini(
         return;
       } catch (err: any) {
         lastError = err;
-        if (isQuotaOrRateLimitError(err)) {
-          console.warn(`Gemini stream quota on ${candidate.model}, failing over to next model...`);
+        console.warn(
+          `Gemini stream attempt ${pass + 1}/${GEMINI_MODEL_CANDIDATES.length} (${candidate.model}) failed:`,
+          err?.status || err?.code || '',
+          String(err?.message || err).slice(0, 180)
+        );
+        if (!emittedAnyChunk && isQuotaOrRateLimitError(err)) {
           continue;
         }
         throw err;
@@ -544,7 +596,13 @@ async function streamWithGemini(
   } catch (error: any) {
     console.error('Gemini Stream Error:', error);
     const message = formatReadableGeminiError(error);
-    res.write(`data: ${JSON.stringify({ error: message, done: true })}\n\n`);
+    res.write(
+      `data: ${JSON.stringify({
+        error: message,
+        retryable: isTransientHighDemandError(error),
+        done: true,
+      })}\n\n`
+    );
     res.end();
   }
 }
@@ -588,6 +646,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
 
 app.get('/api/webrtc-config', (_req: Request, res: Response) => {
   const iceServers: RTCIceServer[] = [
+    { urls: 'stun:stun.cloudflare.com:3478' },
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
@@ -835,7 +894,7 @@ app.post('/api/gemini/spiritual-counsel', async (req: Request, res: Response): P
     }
 
     const systemInstruction = `${ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION}\nየተጠያቂው የክርስትና ስም: ${baptismalName || 'የእግዚአብሔር ልጅ'}።`;
-    const cleanPrompt = prompt.trim();
+    const cleanPrompt = prompt.trim().replace(/\s+/g, ' ');
     const userMessage = `ዘርፍ/ርዕስ: ${topic || 'አጠቃላይ ኦርቶዶክሳዊ እውቀት'}\nጥያቄ: "${cleanPrompt}"\nእባክህ በኦርቶዶክስ ተዋሕዶ ቤተክርስቲያን ትምህርት፣ መጻሕፍት፣ ቀኖና እና አባታዊ ፍቅር መሠረት ግልጽና የተሟላ መልስ ስጠኝ።`;
     const cacheKey = `counsel:${topic || 'all'}:${cleanPrompt.toLowerCase()}`;
 
@@ -850,8 +909,10 @@ app.post('/api/gemini/spiritual-counsel', async (req: Request, res: Response): P
       });
       return;
     }
-    res.status(isQuotaOrRateLimitError(error) ? 429 : 500).json({
-      error: isQuotaOrRateLimitError(error) ? 'QUOTA_EXCEEDED' : 'AI_REQUEST_FAILED',
+    const statusCode = isTransientHighDemandError(error) ? 503 : isDailyQuotaError(error) ? 429 : 500;
+    res.status(statusCode).json({
+      error: statusCode === 503 ? 'MODEL_BUSY' : statusCode === 429 ? 'QUOTA_EXCEEDED' : 'AI_REQUEST_FAILED',
+      retryable: isTransientHighDemandError(error),
       message: formatReadableGeminiError(error),
     });
   }
@@ -863,7 +924,7 @@ app.post('/api/gemini/spiritual-counsel-stream', async (req: Request, res: Respo
     res.status(400).json({ error: 'እባክዎ ጥያቄዎን በግልጽ ይጻፉ።' });
     return;
   }
-  const cleanPrompt = prompt.trim();
+  const cleanPrompt = prompt.trim().replace(/\s+/g, ' ');
   const systemInstruction = `${ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION}\nየተጠያቂው የክርስትና ስም: ${baptismalName || 'የእግዚአብሔር ልጅ'}።`;
   const userMessage = `ዘርፍ/ርዕስ: ${topic || 'አጠቃላይ ኦርቶዶክሳዊ እውቀት'}\nጥያቄ: "${cleanPrompt}"\nእባክህ በኦርቶዶክስ ተዋሕዶ ቤተክርስቲያን ትምህርት፣ መጻሕፍት፣ ቀኖና እና አባታዊ ፍቅር መሠረት ግልጽና የተሟላ መልስ ስጠኝ።`;
   const cacheKey = `counsel:${topic || 'all'}:${cleanPrompt.toLowerCase()}`;
@@ -877,7 +938,7 @@ app.post('/api/gemini/scripture-search', async (req: Request, res: Response): Pr
       res.status(400).json({ error: 'የሚፈለገውን ቃል ወይም ርዕስ ያስገቡ።' });
       return;
     }
-    const cleanQuery = query.trim();
+    const cleanQuery = query.trim().replace(/\s+/g, ' ');
     const cat = String(category || 'ሁሉም የኦርቶዶክስ እውቀት');
     const userPrompt = `የፍለጋ ዘርፍ: ${cat}\nርዕስ / ጥያቄ: "${cleanQuery}"\nስለዚህ ጉዳይ በኢትዮጵያ ኦርቶዶክስ ተዋሕዶ እምነት መሠረት (ከመጽሐፍ ቅዱስ፣ ከነገረ መለኮት/ምሥጢራት፣ ከአበው ትምህርት፣ ከፍትሐ ነገሥት፣ ከገድላት/ታሪክ እና ከሥርዓተ ቤተክርስቲያን አንጻር) የተሟላ፣ ግልጽ እና ተጨባጭ ማብራሪያ ከነማስረጃው በአማርኛ አቅርብ።`;
     const cacheKey = `search:${cat}:${cleanQuery.toLowerCase()}`;
@@ -893,8 +954,10 @@ app.post('/api/gemini/scripture-search', async (req: Request, res: Response): Pr
       });
       return;
     }
-    res.status(isQuotaOrRateLimitError(error) ? 429 : 500).json({
-      error: isQuotaOrRateLimitError(error) ? 'QUOTA_EXCEEDED' : 'AI_SEARCH_FAILED',
+    const statusCode = isTransientHighDemandError(error) ? 503 : isDailyQuotaError(error) ? 429 : 500;
+    res.status(statusCode).json({
+      error: statusCode === 503 ? 'MODEL_BUSY' : statusCode === 429 ? 'QUOTA_EXCEEDED' : 'AI_SEARCH_FAILED',
+      retryable: isTransientHighDemandError(error),
       message: formatReadableGeminiError(error),
     });
   }
@@ -906,7 +969,7 @@ app.post('/api/gemini/scripture-search-stream', async (req: Request, res: Respon
     res.status(400).json({ error: 'የሚፈለገውን ቃል ወይም ርዕስ ያስገቡ።' });
     return;
   }
-  const cleanQuery = query.trim();
+  const cleanQuery = query.trim().replace(/\s+/g, ' ');
   const cat = String(category || 'ሁሉም የኦርቶዶክስ እውቀት');
   const userPrompt = `የፍለጋ ዘርፍ: ${cat}\nርዕስ / ጥያቄ: "${cleanQuery}"\nስለዚህ ጉዳይ በኢትዮጵያ ኦርቶዶክስ ተዋሕዶ እምነት መሠረት (ከመጽሐፍ ቅዱስ፣ ከነገረ መለኮት/ምሥጢራት፣ ከአበው ትምህርት፣ ከፍትሐ ነገሥት፣ ከገድላት/ታሪክ እና ከሥርዓተ ቤተክርስቲያን አንጻር) የተሟላ፣ ግልጽ እና ተጨባጭ ማብራሪያ ከነማስረጃው በአማርኛ አቅርብ።`;
   const cacheKey = `search:${cat}:${cleanQuery.toLowerCase()}`;
@@ -1231,9 +1294,12 @@ const MAX_DIRECT_MESH_PEERS = 8;
 const activeRooms = new Map<string, Set<RoomClient>>();
 const roomChatHistory = new Map<string, Array<{ id: string; sender: string; text: string; time: string; isPriest?: boolean }>>();
 
-function safeWsSend(ws: WebSocket, serialized: string) {
-  // Backpressure guard so congested/3G sockets never stall thousands of healthy peers
-  if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 512 * 1024) {
+function safeWsSend(ws: WebSocket, serialized: string, priority: 'high' | 'normal' | 'low' = 'high') {
+  // Backpressure guard: prioritize audio/signaling ahead of JPEG video frames so slow 4G links never stall audio
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const maxBuffered =
+    priority === 'high' ? 1_500_000 : priority === 'normal' ? 380_000 : 110_000;
+  if (ws.bufferedAmount < maxBuffered) {
     ws.send(serialized);
   }
 }
@@ -1547,7 +1613,26 @@ wss.on('connection', (ws: WebSocket) => {
           });
           roomSet.forEach((client) => {
             if (client.ws !== ws && (!targetPeerId || client.userId === targetPeerId)) {
-              safeWsSend(client.ws, reqMsg);
+              safeWsSend(client.ws, reqMsg, 'high');
+            }
+          });
+        }
+      }
+
+      // G0-Audio. Targeted Request for WS Audio Relay (when WebRTC ICE connects yet 0 UDP audio packets flow bidirectionally)
+      else if (payload.type === 'request-audio-relay') {
+        if (!currentClient) return;
+        const roomId = String(payload.roomId || currentClient.roomId || '');
+        const targetPeerId = payload.targetPeerId ? String(payload.targetPeerId) : null;
+        const roomSet = activeRooms.get(roomId);
+        if (roomSet) {
+          const reqMsg = JSON.stringify({
+            type: 'request-audio-relay',
+            senderPeerId: currentClient.userId,
+          });
+          roomSet.forEach((client) => {
+            if (client.ws !== ws && (!targetPeerId || client.userId === targetPeerId)) {
+              safeWsSend(client.ws, reqMsg, 'high');
             }
           });
         }
@@ -1570,7 +1655,7 @@ wss.on('connection', (ws: WebSocket) => {
         });
         roomSet.forEach((client) => {
           if (client.ws !== ws) {
-            safeWsSend(client.ws, frameMsg);
+            safeWsSend(client.ws, frameMsg, 'low');
           }
         });
       }
@@ -1585,12 +1670,12 @@ wss.on('connection', (ws: WebSocket) => {
         const audioMsg = JSON.stringify({
           type: 'ws-audio-chunk',
           senderPeerId: currentClient.userId,
-          pcm16: payload.pcm16.slice(0, 32_000),
+          pcm16: payload.pcm16.slice(0, 48_000),
           sr: Number(payload.sr || 16000),
         });
         roomSet.forEach((client) => {
           if (client.ws !== ws) {
-            safeWsSend(client.ws, audioMsg);
+            safeWsSend(client.ws, audioMsg, 'normal');
           }
         });
       }

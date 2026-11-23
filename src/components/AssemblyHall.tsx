@@ -41,10 +41,40 @@ interface AssemblyHallProps {
 type VideoQualityPreset = '1080p' | '720p' | '360p';
 
 const QUALITY_MAP: Record<VideoQualityPreset, { width: number; height: number; maxBitrate: number; label: string }> = {
-  '1080p': { width: 1920, height: 1080, maxBitrate: 2_500_000, label: 'Full HD 1080p' },
-  '720p': { width: 1280, height: 720, maxBitrate: 1_200_000, label: 'HD 720p' },
-  '360p': { width: 640, height: 360, maxBitrate: 450_000, label: 'ፈጣን 360p' },
+  '1080p': { width: 1920, height: 1080, maxBitrate: 1_800_000, label: 'Full HD 1080p' },
+  '720p': { width: 1280, height: 720, maxBitrate: 750_000, label: 'HD 720p' },
+  '360p': { width: 640, height: 360, maxBitrate: 350_000, label: 'ፈጣን 360p' },
 };
+
+function preferRobustOpusSdp(sdp?: string): string | undefined {
+  if (!sdp) return sdp;
+  const lines = sdp.split('\r\n');
+  const opusPt = lines
+    .map((line) => line.match(/^a=rtpmap:(\d+)\s+opus\/48000/i)?.[1])
+    .find(Boolean);
+  if (!opusPt) return sdp;
+
+  const fmtpPrefix = `a=fmtp:${opusPt} `;
+  let replaced = false;
+  const nextLines = lines.map((line) => {
+    if (line.startsWith(fmtpPrefix)) {
+      replaced = true;
+      let next = line;
+      if (!next.includes('useinbandfec=')) next += ';useinbandfec=1';
+      if (!next.includes('usedtx=')) next += ';usedtx=0';
+      if (!next.includes('maxaveragebitrate=')) next += ';maxaveragebitrate=48000';
+      return next;
+    }
+    return line;
+  });
+  if (!replaced) {
+    const idx = nextLines.findIndex((l) => l.startsWith(`a=rtpmap:${opusPt} `));
+    if (idx !== -1) {
+      nextLines.splice(idx + 1, 0, `${fmtpPrefix}minptime=10;useinbandfec=1;usedtx=0;maxaveragebitrate=48000`);
+    }
+  }
+  return nextLines.join('\r\n');
+}
 
 interface RemotePeer {
   peerId: string;
@@ -87,10 +117,14 @@ async function applyStudioEncoderTuning(pc: RTCPeerConnection, quality: VideoQua
       }
       if (sender.track.kind === 'video') {
         params.encodings[0].maxBitrate = targetBitrate;
-        params.encodings[0].maxFramerate = 30;
+        params.encodings[0].maxFramerate = quality === '360p' ? 20 : 24;
+        (params.encodings[0] as any).priority = 'low';
+        (params.encodings[0] as any).networkPriority = 'low';
         (params as any).degradationPreference = 'balanced';
       } else if (sender.track.kind === 'audio') {
-        params.encodings[0].maxBitrate = 96_000;
+        params.encodings[0].maxBitrate = 48_000;
+        (params.encodings[0] as any).priority = 'high';
+        (params.encodings[0] as any).networkPriority = 'high';
       }
       await sender.setParameters(params);
     } catch {
@@ -98,6 +132,101 @@ async function applyStudioEncoderTuning(pc: RTCPeerConnection, quality: VideoQua
     }
   }
 }
+
+interface PipCornerData {
+  label: string;
+  stream: MediaStream | null;
+  relayFrame?: string | null;
+  isVideoOn?: boolean;
+  isMicOn?: boolean;
+  mirror?: boolean;
+  onClick?: () => void;
+}
+
+const PipCornerTile: React.FC<PipCornerData> = ({
+  label,
+  stream,
+  relayFrame,
+  isVideoOn = true,
+  isMicOn = true,
+  mirror = false,
+  onClick,
+}) => {
+  const pipVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [hasFrames, setHasFrames] = useState(false);
+
+  useEffect(() => {
+    const el = pipVideoRef.current;
+    if (!el || !stream) {
+      setHasFrames(false);
+      return;
+    }
+    if (el.srcObject !== stream) {
+      el.srcObject = stream;
+    }
+    el.defaultMuted = true;
+    el.muted = true;
+    el.play().catch(() => {});
+    const check = () => setHasFrames(Boolean(el.videoWidth > 0 && el.videoHeight > 0));
+    check();
+    const timer = window.setInterval(check, 500);
+    return () => clearInterval(timer);
+  }, [stream]);
+
+  const showStream = Boolean(
+    stream &&
+      (hasFrames ||
+        (isVideoOn !== false && stream.getVideoTracks().some((t) => t.readyState === 'live' && !t.muted)))
+  );
+  const showRelay = Boolean(!showStream && relayFrame);
+
+  return (
+    <div
+      onClick={(e) => {
+        if (onClick) {
+          e.stopPropagation();
+          onClick();
+        }
+      }}
+      className={`absolute bottom-14 right-3 z-30 w-28 sm:w-40 h-36 sm:h-48 rounded-2xl border-2 border-amber-400/90 bg-stone-950 shadow-2xl overflow-hidden flex flex-col justify-end ${
+        onClick ? 'cursor-pointer hover:border-amber-300 transition' : 'pointer-events-none'
+      }`}
+    >
+      <video
+        ref={pipVideoRef}
+        autoPlay
+        playsInline
+        muted
+        onLoadedMetadata={() => {
+          pipVideoRef.current?.play().catch(() => {});
+          setHasFrames(Boolean(pipVideoRef.current && pipVideoRef.current.videoWidth > 0));
+        }}
+        onPlaying={() => setHasFrames(Boolean(pipVideoRef.current && pipVideoRef.current.videoWidth > 0))}
+        className={`absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.05] ${
+          mirror ? 'mirror' : ''
+        } ${showStream ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
+      />
+      {showRelay && relayFrame && (
+        <img
+          src={relayFrame}
+          alt={label}
+          className="absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.05]"
+        />
+      )}
+      {!showStream && !showRelay && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-900 text-amber-200 p-2">
+          <div className="w-10 h-10 rounded-full bg-amber-950 border border-amber-500/60 flex items-center justify-center text-sm font-extrabold">
+            {(label || 'ተ').charAt(0)}
+          </div>
+        </div>
+      )}
+      <div className="relative z-10 px-2 py-1 bg-gradient-to-t from-black/95 via-black/75 to-transparent flex items-center gap-1.5">
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isMicOn ? 'bg-emerald-400' : 'bg-red-400'}`} />
+        <span className="text-[10px] font-extrabold text-amber-100 truncate">{label}</span>
+      </div>
+    </div>
+  );
+};
 
 // Sub-component for reliable high-res remote video/audio attachment + per-video fullscreen
 const RemoteVideoTile: React.FC<{
@@ -110,6 +239,7 @@ const RemoteVideoTile: React.FC<{
   onUnlockAudio?: () => void;
   onVideoHealthChange?: (peerId: string, hasDecodedFrames: boolean) => void;
   tallStage?: boolean;
+  pipCorner?: PipCornerData | null;
 }> = ({
   peer,
   isGlobalAudioMuted,
@@ -120,6 +250,7 @@ const RemoteVideoTile: React.FC<{
   onUnlockAudio,
   onVideoHealthChange,
   tallStage,
+  pipCorner,
 }) => {
   const tileRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -195,6 +326,12 @@ const RemoteVideoTile: React.FC<{
       checkVideoFrames();
       if (videoEl && videoEl.paused && stream.getVideoTracks().length > 0) {
         videoEl.play().catch(() => {});
+      }
+      if (audioEl) {
+        audioEl.muted = isGlobalAudioMuted;
+        if (!isGlobalAudioMuted && audioEl.paused && stream.getAudioTracks().length > 0) {
+          audioEl.play().then(() => setNeedsAudioTap(false)).catch(() => {});
+        }
       }
     }, 600);
 
@@ -385,6 +522,9 @@ const RemoteVideoTile: React.FC<{
           {hasWebRtcVideo ? 'ቀጥታ HD' : peer.relayFrame ? 'ቀጥታ 4G Relay' : isWebRtcConnected ? 'ቀጥታ ድምፅ' : peer.connectionState}
         </span>
       </div>
+
+      {/* Picture-in-Picture corner person when zoomed/expanded or in speaker stage */}
+      {pipCorner && <PipCornerTile {...pipCorner} />}
     </div>
   );
 };
@@ -419,6 +559,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const [wsDiagnostic, setWsDiagnostic] = useState<string | null>(null);
   const [wsRelayActive, setWsRelayActive] = useState(false);
   const [videoRelayForced, setVideoRelayForced] = useState(false);
+  const [audioRelayForced, setAudioRelayForced] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
   const [wsReconnectNonce, setWsReconnectNonce] = useState(0);
 
@@ -449,10 +590,14 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const remoteStreamsMapRef = useRef<Map<string, MediaStream>>(new Map());
   const pendingIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const webrtcVideoHealthRef = useRef<Map<string, boolean>>(new Map());
+  const webrtcAudioFlowingRef = useRef<Map<string, boolean>>(new Map());
+  const inboundAudioBytesRef = useRef<Map<string, { bytes: number; stalledChecks: number }>>(new Map());
   const wsAudioPlayerRef = useRef<WsMediaAudioPlayer | null>(null);
   const wsMediaSenderRef = useRef<WsMediaSender | null>(null);
   const rtcConfigRef = useRef<RTCConfiguration>({
+    iceCandidatePoolSize: 4,
     iceServers: [
+      { urls: 'stun:stun.cloudflare.com:3478' },
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun2.l.google.com:19302' },
@@ -468,6 +613,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   isScreenSharingRef.current = isScreenSharing;
   const wsRelayActiveRef = useRef(wsRelayActive);
   wsRelayActiveRef.current = wsRelayActive;
+  const videoRelayForcedRef = useRef(videoRelayForced);
+  videoRelayForcedRef.current = videoRelayForced;
+  const audioRelayForcedRef = useRef(audioRelayForced);
+  audioRelayForcedRef.current = audioRelayForced;
   const isGlobalAudioMutedRef = useRef(isGlobalAudioMuted);
   isGlobalAudioMutedRef.current = isGlobalAudioMuted;
   const remotePeersRef = useRef<RemotePeer[]>(remotePeers);
@@ -486,7 +635,18 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     wsAudioPlayerRef.current?.unlock().then((ok) => {
       if (ok) setAudioBlocked(false);
     });
-    wsMediaSenderRef.current?.ensureAudioCapture();
+    wsMediaSenderRef.current?.resumeAudio();
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume().catch(() => {});
+    }
+    if (typeof document !== 'undefined') {
+      document.querySelectorAll('audio').forEach((el) => {
+        if (!isGlobalAudioMutedRef.current && el.srcObject) {
+          el.muted = false;
+          el.play().catch(() => {});
+        }
+      });
+    }
   }, []);
 
   const triggerReaction = useCallback((emoji: string, sender: string) => {
@@ -713,7 +873,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
     const boot = async () => {
       const extConfig = await fetchWebRTCConfig();
-      rtcConfigRef.current = { iceServers: extConfig.iceServers };
+      rtcConfigRef.current = {
+        iceServers: extConfig.iceServers,
+        iceCandidatePoolSize: 4,
+      };
 
       // 1. Acquire Video & Audio with universal fallbacks
       const acquiredStream = await acquireInitialMedia();
@@ -907,6 +1070,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setVideoRelayForced(true);
               return;
+            } else if (data.type === 'request-audio-relay') {
+              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              setAudioRelayForced(true);
+              return;
             } else if (data.type === 'ws-video-frame') {
               if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setRemotePeers((prev) =>
@@ -920,11 +1087,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             } else if (data.type === 'ws-audio-chunk') {
               if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               const senderPeer = remotePeersRef.current.find((p) => p.peerId === data.senderPeerId);
-              const hasWebRtcAudio =
+              const audioBytesFlowing = webrtcAudioFlowingRef.current.get(data.senderPeerId) === true;
+              const hasLiveUnmutedTrack = Boolean(
+                senderPeer?.stream?.getAudioTracks().some((t) => t.readyState === 'live' && !t.muted)
+              );
+              const hasVerifiedWebRtcAudio =
                 senderPeer &&
                 (senderPeer.connectionState === 'connected' || senderPeer.connectionState === 'completed') &&
-                Boolean(senderPeer.stream?.getAudioTracks().some((t) => t.readyState === 'live'));
-              if (!hasWebRtcAudio) {
+                audioBytesFlowing &&
+                hasLiveUnmutedTrack;
+              if (!hasVerifiedWebRtcAudio) {
                 wsAudioPlayerRef.current?.playChunk(
                   data.senderPeerId,
                   data.pcm16,
@@ -956,6 +1128,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               peerConnectionsRef.current.clear();
               remoteStreamsMapRef.current.clear();
               pendingIceRef.current.clear();
+              webrtcAudioFlowingRef.current.clear();
+              inboundAudioBytesRef.current.clear();
 
               const existing: any[] = data.existingPeers || [];
               setRemotePeers(
@@ -978,13 +1152,15 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               for (const p of existing) {
                 const pc = createPeerConnection(p.peerId);
                 const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
+                const tunedSdp = preferRobustOpusSdp(offer.sdp);
+                const tunedOffer = tunedSdp ? { type: offer.type, sdp: tunedSdp } : offer;
+                await pc.setLocalDescription(tunedOffer);
                 ws.send(
                   JSON.stringify({
                     type: 'webrtc-signal',
                     roomId: ROOM_ID,
                     targetPeerId: p.peerId,
-                    signal: { sdp: offer },
+                    signal: { sdp: tunedOffer },
                   })
                 );
               }
@@ -1073,25 +1249,29 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               if (signal.sdp) {
                 const isOffer = signal.sdp.type === 'offer';
                 const polite = selfPeerIdRef.current < senderId;
+                const tunedRemoteSdp = preferRobustOpusSdp(signal.sdp.sdp);
+                const remoteDesc = tunedRemoteSdp ? { type: signal.sdp.type, sdp: tunedRemoteSdp } : signal.sdp;
                 if (isOffer && pc.signalingState !== 'stable') {
                   if (!polite) return;
                   await Promise.all([
                     pc.setLocalDescription({ type: 'rollback' }),
-                    pc.setRemoteDescription(new RTCSessionDescription(signal.sdp)),
+                    pc.setRemoteDescription(new RTCSessionDescription(remoteDesc)),
                   ]);
                 } else {
-                  await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+                  await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
                 }
                 await flushIceCandidates(senderId, pc);
                 if (isOffer) {
                   const answer = await pc.createAnswer();
-                  await pc.setLocalDescription(answer);
+                  const tunedAnswerSdp = preferRobustOpusSdp(answer.sdp);
+                  const tunedAnswer = tunedAnswerSdp ? { type: answer.type, sdp: tunedAnswerSdp } : answer;
+                  await pc.setLocalDescription(tunedAnswer);
                   ws.send(
                     JSON.stringify({
                       type: 'webrtc-signal',
                       roomId: ROOM_ID,
                       targetPeerId: senderId,
-                      signal: { sdp: answer },
+                      signal: { sdp: tunedAnswer },
                     })
                   );
                 }
@@ -1143,6 +1323,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               }
               remoteStreamsMapRef.current.delete(data.peerId);
               pendingIceRef.current.delete(data.peerId);
+              webrtcAudioFlowingRef.current.delete(data.peerId);
+              inboundAudioBytesRef.current.delete(data.peerId);
               setRemotePeers((prev) => prev.filter((p) => p.peerId !== data.peerId));
             } else if (data.type === 'assembly-chat-message') {
               setChatMessages((prev) => [
@@ -1215,6 +1397,18 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     };
   }, [createPeerConnection, triggerReaction, user.id, user.fullName, user.baptismalName, user.role, wsReconnectNonce]);
 
+  // Sync expanded/fullscreen state when user presses browser Back/ESC
+  useEffect(() => {
+    const onFsChange = () => {
+      if (!document.fullscreenElement) {
+        setIsFullscreen(false);
+        setExpandedTileId(null);
+      }
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
+
   // Keep local self-view video bound whenever viewMode switches (gallery <-> speaker)
   useEffect(() => {
     const stream = screenStreamRef.current || localStreamRef.current;
@@ -1226,12 +1420,26 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     }
   }, [viewMode, isVideoOn, isScreenSharing]);
 
-  // Automatic 4.5s CGNAT / Symmetric-4G Relay Detection + Video Frame Health Fallback
+  // Global mobile touch/pointer listener so AudioContext & <audio> unlock on any screen tap
+  useEffect(() => {
+    const onUserGesture = () => {
+      unlockRemoteAudio();
+    };
+    window.addEventListener('pointerdown', onUserGesture, { passive: true, capture: true });
+    window.addEventListener('touchstart', onUserGesture, { passive: true, capture: true });
+    return () => {
+      window.removeEventListener('pointerdown', onUserGesture, true);
+      window.removeEventListener('touchstart', onUserGesture, true);
+    };
+  }, [unlockRemoteAudio]);
+
+  // Automatic 4.5s CGNAT / Symmetric-4G Relay Detection + Video/Audio RTP Packet Health Fallback
   useEffect(() => {
     const activeStagePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest');
     if (activeStagePeers.length === 0 || liveKitRoomRef.current) {
       setWsRelayActive(false);
       setVideoRelayForced(false);
+      setAudioRelayForced(false);
       return;
     }
 
@@ -1255,16 +1463,20 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     return () => clearTimeout(timer);
   }, [remotePeers]);
 
-  // Monitor WebRTC decoded video frames: if ICE is connected (audio works) yet video fails/stalls after 3.5s, trigger WS video relay!
+  // Continuous RTP Stats Monitor (every 2.5s):
+  // Guarantees bidirectional audio & video relay activate IMMEDIATELY if ICE claims "connected" yet 0 RTP packets flow over 4G CGNAT!
   useEffect(() => {
     const activeStagePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest');
     if (activeStagePeers.length === 0 || !wsConnected || liveKitRoomRef.current) return;
 
-    const timer = window.setTimeout(async () => {
-      for (const peer of activeStagePeers) {
+    const inspectMediaStats = async () => {
+      const peersNow = remotePeersRef.current.filter((p) => p.onStage !== false || p.role === 'priest');
+      for (const peer of peersNow) {
         const isConn = peer.connectionState === 'connected' || peer.connectionState === 'completed';
+        if (!isConn) continue;
+
         const hasFrames = webrtcVideoHealthRef.current.get(peer.peerId) === true;
-        if (isConn && !hasFrames && peer.isVideoOn !== false && wsRef.current?.readyState === WebSocket.OPEN) {
+        if (!hasFrames && peer.isVideoOn !== false && wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(
             JSON.stringify({
               type: 'request-video-relay',
@@ -1273,40 +1485,82 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             })
           );
         }
-      }
 
-      // Also verify our own outbound video RTP frames: if ICE connected & our camera is on yet 0 framesSent, send WS frames!
-      if (isVideoOnRef.current) {
-        let outboundStalled = false;
-        for (const [, pc] of peerConnectionsRef.current.entries()) {
-          if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') continue;
-          try {
-            const stats = await pc.getStats();
+        const pc = peerConnectionsRef.current.get(peer.peerId);
+        if (!pc) continue;
+        try {
+          const stats = await pc.getStats();
+          let inboundAudioBytes = 0;
+          stats.forEach((report) => {
+            if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+              inboundAudioBytes += Number(report.bytesReceived || 0);
+            }
+          });
+
+          const prev = inboundAudioBytesRef.current.get(peer.peerId) || { bytes: 0, stalledChecks: 0 };
+          if (inboundAudioBytes > prev.bytes) {
+            webrtcAudioFlowingRef.current.set(peer.peerId, true);
+            inboundAudioBytesRef.current.set(peer.peerId, { bytes: inboundAudioBytes, stalledChecks: 0 });
+          } else {
+            const nextStalls = prev.stalledChecks + 1;
+            inboundAudioBytesRef.current.set(peer.peerId, { bytes: inboundAudioBytes, stalledChecks: nextStalls });
+            if (peer.isMicOn && (inboundAudioBytes === 0 || nextStalls >= 2)) {
+              webrtcAudioFlowingRef.current.set(peer.peerId, false);
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                wsRef.current.send(
+                  JSON.stringify({
+                    type: 'request-audio-relay',
+                    roomId: ROOM_ID,
+                    targetPeerId: peer.peerId,
+                  })
+                );
+              }
+            }
+          }
+
+          if (isMicOnRef.current) {
+            let audioOutboundFound = false;
+            let packetsSent = 0;
+            stats.forEach((report) => {
+              if (report.type === 'outbound-rtp' && report.kind === 'audio') {
+                audioOutboundFound = true;
+                packetsSent += Number(report.packetsSent || 0);
+              }
+            });
+            if (!audioOutboundFound || packetsSent === 0) {
+              setAudioRelayForced(true);
+            }
+          }
+
+          if (isVideoOnRef.current) {
             let videoOutboundFound = false;
             let framesSent = 0;
             stats.forEach((report) => {
               if (report.type === 'outbound-rtp' && report.kind === 'video') {
                 videoOutboundFound = true;
-                framesSent += report.framesSent || 0;
+                framesSent += Number(report.framesSent || 0);
               }
             });
             if (!videoOutboundFound || framesSent === 0) {
-              outboundStalled = true;
+              setVideoRelayForced(true);
             }
-          } catch {}
-        }
-        if (outboundStalled) {
-          setVideoRelayForced(true);
-        }
+          }
+        } catch {}
       }
-    }, 3500);
+    };
 
-    return () => clearTimeout(timer);
-  }, [remotePeers, wsConnected]);
+    const initialTimer = window.setTimeout(inspectMediaStats, 2500);
+    const intervalTimer = window.setInterval(inspectMediaStats, 3500);
 
-  // Run WebSocket Media Sender whenever full WS Relay OR Video-Only Relay Fallback is active
+    return () => {
+      clearTimeout(initialTimer);
+      clearInterval(intervalTimer);
+    };
+  }, [remotePeers.length, wsConnected]);
+
+  // Run WebSocket Media Sender whenever full WS Relay OR Video/Audio Relay Fallback is active
   useEffect(() => {
-    const needsSender = (wsRelayActive || videoRelayForced) && wsConnected && selfOnStage && !liveKitRoomRef.current;
+    const needsSender = (wsRelayActive || videoRelayForced || audioRelayForced) && wsConnected && selfOnStage && !liveKitRoomRef.current;
     if (!needsSender) {
       wsMediaSenderRef.current?.stop();
       wsMediaSenderRef.current = null;
@@ -1320,8 +1574,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       getLocalStream: () => screenStreamRef.current || localStreamRef.current,
       isVideoEnabled: () => isVideoOnRef.current,
       isMicEnabled: () => isMicOnRef.current,
-      shouldSendVideo: () => isVideoOnRef.current,
-      shouldSendAudio: () => wsRelayActiveRef.current && isMicOnRef.current,
+      shouldSendVideo: () => (wsRelayActiveRef.current || videoRelayForcedRef.current) && isVideoOnRef.current,
+      shouldSendAudio: () => (wsRelayActiveRef.current || audioRelayForcedRef.current) && isMicOnRef.current,
     });
     wsMediaSenderRef.current = sender;
     sender.start();
@@ -1332,7 +1586,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         wsMediaSenderRef.current = null;
       }
     };
-  }, [wsRelayActive, videoRelayForced, wsConnected, selfOnStage]);
+  }, [wsRelayActive, videoRelayForced, audioRelayForced, wsConnected, selfOnStage]);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1675,6 +1929,13 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     }
   };
 
+  const handleSwapZoomTarget = async (nextId: string) => {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen().catch(() => {});
+    }
+    setExpandedTileId(nextId);
+  };
+
   const handleToggleSelfFullscreen = async () => {
     if (document.fullscreenElement) {
       await document.exitFullscreen().catch(() => {});
@@ -1988,6 +2249,18 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     <RefreshCw className="w-4 h-4" />
                   </button>
                 </div>
+
+                {/* When Self tile is zoomed/expanded, display one remote participant in the bottom-right corner */}
+                {isSelfExpanded && stageRemotePeers[0] && (
+                  <PipCornerTile
+                    label={stageRemotePeers[0].baptismalName || stageRemotePeers[0].userName}
+                    stream={stageRemotePeers[0].stream}
+                    relayFrame={stageRemotePeers[0].relayFrame}
+                    isVideoOn={stageRemotePeers[0].isVideoOn}
+                    isMicOn={stageRemotePeers[0].isMicOn}
+                    onClick={() => handleSwapZoomTarget(stageRemotePeers[0].peerId)}
+                  />
+                )}
               </div>
 
               {/* REAL REMOTE CONNECTED PEERS */}
@@ -2006,6 +2279,18 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                   onUnlockAudio={unlockRemoteAudio}
                   onVideoHealthChange={handlePeerVideoHealthChange}
                   tallStage={true}
+                  pipCorner={
+                    expandedTileId === peer.peerId
+                      ? {
+                          label: `${user.baptismalName || user.fullName} (እኔ)`,
+                          stream: screenStreamRef.current || localStreamRef.current,
+                          isVideoOn: isVideoOn || isScreenSharing,
+                          isMicOn,
+                          mirror: !isScreenSharing && facingMode === 'user',
+                          onClick: () => handleSwapZoomTarget('self'),
+                        }
+                      : null
+                  }
                 />
               ))}
 
@@ -2050,6 +2335,14 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     onUnlockAudio={unlockRemoteAudio}
                     onVideoHealthChange={handlePeerVideoHealthChange}
                     tallStage={true}
+                    pipCorner={{
+                      label: `${user.baptismalName || user.fullName} (እኔ)`,
+                      stream: screenStreamRef.current || localStreamRef.current,
+                      isVideoOn: isVideoOn || isScreenSharing,
+                      isMicOn,
+                      mirror: !isScreenSharing && facingMode === 'user',
+                      onClick: () => handleSwapZoomTarget('self'),
+                    }}
                   />
                 ) : (
                   <div className="p-8 rounded-2xl bg-stone-900/60 border border-amber-800/40 text-center space-y-3 min-h-[420px] flex flex-col items-center justify-center">

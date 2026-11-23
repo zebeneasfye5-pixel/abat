@@ -55,7 +55,7 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
   const [prompt, setPrompt] = useState('');
   const [topic, setTopic] = useState(COUNSEL_TOPICS[0]);
   const [loading, setLoading] = useState(false);
-  const [conversation, setConversation] = useState<Array<{ role: 'user' | 'priest_ai'; text: string }>>([
+  const [conversation, setConversation] = useState<Array<{ role: 'user' | 'priest_ai'; text: string; isError?: boolean; retryQuestion?: string }>>([
     {
       role: 'priest_ai',
       text: `በእግዚአብሔር ስም ሰላም ለእናንተ ይሁን ${user.baptismalName || 'ልጄ'}። እኔ የቀሲስ ሄኖክ ሁለንተናዊ የኢትዮጵያ ኦርቶዶክስ ተዋሕዶ እውቀት እና የኤአይ ረዳት ነኝ። በመጽሐፍ ቅዱስ፣ በነገረ መለኮት፣ በምሥጢራተ ቤተክርስቲያን፣ በፍትሐ ነገሥት፣ በቅዱሳን ታሪክ፣ በቅዳሴ፣ በጾምና በንስሐ ዙሪያ ያለዎትን ማንኛውንም ጥያቄ ይጠይቁኝ — መልሱ በፍጥነት በቀጥታ ይታያል።`,
@@ -108,7 +108,7 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
     const controller = new AbortController();
     chatAbortRef.current = controller;
 
-    setConversation((prev) => [...prev, { role: 'user', text: q }, { role: 'priest_ai', text: '' }]);
+    setConversation((prev) => [...prev, { role: 'user', text: q }, { role: 'priest_ai', text: '', retryQuestion: q }]);
     if (!userQuestion) setPrompt('');
     setLoading(true);
 
@@ -136,6 +136,8 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
           copy[copy.length - 1] = {
             role: 'priest_ai',
             text: `⚠️ ${err?.message || 'ከኤአይ ሰርቨር ጋር መገናኘት አልተቻለም። እባክዎ የGEMINI_API_KEY መሞላቱን ያረጋግጡ።'}`,
+            isError: true,
+            retryQuestion: q,
           };
         }
         return copy;
@@ -362,6 +364,17 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
 
                   {msg.role === 'priest_ai' && msg.text && (
                     <div className="flex flex-wrap items-center gap-2 mt-3 pt-2.5 border-t border-stone-800/80 text-xs text-stone-300">
+                      {msg.isError && msg.retryQuestion && (
+                        <button
+                          type="button"
+                          onClick={() => handleAsk(msg.retryQuestion)}
+                          disabled={loading}
+                          className="px-3 py-1 rounded-lg bg-amber-600 hover:bg-amber-500 text-stone-950 flex items-center gap-1.5 transition font-extrabold"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>እንደገና ሞክር</span>
+                        </button>
+                      )}
                       <button
                         onClick={() => handleSpeech(msg.text)}
                         className="px-2 py-1 rounded-lg bg-stone-900 hover:bg-stone-800 hover:text-amber-200 flex items-center gap-1 transition font-bold"
@@ -562,6 +575,17 @@ export const SpiritualAIAdvisor: React.FC<SpiritualAIAdvisorProps> = ({ user }) 
 
                 {scriptureResult && (
                   <div className="flex flex-wrap items-center gap-2 text-xs">
+                    {scriptureResult.startsWith('⚠️') && scriptureQuery.trim().length >= 2 && (
+                      <button
+                        type="button"
+                        onClick={() => executeOrthodoxSearch(scriptureQuery, searchCategory)}
+                        disabled={scriptureLoading}
+                        className="py-2 px-3 rounded-xl bg-amber-600 hover:bg-amber-500 text-stone-950 font-extrabold inline-flex items-center justify-center gap-1.5 transition"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>እንደገና ሞክር</span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => handleShare(`ኦርቶዶክሳዊ እውቀት: ${scriptureQuery}`, scriptureResult, 'search-share')}

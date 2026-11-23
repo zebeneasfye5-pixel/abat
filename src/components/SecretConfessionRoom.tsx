@@ -7,6 +7,36 @@ import { playChurchBell, speakBlessingPrayer } from '../utils/audio';
 import { WsMediaAudioPlayer, WsMediaSender } from '../utils/wsMediaRelay';
 import sacredSanctuaryImg from '../assets/images/sacred_confession_sanctuary_1794468348510.jpg';
 
+function preferRobustOpusSdp(sdp?: string): string | undefined {
+  if (!sdp) return sdp;
+  const lines = sdp.split('\r\n');
+  const opusPt = lines
+    .map((line) => line.match(/^a=rtpmap:(\d+)\s+opus\/48000/i)?.[1])
+    .find(Boolean);
+  if (!opusPt) return sdp;
+
+  const fmtpPrefix = `a=fmtp:${opusPt} `;
+  let replaced = false;
+  const nextLines = lines.map((line) => {
+    if (line.startsWith(fmtpPrefix)) {
+      replaced = true;
+      let next = line;
+      if (!next.includes('useinbandfec=')) next += ';useinbandfec=1';
+      if (!next.includes('usedtx=')) next += ';usedtx=0';
+      if (!next.includes('maxaveragebitrate=')) next += ';maxaveragebitrate=48000';
+      return next;
+    }
+    return line;
+  });
+  if (!replaced) {
+    const idx = nextLines.findIndex((l) => l.startsWith(`a=rtpmap:${opusPt} `));
+    if (idx !== -1) {
+      nextLines.splice(idx + 1, 0, `${fmtpPrefix}minptime=10;useinbandfec=1;usedtx=0;maxaveragebitrate=48000`);
+    }
+  }
+  return nextLines.join('\r\n');
+}
+
 interface SecretConfessionRoomProps {
   user: UserProfile;
   bookings: ConfessionBooking[];
@@ -42,6 +72,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const [remoteIsVideoOn, setRemoteIsVideoOn] = useState<boolean>(true);
   const [wsRelayActive, setWsRelayActive] = useState(false);
   const [videoRelayForced, setVideoRelayForced] = useState(false);
+  const [audioRelayForced, setAudioRelayForced] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
 
@@ -69,6 +100,8 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const animationFrameRef = useRef<number | null>(null);
   const iceCandidatesQueue = useRef<RTCIceCandidateInit[]>([]);
   const remotePeerIdRef = useRef<string | null>(null);
+  const webrtcAudioFlowingRef = useRef<boolean>(false);
+  const inboundAudioStatsRef = useRef<{ bytes: number; stalledChecks: number }>({ bytes: 0, stalledChecks: 0 });
   const iceStateRef = useRef<string>(iceState);
   iceStateRef.current = iceState;
   const isMicOnRef = useRef(isMicOn);
@@ -77,6 +110,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   isVideoOnRef.current = isVideoOn;
   const wsRelayActiveRef = useRef(wsRelayActive);
   wsRelayActiveRef.current = wsRelayActive;
+  const videoRelayForcedRef = useRef(videoRelayForced);
+  videoRelayForcedRef.current = videoRelayForced;
+  const audioRelayForcedRef = useRef(audioRelayForced);
+  audioRelayForcedRef.current = audioRelayForced;
   const remoteVideoHasFramesRef = useRef(remoteVideoHasFrames);
   remoteVideoHasFramesRef.current = remoteVideoHasFrames;
   const remoteIsVideoOnRef = useRef(remoteIsVideoOn);
@@ -86,11 +123,25 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     wsAudioPlayerRef.current?.unlock().then((ok) => {
       if (ok) setAudioBlocked(false);
     });
-    wsMediaSenderRef.current?.ensureAudioCapture();
+    wsMediaSenderRef.current?.resumeAudio();
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume().catch(() => {});
+    }
     if (remoteAudioRef.current && remoteStreamRef.current) {
+      remoteAudioRef.current.muted = false;
       remoteAudioRef.current.play().then(() => setAudioBlocked(false)).catch(() => {});
     }
   };
+
+  useEffect(() => {
+    const onGesture = () => unlockSecretAudio();
+    window.addEventListener('pointerdown', onGesture, { passive: true, capture: true });
+    window.addEventListener('touchstart', onGesture, { passive: true, capture: true });
+    return () => {
+      window.removeEventListener('pointerdown', onGesture, true);
+      window.removeEventListener('touchstart', onGesture, true);
+    };
+  }, []);
 
   useEffect(() => {
     const onFsChange = () => {
@@ -137,7 +188,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       if (pcRef.current) {
         pcRef.current.close();
       }
-      const pc = new RTCPeerConnection(rtcConfig);
+      const pc = new RTCPeerConnection({
+        iceServers: rtcConfig.iceServers,
+        iceCandidatePoolSize: 4,
+      });
       pcRef.current = pc;
 
       const applyEncoderParams = (conn: RTCPeerConnection) => {
@@ -149,11 +203,15 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               params.encodings = [{}];
             }
             if (sender.track.kind === 'video') {
-              params.encodings[0].maxBitrate = 1_200_000;
-              params.encodings[0].maxFramerate = 30;
+              params.encodings[0].maxBitrate = 750_000;
+              params.encodings[0].maxFramerate = 24;
+              (params.encodings[0] as any).priority = 'low';
+              (params.encodings[0] as any).networkPriority = 'low';
               (params as any).degradationPreference = 'balanced';
             } else if (sender.track.kind === 'audio') {
-              params.encodings[0].maxBitrate = 96_000;
+              params.encodings[0].maxBitrate = 48_000;
+              (params.encodings[0] as any).priority = 'high';
+              (params.encodings[0] as any).networkPriority = 'high';
             }
             sender.setParameters(params).catch(() => {});
           });
@@ -395,6 +453,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setVideoRelayForced(true);
               return;
+            } else if (data.type === 'request-audio-relay') {
+              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              setAudioRelayForced(true);
+              return;
             } else if (data.type === 'ws-video-frame') {
               if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setRemoteRelayFrame(data.frame);
@@ -404,10 +466,11 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               return;
             } else if (data.type === 'ws-audio-chunk') {
               if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
-              const hasWebRtcAudio =
+              const hasVerifiedWebRtcAudio =
                 (iceStateRef.current === 'connected' || iceStateRef.current === 'completed') &&
-                Boolean(remoteStreamRef.current?.getAudioTracks().some((t) => t.readyState === 'live'));
-              if (!hasWebRtcAudio) {
+                webrtcAudioFlowingRef.current &&
+                Boolean(remoteStreamRef.current?.getAudioTracks().some((t) => t.readyState === 'live' && !t.muted));
+              if (!hasVerifiedWebRtcAudio) {
                 wsAudioPlayerRef.current?.playChunk(data.senderPeerId, data.pcm16, data.sr || 16000, false);
               }
               return;
@@ -417,22 +480,28 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               const target = data.existingPeers[0];
               if (target.peerId === selfPeerIdRef.current) return;
               remotePeerIdRef.current = target.peerId;
+              webrtcAudioFlowingRef.current = false;
+              inboundAudioStatsRef.current = { bytes: 0, stalledChecks: 0 };
               setRemoteUserName(target.baptismalName || target.userName);
               setRemoteIsVideoOn(target.isVideoOn !== false);
               const pc = createPC(rtcConfig, ws, target.peerId);
               const offer = await pc.createOffer();
-              await pc.setLocalDescription(offer);
+              const tunedSdp = preferRobustOpusSdp(offer.sdp);
+              const tunedOffer = tunedSdp ? { type: offer.type, sdp: tunedSdp } : offer;
+              await pc.setLocalDescription(tunedOffer);
               ws.send(
                 JSON.stringify({
                   type: 'webrtc-signal',
                   roomId,
                   targetPeerId: target.peerId,
-                  signal: { sdp: offer },
+                  signal: { sdp: tunedOffer },
                 })
               );
             } else if (data.type === 'peer-joined' && data.peer) {
               if (data.peer.peerId === selfPeerIdRef.current) return;
               remotePeerIdRef.current = data.peer.peerId;
+              webrtcAudioFlowingRef.current = false;
+              inboundAudioStatsRef.current = { bytes: 0, stalledChecks: 0 };
               setRemoteUserName(data.peer.baptismalName || data.peer.userName);
               setRemoteIsVideoOn(data.peer.isVideoOn !== false);
             } else if (data.type === 'peer-media-state' && data.peerId !== selfPeerIdRef.current) {
@@ -458,25 +527,29 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               if (signal.sdp) {
                 const isOffer = signal.sdp.type === 'offer';
                 const polite = selfPeerIdRef.current < (data.senderPeerId || '');
+                const tunedRemoteSdp = preferRobustOpusSdp(signal.sdp.sdp);
+                const remoteDesc = tunedRemoteSdp ? { type: signal.sdp.type, sdp: tunedRemoteSdp } : signal.sdp;
                 if (isOffer && pc.signalingState !== 'stable') {
                   if (!polite) return;
                   await Promise.all([
                     pc.setLocalDescription({ type: 'rollback' }),
-                    pc.setRemoteDescription(new RTCSessionDescription(signal.sdp)),
+                    pc.setRemoteDescription(new RTCSessionDescription(remoteDesc)),
                   ]);
                 } else {
-                  await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+                  await pc.setRemoteDescription(new RTCSessionDescription(remoteDesc));
                 }
                 await flushIce(pc);
                 if (isOffer) {
                   const answer = await pc.createAnswer();
-                  await pc.setLocalDescription(answer);
+                  const tunedAnswerSdp = preferRobustOpusSdp(answer.sdp);
+                  const tunedAnswer = tunedAnswerSdp ? { type: answer.type, sdp: tunedAnswerSdp } : answer;
+                  await pc.setLocalDescription(tunedAnswer);
                   ws.send(
                     JSON.stringify({
                       type: 'webrtc-signal',
                       roomId,
                       targetPeerId: data.senderPeerId,
-                      signal: { sdp: answer },
+                      signal: { sdp: tunedAnswer },
                     })
                   );
                 }
@@ -494,6 +567,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               setRemoteVideoHasFrames(false);
               setRemoteIsVideoOn(true);
               setVideoRelayForced(false);
+              setAudioRelayForced(false);
+              webrtcAudioFlowingRef.current = false;
+              inboundAudioStatsRef.current = { bytes: 0, stalledChecks: 0 };
               setIceState('waiting');
               remotePeerIdRef.current = null;
               remoteStreamRef.current = null;
@@ -553,6 +629,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     if (!isAuthenticated || !wsConnected) {
       setWsRelayActive(false);
       setVideoRelayForced(false);
+      setAudioRelayForced(false);
       return;
     }
     if (iceState === 'connected' || iceState === 'completed') {
@@ -569,7 +646,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     return () => clearTimeout(timer);
   }, [isAuthenticated, wsConnected, iceState]);
 
-  // Monitor decoded WebRTC video frames in Secret Room: trigger WS video relay if WebRTC audio works without video frames
+  // Monitor decoded WebRTC video frames AND real audio RTP byte counters in Secret Room
   useEffect(() => {
     if (!isAuthenticated || !wsConnected || !remoteUserConnected) return;
 
@@ -580,12 +657,16 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       if (vid && vid.paused && remoteStreamRef.current?.getVideoTracks().length) {
         vid.play().catch(() => {});
       }
+      if (remoteAudioRef.current && remoteAudioRef.current.paused && remoteStreamRef.current?.getAudioTracks().length) {
+        remoteAudioRef.current.play().then(() => setAudioBlocked(false)).catch(() => {});
+      }
     }, 600);
 
-    const relayFallbackTimer = window.setTimeout(async () => {
+    const checkMediaStats = async () => {
       const isConn = iceStateRef.current === 'connected' || iceStateRef.current === 'completed';
+      if (!isConn) return;
+
       if (
-        isConn &&
         !remoteVideoHasFramesRef.current &&
         remoteIsVideoOnRef.current &&
         wsRef.current?.readyState === WebSocket.OPEN &&
@@ -600,32 +681,77 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         );
       }
 
-      if (isConn && isVideoOnRef.current && pcRef.current) {
+      if (pcRef.current) {
         try {
           const stats = await pcRef.current.getStats();
-          let found = false;
-          let framesSent = 0;
+          let inboundAudioBytes = 0;
           stats.forEach((report) => {
-            if (report.type === 'outbound-rtp' && report.kind === 'video') {
-              found = true;
-              framesSent += report.framesSent || 0;
+            if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+              inboundAudioBytes += Number(report.bytesReceived || 0);
             }
           });
-          if (!found || framesSent === 0) {
-            setVideoRelayForced(true);
+          const prev = inboundAudioStatsRef.current;
+          if (inboundAudioBytes > prev.bytes) {
+            webrtcAudioFlowingRef.current = true;
+            inboundAudioStatsRef.current = { bytes: inboundAudioBytes, stalledChecks: 0 };
+          } else {
+            const nextStalls = prev.stalledChecks + 1;
+            inboundAudioStatsRef.current = { bytes: inboundAudioBytes, stalledChecks: nextStalls };
+            if ((inboundAudioBytes === 0 || nextStalls >= 2) && wsRef.current?.readyState === WebSocket.OPEN && remotePeerIdRef.current) {
+              webrtcAudioFlowingRef.current = false;
+              wsRef.current.send(
+                JSON.stringify({
+                  type: 'request-audio-relay',
+                  roomId,
+                  targetPeerId: remotePeerIdRef.current,
+                })
+              );
+            }
+          }
+
+          if (isMicOnRef.current) {
+            let audioFound = false;
+            let packetsSent = 0;
+            stats.forEach((report) => {
+              if (report.type === 'outbound-rtp' && report.kind === 'audio') {
+                audioFound = true;
+                packetsSent += Number(report.packetsSent || 0);
+              }
+            });
+            if (!audioFound || packetsSent === 0) {
+              setAudioRelayForced(true);
+            }
+          }
+
+          if (isVideoOnRef.current) {
+            let found = false;
+            let framesSent = 0;
+            stats.forEach((report) => {
+              if (report.type === 'outbound-rtp' && report.kind === 'video') {
+                found = true;
+                framesSent += Number(report.framesSent || 0);
+              }
+            });
+            if (!found || framesSent === 0) {
+              setVideoRelayForced(true);
+            }
           }
         } catch {}
       }
-    }, 3500);
+    };
+
+    const initialStatsTimer = window.setTimeout(checkMediaStats, 2500);
+    const intervalStatsTimer = window.setInterval(checkMediaStats, 3500);
 
     return () => {
       clearInterval(healthCheck);
-      clearTimeout(relayFallbackTimer);
+      clearTimeout(initialStatsTimer);
+      clearInterval(intervalStatsTimer);
     };
   }, [isAuthenticated, wsConnected, remoteUserConnected, roomId]);
 
   useEffect(() => {
-    const needsSender = (wsRelayActive || videoRelayForced) && wsConnected && Boolean(roomId);
+    const needsSender = (wsRelayActive || videoRelayForced || audioRelayForced) && wsConnected && Boolean(roomId);
     if (!needsSender) {
       wsMediaSenderRef.current?.stop();
       wsMediaSenderRef.current = null;
@@ -638,8 +764,8 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       getLocalStream: () => streamRef.current,
       isVideoEnabled: () => isVideoOnRef.current,
       isMicEnabled: () => isMicOnRef.current,
-      shouldSendVideo: () => isVideoOnRef.current,
-      shouldSendAudio: () => wsRelayActiveRef.current && isMicOnRef.current,
+      shouldSendVideo: () => (wsRelayActiveRef.current || videoRelayForcedRef.current) && isVideoOnRef.current,
+      shouldSendAudio: () => (wsRelayActiveRef.current || audioRelayForcedRef.current) && isMicOnRef.current,
     });
     wsMediaSenderRef.current = sender;
     sender.start();
@@ -649,7 +775,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         wsMediaSenderRef.current = null;
       }
     };
-  }, [wsRelayActive, videoRelayForced, wsConnected, roomId]);
+  }, [wsRelayActive, videoRelayForced, audioRelayForced, wsConnected, roomId]);
 
   const handleRequestSecretMedia = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {

@@ -280,8 +280,14 @@ export async function logoutUser(): Promise<void> {
 }
 
 export async function fetchRegisteredUsers(): Promise<UserProfile[]> {
+  const token = getAuthToken();
+  if (!token) return [];
   try {
-    const data = await safeFetchJson<{ users: UserProfile[] }>('/api/users', {}, 12000);
+    const data = await safeFetchJson<{ users: UserProfile[] }>(
+      '/api/users',
+      { headers: { Authorization: `Bearer ${token}` } },
+      12000
+    );
     return data.users || [];
   } catch {
     return [];
@@ -550,8 +556,14 @@ export async function fetchLiveKitToken(
 
 // --- 4. CONFESSIONS & SECRET ROOM API ---
 export async function fetchConfessions(): Promise<ConfessionBooking[]> {
+  const token = getAuthToken();
+  if (!token) return [];
   try {
-    const data = await safeFetchJson<{ bookings: ConfessionBooking[] }>('/api/confessions', {}, 12000);
+    const data = await safeFetchJson<{ bookings: ConfessionBooking[] }>(
+      '/api/confessions',
+      { headers: { Authorization: `Bearer ${token}` } },
+      12000
+    );
     return data.bookings || [];
   } catch {
     return [];
@@ -740,4 +752,44 @@ export async function saveBankAccountConfig(payload: {
     userBankAccount: res.userBankAccount,
   });
   return res;
+}
+
+// --- 6. ADMIN / PRIEST DATABASE BACKUP & RESTORE API ---
+export async function exportDatabaseBackup(): Promise<Record<string, any>> {
+  const token = getAuthToken();
+  if (!token) {
+    throw new Error('የዳታቤዝ ባክአፕ ለማውረድ በቀሲስ/አስተዳዳሪ አካውንት መግባት ያስፈልጋል።');
+  }
+  return safeFetchJson<Record<string, any>>(
+    '/api/admin/export-db',
+    {
+      headers: { Authorization: `Bearer ${token}` },
+    },
+    20000
+  );
+}
+
+export async function importDatabaseBackup(backupData: Record<string, any>): Promise<{
+  success: boolean;
+  counts: { users: number; confessionBookings: number; walletTransactions: number; contacts: number };
+}> {
+  const token = getAuthToken();
+  if (!token) {
+    throw new Error('ዳታቤዝ ለመመለስ በቀሲስ/አስተዳዳሪ አካውንት መግባት ያስፈልጋል።');
+  }
+  return safeFetchJson<{
+    success: boolean;
+    counts: { users: number; confessionBookings: number; walletTransactions: number; contacts: number };
+  }>(
+    '/api/admin/import-db',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(backupData),
+    },
+    25000
+  );
 }

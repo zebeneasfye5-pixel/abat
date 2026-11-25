@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { X, ArrowLeft, Users, Calendar, Mic, Wallet, Shield, KeyRound, User, Save } from 'lucide-react';
-import { ConfessionBooking, WalletState, WalletTransaction, UserProfile, UserRole } from '../types';
-import { fetchRegisteredUsers, updateUserProfile } from '../services/api';
+import React, { useState, useEffect, useRef } from 'react';
+import { X, ArrowLeft, Users, Calendar, Mic, Wallet, Shield, KeyRound, User, Save, Download, Upload, CheckCircle2, AlertCircle } from 'lucide-react';
+import { ConfessionBooking, WalletState, WalletTransaction, UserProfile } from '../types';
+import { fetchRegisteredUsers, updateUserProfile, exportDatabaseBackup, importDatabaseBackup } from '../services/api';
 
 interface SuperDashboardDrawerProps {
   isOpen: boolean;
@@ -13,6 +13,7 @@ interface SuperDashboardDrawerProps {
   currentUser: UserProfile;
   onUpdateUser?: (updated: UserProfile) => void;
   onOpenAuthModal?: () => void;
+  onDataRestored?: () => void;
 }
 
 export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
@@ -25,6 +26,7 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
   currentUser,
   onUpdateUser,
   onOpenAuthModal,
+  onDataRestored,
 }) => {
   const [activeTab, setActiveTab] = useState<'profile' | 'children' | 'confessions' | 'assembly_control' | 'wallet_audit' | 'system'>('profile');
 
@@ -39,12 +41,24 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
   });
   const [profileSaved, setProfileSaved] = useState(false);
 
-  // Real registered users loaded from server
+  // Real registered users loaded from server (priest/admin only)
   const [registeredUsers, setRegisteredUsers] = useState<UserProfile[]>([]);
+  const [systemStatus, setSystemStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [assemblyNotice, setAssemblyNotice] = useState<string | null>(null);
+  const [isBackupBusy, setIsBackupBusy] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const isPriestOrAdmin = currentUser.isAuthenticated && (currentUser.role === 'priest' || currentUser.role === 'admin');
 
   useEffect(() => {
     if (isOpen) {
-      fetchRegisteredUsers().then(setRegisteredUsers);
+      if (isPriestOrAdmin) {
+        fetchRegisteredUsers().then(setRegisteredUsers);
+      } else {
+        setRegisteredUsers([]);
+      }
+      setSystemStatus(null);
+      setAssemblyNotice(null);
       setProfileForm({
         fullName: currentUser.fullName || '',
         baptismalName: currentUser.baptismalName || '',
@@ -75,6 +89,64 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
       setTimeout(() => setProfileSaved(false), 2000);
     } catch {
       if (onOpenAuthModal) onOpenAuthModal();
+    }
+  };
+
+  const handleExportBackup = async () => {
+    setSystemStatus(null);
+    setIsBackupBusy(true);
+    try {
+      const backupPayload = await exportDatabaseBackup();
+      const jsonText = JSON.stringify(backupPayload, null, 2);
+      const blob = new Blob([jsonText], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `qesis-henok-backup-${dateStr}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+      setSystemStatus({
+        type: 'success',
+        message: 'ሙሉ የዳታቤዝ ባክአፕ (JSON) በስኬት ወርዷል።',
+      });
+    } catch (err: any) {
+      setSystemStatus({
+        type: 'error',
+        message: err?.message || 'ባክአፕ ማውረድ አልተቻለም።',
+      });
+    } finally {
+      setIsBackupBusy(false);
+    }
+  };
+
+  const handleImportBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    setSystemStatus(null);
+    setIsBackupBusy(true);
+    try {
+      const rawText = await file.text();
+      const parsed = JSON.parse(rawText);
+      const result = await importDatabaseBackup(parsed);
+      const refreshedUsers = await fetchRegisteredUsers();
+      setRegisteredUsers(refreshedUsers);
+      if (onDataRestored) onDataRestored();
+      setSystemStatus({
+        type: 'success',
+        message: `ዳታቤዙ በስኬት ተመልሷል (${result.counts.users} ተጠቃሚዎች፣ ${result.counts.confessionBookings} ቀጠሮዎች፣ ${result.counts.walletTransactions} የዋሌት ዝውውሮች)።`,
+      });
+    } catch (err: any) {
+      setSystemStatus({
+        type: 'error',
+        message: err?.message || 'የተመረጠው የJSON ፋይል ትክክለኛ አይደለም ወይም መመለስ አልተቻለም።',
+      });
+    } finally {
+      setIsBackupBusy(false);
     }
   };
 
@@ -367,7 +439,7 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
                   <p className="text-xs font-semibold text-stone-200">የአጠቃላይ አዳራሽ ማይክሮፎኖች (Global Mute)</p>
                   <p className="text-[11px] text-stone-400">አላስፈላጊ የድምፅ ረብሻ እንዳይኖር ሁሉንም ተሳታፊዎች በአንድ ጊዜ ዝጋ</p>
                   <button
-                    onClick={() => alert('ሁሉም የማይክሮፎን ድምጾች በዋናው መቆጣጠሪያ ተዘግተዋል (All Muted)!')}
+                    onClick={() => setAssemblyNotice('ሁሉም የማይክሮፎን ድምጾች በዋናው መቆጣጠሪያ ተዘግተዋል (All Muted)!')}
                     className="w-full py-2 rounded-lg bg-red-950 hover:bg-red-900 border border-red-700 text-red-200 text-xs font-medium transition"
                   >
                     ሁሉንም ማይኮች ዝጋ (Mute All)
@@ -378,13 +450,19 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
                   <p className="text-xs font-semibold text-stone-200">የቀጥታ ስርጭት ጥራት (HD Streaming)</p>
                   <p className="text-[11px] text-stone-400">ከፍተኛ ጥራት ያለው 1080p ቪዲዮ እና ዝቅተኛ የኔትወርክ ፍጆታ</p>
                   <button
-                    onClick={() => alert('የስርጭት ፍጥነት ወደ ሱፐር ፋስት (Low-Latency) ተቀይሯል')}
+                    onClick={() => setAssemblyNotice('የስርጭት ፍጥነት ወደ ሱፐር ፋስት (Low-Latency) ተቀይሯል')}
                     className="w-full py-2 rounded-lg bg-amber-950 hover:bg-amber-900 border border-amber-700 text-amber-200 text-xs font-medium transition"
                   >
                     ፈጣን የስርጭት ሞድ (Ultra Fast)
                   </button>
                 </div>
               </div>
+              {assemblyNotice && (
+                <div className="p-3 rounded-xl bg-emerald-950/60 border border-emerald-700/60 text-emerald-200 text-xs flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>{assemblyNotice}</span>
+                </div>
+              )}
             </div>
           )}
 
@@ -443,8 +521,8 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
           {activeTab === 'system' && (
             <div className="space-y-4">
               <div>
-                <h3 className="text-sm font-semibold text-amber-200">የስርዓት ደህንነትና የኦፍላይን ዳታቤዝ</h3>
-                <p className="text-xs text-stone-400">የመተግበሪያው ቅንብሮችና የተሸጎጡ ፋይሎች</p>
+                <h3 className="text-sm font-semibold text-amber-200">የስርዓት ደህንነትና የዳታቤዝ ባክአፕ</h3>
+                <p className="text-xs text-stone-400">የመተግበሪያው ቅንብሮች፣ ባክአፕ እና መልሶ ማግኛ</p>
               </div>
 
               <div className="p-4 rounded-xl bg-stone-900/60 border border-stone-800 space-y-3 text-xs">
@@ -462,14 +540,71 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
                 </div>
                 <div className="flex justify-between items-center">
                   <span className="text-stone-300">የኤአይ ረዳት ሞዴል፡</span>
-                  <span className="text-amber-200">Gemini 4 Hydrogen (Server-Side)</span>
+                  <span className="text-amber-200">Gemini 2.5 Flash (Server-Side)</span>
                 </div>
+
+                {isPriestOrAdmin && (
+                  <div className="pt-3 border-t border-stone-800 space-y-2.5">
+                    <div>
+                      <p className="font-semibold text-amber-200">የRender ዳታቤዝ ባክአፕ እና መልሶ ማግኛ (Backup & Restore)</p>
+                      <p className="text-[11px] text-stone-400">
+                        ሰርቨሩ እንደገና ሲጫን (Redeploy) የተጠቃሚዎች፣ የቀጠሮዎች እና የዋሌት መረጃ እንዳይጠፋ ሙሉ JSON ባክአፕ ያውርዱ ወይም ይመልሱ።
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        disabled={isBackupBusy}
+                        onClick={handleExportBackup}
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-amber-900/70 hover:bg-amber-900 border border-amber-600/60 text-amber-100 font-semibold transition disabled:opacity-50"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>{isBackupBusy ? 'በመሥራት ላይ...' : 'ሙሉ ባክአፕ አውርድ (Export JSON)'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={isBackupBusy}
+                        onClick={() => fileInputRef.current?.click()}
+                        className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-700/60 text-emerald-200 font-semibold transition disabled:opacity-50"
+                      >
+                        <Upload className="w-3.5 h-3.5" />
+                        <span>ባክአፕ መልስ (Import JSON)</span>
+                      </button>
+
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept=".json,application/json"
+                        onChange={handleImportBackupFile}
+                        className="hidden"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {systemStatus && (
+                  <div
+                    className={`p-3 rounded-xl border text-xs flex items-start gap-2 ${
+                      systemStatus.type === 'success'
+                        ? 'bg-emerald-950/70 border-emerald-700/60 text-emerald-200'
+                        : 'bg-red-950/70 border-red-700/60 text-red-200'
+                    }`}
+                  >
+                    {systemStatus.type === 'success' ? (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                    )}
+                    <span>{systemStatus.message}</span>
+                  </div>
+                )}
 
                 <div className="pt-3 border-t border-stone-800 flex gap-2">
                   <button
                     onClick={() => {
                       localStorage.clear();
-                      alert('የስልኩ ካሽ ጸድቷል (Cache Cleared)');
+                      setSystemStatus({ type: 'success', message: 'የስልኩ ካሽ ጸድቷል (Cache Cleared)' });
                     }}
                     className="px-3 py-1.5 rounded-lg bg-stone-900 hover:bg-stone-800 border border-stone-700 text-stone-300 transition"
                   >

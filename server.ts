@@ -1,7 +1,7 @@
 import express, { Request, Response } from 'express';
 import http from 'http';
 import dotenv from 'dotenv';
-import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
@@ -17,7 +17,7 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Enable CORS so separate frontend hosts (e.g., Vercel) can talk to this Render backend when VITE_API_URL is set
 app.use((req: Request, res: Response, next) => {
@@ -209,10 +209,22 @@ function saveDatabase() {
   }
 }
 
-// Deterministic server signing secret so tokens & account recovery tokens survive Render restarts/redeploys
+const RUNTIME_EPHEMERAL_SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+let warnedMissingSessionSecret = false;
+
+// Require SESSION_SECRET in production; fall back to an ephemeral in-memory random secret with a clear warning if unset
 function getSessionSecret(): string {
-  const seed = process.env.SESSION_SECRET || process.env.PRIEST_SECRET_CODE || 'qesis-henok-orthodox-permanent-seed';
-  return crypto.createHash('sha256').update(`qh-auth-v1:${seed}`).digest('hex');
+  const envSecret = process.env.SESSION_SECRET?.trim();
+  if (!envSecret) {
+    if (!warnedMissingSessionSecret) {
+      warnedMissingSessionSecret = true;
+      console.warn(
+        '[SECURITY WARNING] SESSION_SECRET environment variable is not configured. Using an ephemeral in-memory secret; tokens will invalidate on restart.'
+      );
+    }
+    return crypto.createHash('sha256').update(`qh-auth-v1:${RUNTIME_EPHEMERAL_SESSION_SECRET}`).digest('hex');
+  }
+  return crypto.createHash('sha256').update(`qh-auth-v1:${envSecret}`).digest('hex');
 }
 
 function signPayload(payloadObj: object): string {
@@ -402,11 +414,9 @@ const ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION = `
 - አላስፈላጊ ረጅም መግቢያ ሳትዘረጋ በቀጥታ ዋናውን ትምህርት፣ ማስረጃ (ጥቅስ/አበው/ቀኖና) እና ተግባራዊ መመሪያ አቅርብ።
 `;
 
-const GEMINI_MODEL_CANDIDATES: Array<{ model: string; thinkingLevel?: ThinkingLevel }> = [
-  { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW },
-  { model: 'gemini-3.1-flash-lite' },
-  { model: 'gemini-4-hydrogen' },
-  { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL },
+const GEMINI_MODEL_CANDIDATES: Array<{ model: string }> = [
+  { model: 'gemini-2.5-flash' },
+  { model: 'gemini-2.5-flash-lite' },
 ];
 
 function sleepMs(ms: number): Promise<void> {
@@ -464,12 +474,8 @@ function formatReadableGeminiError(error: any): string {
   return 'የኤአይ አገልግሎት ጊዜያዊ መቋረጥ አጋጥሞታል፤ እባክዎ ከጥቂት ሰከንዶች በኋላ እንደገና ይሞክሩ።';
 }
 
-function buildGeminiConfig(systemInstruction: string, thinkingLevel?: ThinkingLevel) {
-  const config: Record<string, any> = { systemInstruction };
-  if (thinkingLevel) {
-    config.thinkingConfig = { thinkingLevel };
-  }
-  return config;
+function buildGeminiConfig(systemInstruction: string) {
+  return { systemInstruction };
 }
 
 async function generateWithGemini(prompt: string, systemInstruction: string, cacheKey?: string): Promise<string> {
@@ -492,7 +498,7 @@ async function generateWithGemini(prompt: string, systemInstruction: string, cac
       const response = await ai.models.generateContent({
         model: candidate.model,
         contents: prompt,
-        config: buildGeminiConfig(systemInstruction, candidate.thinkingLevel),
+        config: buildGeminiConfig(systemInstruction),
       });
 
       const text = response.text?.trim();
@@ -555,7 +561,7 @@ async function streamWithGemini(
         const stream = await ai.models.generateContentStream({
           model: candidate.model,
           contents: prompt,
-          config: buildGeminiConfig(systemInstruction, candidate.thinkingLevel),
+          config: buildGeminiConfig(systemInstruction),
         });
 
         let fullText = '';
@@ -713,13 +719,22 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
   }
 
   let finalRole: StoredUser['role'] = 'child';
-  if (role === 'priest' || role === 'deacon') {
-    // Allow priest registration cleanly when priest verification code matches (or default 777)
-    if (role === 'priest' && priestCode && priestCode !== '777' && priestCode !== (process.env.PRIEST_SECRET_CODE || '777')) {
+  if (role === 'priest') {
+    const expectedPriestCode = process.env.PRIEST_SECRET_CODE?.trim();
+    if (!expectedPriestCode) {
+      res.status(403).json({ error: 'የቀሲስ ምዝገባ ሚስጥር ኮድ በሰርቨሩ ላይ አልተዋቀረም።' });
+      return;
+    }
+    const providedCode = typeof priestCode === 'string' ? priestCode.trim() : '';
+    const expectedBuf = Buffer.from(expectedPriestCode);
+    const providedBuf = Buffer.from(providedCode);
+    if (!providedCode || expectedBuf.length !== providedBuf.length || !crypto.timingSafeEqual(expectedBuf, providedBuf)) {
       res.status(403).json({ error: 'የቀሲስ/የአስተዳዳሪ ማረጋገጫ ኮድ የተሳሳተ ነው።' });
       return;
     }
-    finalRole = role;
+    finalRole = 'priest';
+  } else if (role === 'deacon') {
+    finalRole = 'deacon';
   }
 
   const { hash, salt } = hashPassword(String(password));
@@ -878,7 +893,16 @@ app.post('/api/auth/logout', (req: Request, res: Response) => {
   res.json({ success: true });
 });
 
-app.get('/api/users', (_req: Request, res: Response) => {
+app.get('/api/users', (req: Request, res: Response) => {
+  const user = getAuthenticatedUser(req);
+  if (!user) {
+    res.status(401).json({ error: 'ያልተረጋገጠ ክፍለ ጊዜ (Unauthenticated)' });
+    return;
+  }
+  if (user.role !== 'priest' && user.role !== 'admin') {
+    res.status(403).json({ error: 'የተጠቃሚዎችን ዝርዝር ለማየት የቀሲስ ወይም የአስተዳዳሪ ፈቃድ ያስፈልጋል።' });
+    return;
+  }
   res.json({
     users: db.users.map(sanitizeUser),
   });
@@ -1064,7 +1088,16 @@ app.delete('/api/community/contacts/:id', (req: Request, res: Response) => {
 });
 
 // --- 3. CONFESSION BOOKINGS & SECRET ROOM ENDPOINTS ---
-app.get('/api/confessions', (_req: Request, res: Response) => {
+app.get('/api/confessions', (req: Request, res: Response) => {
+  const user = getAuthenticatedUser(req);
+  if (!user) {
+    res.status(401).json({ error: 'ያልተረጋገጠ ክፍለ ጊዜ (Unauthenticated)' });
+    return;
+  }
+  if (user.role !== 'priest' && user.role !== 'admin') {
+    res.status(403).json({ error: 'የንስሐ ቀጠሮዎችን ሙሉ ዝርዝር ለማየት የቀሲስ ወይም የአስተዳዳሪ ፈቃድ ያስፈልጋል።' });
+    return;
+  }
   res.json({ bookings: db.confessionBookings });
 });
 
@@ -1265,6 +1298,207 @@ app.post('/api/wallet/withdraw', (req: Request, res: Response) => {
   saveDatabase();
 
   res.status(201).json({ success: true, transaction: newTx, newBalance: db.walletBalance });
+});
+
+// --- 4B. ADMIN / PRIEST DATABASE BACKUP & RESTORE ENDPOINTS ---
+function requirePriestOrAdmin(req: Request, res: Response): StoredUser | null {
+  const user = getAuthenticatedUser(req);
+  if (!user) {
+    res.status(401).json({ error: 'ያልተረጋገጠ ክፍለ ጊዜ (Unauthenticated)' });
+    return null;
+  }
+  if (user.role !== 'priest' && user.role !== 'admin') {
+    res.status(403).json({ error: 'ይህን ተግባር ለመፈጸም የቀሲስ ወይም የአስተዳዳሪ ፈቃድ ያስፈልጋል።' });
+    return null;
+  }
+  return user;
+}
+
+app.get('/api/admin/export-db', (req: Request, res: Response) => {
+  const adminUser = requirePriestOrAdmin(req, res);
+  if (!adminUser) return;
+
+  const exportedAt = new Date().toISOString();
+  res.json({
+    exportedAt,
+    version: 1,
+    exportedBy: adminUser.baptismalName || adminUser.fullName,
+    data: {
+      users: db.users,
+      confessionBookings: db.confessionBookings,
+      walletBalance: db.walletBalance,
+      walletTransactions: db.walletTransactions,
+      userBankAccounts: db.userBankAccounts,
+      ministryBanks: db.ministryBanks,
+      communityStats: db.communityStats,
+      contacts: db.contacts,
+    },
+  });
+});
+
+app.post('/api/admin/import-db', (req: Request, res: Response) => {
+  const adminUser = requirePriestOrAdmin(req, res);
+  if (!adminUser) return;
+
+  const rawBody = req.body;
+  if (!rawBody || typeof rawBody !== 'object') {
+    res.status(400).json({ error: 'ትክክለኛ የJSON ባክአፕ ፋይል አልቀረበም።' });
+    return;
+  }
+
+  const payload = rawBody.data && typeof rawBody.data === 'object' ? rawBody.data : rawBody;
+
+  const hasValidUsers = Array.isArray(payload.users);
+  const hasValidBookings = Array.isArray(payload.confessionBookings);
+  const hasValidTransactions = Array.isArray(payload.walletTransactions);
+  const hasValidWalletBalance = payload.walletBalance && typeof payload.walletBalance === 'object';
+
+  if (!hasValidUsers && !hasValidBookings && !hasValidTransactions && !hasValidWalletBalance) {
+    res.status(400).json({ error: 'የቀረበው ፋይል የሚታወቅ የቀሲስ ሄኖክ ዳታቤዝ መረጃ (users, bookings, wallet) አልያዘም።' });
+    return;
+  }
+
+  if (hasValidUsers) {
+    const validUsers: StoredUser[] = payload.users
+      .filter((u: any) => u && typeof u === 'object' && typeof u.id === 'string' && typeof u.phone === 'string')
+      .map((u: any) => ({
+        id: String(u.id),
+        fullName: String(u.fullName || 'ተጠቃሚ'),
+        baptismalName: String(u.baptismalName || u.fullName || 'ተጠቃሚ'),
+        phone: String(u.phone),
+        email: String(u.email || ''),
+        passwordHash: String(u.passwordHash || ''),
+        passwordSalt: String(u.passwordSalt || ''),
+        role: (['child', 'priest', 'deacon', 'admin'].includes(u.role) ? u.role : 'child') as StoredUser['role'],
+        confessorPriest: String(u.confessorPriest || 'ቀሲስ ሄኖክ'),
+        confessionStage: (['ጀማሪ', 'መካከለኛ', 'የበረታ/የቆረበ'].includes(u.confessionStage)
+          ? u.confessionStage
+          : 'ጀማሪ') as StoredUser['confessionStage'],
+        avatarSeed: String(u.avatarSeed || u.baptismalName || 'QH'),
+        createdAt: String(u.createdAt || new Date().toISOString()),
+      }));
+    // Keep the currently authenticated admin/priest record intact so the active session is never locked out
+    const adminPresent = validUsers.some((u) => u.id === adminUser.id || u.phone === adminUser.phone);
+    if (!adminPresent) {
+      validUsers.push(adminUser);
+    }
+    db.users = validUsers;
+  }
+
+  if (hasValidBookings) {
+    db.confessionBookings = payload.confessionBookings
+      .filter((b: any) => b && typeof b === 'object' && typeof b.id === 'string')
+      .map((b: any) => ({
+        id: String(b.id),
+        childName: String(b.childName || ''),
+        baptismalName: String(b.baptismalName || 'የንስሐ ልጅ'),
+        phone: String(b.phone || ''),
+        date: String(b.date || ''),
+        time: String(b.time || ''),
+        status: (['pending', 'confirmed', 'completed', 'cancelled'].includes(b.status)
+          ? b.status
+          : 'pending') as ConfessionSlot['status'],
+        penanceNotes: b.penanceNotes !== undefined ? String(b.penanceNotes) : undefined,
+        secretPasscode: String(b.secretPasscode || '0000'),
+      }));
+  }
+
+  if (hasValidWalletBalance) {
+    db.walletBalance = {
+      totalBalance: Number(payload.walletBalance.totalBalance || 0),
+      tithes: Number(payload.walletBalance.tithes || 0),
+      charity: Number(payload.walletBalance.charity || 0),
+      churchSupport: Number(payload.walletBalance.churchSupport || 0),
+      withdrawnTotal: Number(payload.walletBalance.withdrawnTotal || 0),
+    };
+  }
+
+  if (hasValidTransactions) {
+    db.walletTransactions = payload.walletTransactions
+      .filter((t: any) => t && typeof t === 'object' && typeof t.id === 'string')
+      .map((t: any) => ({
+        id: String(t.id),
+        userId: String(t.userId || 'usr-member'),
+        userName: String(t.userName || 'ተጠቃሚ'),
+        type: (['tithe', 'charity', 'service_support', 'deposit', 'withdrawal'].includes(t.type)
+          ? t.type
+          : 'deposit') as WalletTx['type'],
+        amount: Number(t.amount || 0),
+        timestamp: String(t.timestamp || ''),
+        paymentMethod: (['telebirr', 'cbe_birr', 'chapa', 'bank_transfer', 'spiritual_wallet'].includes(t.paymentMethod)
+          ? t.paymentMethod
+          : 'bank_transfer') as WalletTx['paymentMethod'],
+        status: (['completed', 'pending'].includes(t.status) ? t.status : 'completed') as WalletTx['status'],
+        receiptNumber: String(t.receiptNumber || ''),
+        purposeNote: String(t.purposeNote || ''),
+        bankName: t.bankName ? String(t.bankName) : undefined,
+        accountNumber: t.accountNumber ? String(t.accountNumber) : undefined,
+        accountHolderName: t.accountHolderName ? String(t.accountHolderName) : undefined,
+        referenceNumber: t.referenceNumber ? String(t.referenceNumber) : undefined,
+      }));
+  }
+
+  if (payload.userBankAccounts && typeof payload.userBankAccounts === 'object' && !Array.isArray(payload.userBankAccounts)) {
+    const cleanAccounts: Record<string, BankAccountRecord> = {};
+    for (const [k, v] of Object.entries(payload.userBankAccounts)) {
+      if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+      if (v && typeof v === 'object') {
+        const rec = v as any;
+        cleanAccounts[k] = {
+          bankName: String(rec.bankName || ''),
+          accountHolderName: String(rec.accountHolderName || ''),
+          accountNumber: String(rec.accountNumber || ''),
+          branchName: rec.branchName ? String(rec.branchName) : undefined,
+          telebirrPhone: rec.telebirrPhone ? String(rec.telebirrPhone) : undefined,
+        };
+      }
+    }
+    db.userBankAccounts = cleanAccounts;
+  }
+
+  if (payload.ministryBanks && typeof payload.ministryBanks === 'object') {
+    db.ministryBanks = {
+      cbeAccount: String(payload.ministryBanks.cbeAccount ?? db.ministryBanks.cbeAccount),
+      cbeHolder: String(payload.ministryBanks.cbeHolder ?? db.ministryBanks.cbeHolder),
+      telebirrPhone: String(payload.ministryBanks.telebirrPhone ?? db.ministryBanks.telebirrPhone),
+      telebirrName: String(payload.ministryBanks.telebirrName ?? db.ministryBanks.telebirrName),
+      awashAccount: String(payload.ministryBanks.awashAccount ?? db.ministryBanks.awashAccount),
+      dashenAccount: String(payload.ministryBanks.dashenAccount ?? db.ministryBanks.dashenAccount),
+      abyssiniaAccount: String(payload.ministryBanks.abyssiniaAccount ?? db.ministryBanks.abyssiniaAccount),
+    };
+  }
+
+  if (payload.communityStats && typeof payload.communityStats === 'object') {
+    db.communityStats = {
+      likesCount: Number(payload.communityStats.likesCount ?? db.communityStats.likesCount),
+      sharesCount: Number(payload.communityStats.sharesCount ?? db.communityStats.sharesCount),
+    };
+  }
+
+  if (Array.isArray(payload.contacts)) {
+    db.contacts = payload.contacts
+      .filter((c: any) => c && typeof c === 'object' && typeof c.id === 'string')
+      .map((c: any) => ({
+        id: String(c.id),
+        name: String(c.name || ''),
+        phone: String(c.phone || ''),
+        addedBy: String(c.addedBy || 'አባል'),
+        invitedAt: String(c.invitedAt || ''),
+        note: c.note ? String(c.note) : undefined,
+      }));
+  }
+
+  saveDatabase();
+
+  res.json({
+    success: true,
+    counts: {
+      users: db.users.length,
+      confessionBookings: db.confessionBookings.length,
+      walletTransactions: db.walletTransactions.length,
+      contacts: db.contacts.length,
+    },
+  });
 });
 
 // --- 5. HIGH-SCALE ANTI-CONGESTION WEBSOCKET SIGNALING & RELAY SERVER ---

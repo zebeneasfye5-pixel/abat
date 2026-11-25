@@ -149,8 +149,7 @@ export default function App() {
     };
   }, []);
 
-  // Only load bookings and wallet data when the user is signed in
-  useEffect(() => {
+  const refreshProtectedData = useCallback(() => {
     if (!user.isAuthenticated) return;
     fetchConfessions().then(setBookings);
     fetchWalletData().then((data) => {
@@ -159,7 +158,12 @@ export default function App() {
       if (data.ministryBanks) setMinistryBanks(data.ministryBanks);
       if (data.userBankAccount !== undefined) setUserBankAccount(data.userBankAccount);
     });
-  }, [user.isAuthenticated]);
+  }, [user.isAuthenticated, user.role]);
+
+  // Only load bookings and wallet data when the user is signed in
+  useEffect(() => {
+    refreshProtectedData();
+  }, [refreshProtectedData]);
 
   // Browser Hardware/Chrome Back Button (`popstate`) Integration
   useEffect(() => {
@@ -654,6 +658,7 @@ export default function App() {
             currentUser={user}
             onUpdateUser={handleUpdateUser}
             onOpenAuthModal={() => setIsAuthModalOpen(true)}
+            onDataRestored={refreshProtectedData}
           />
         )}
 

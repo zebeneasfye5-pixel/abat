@@ -107,6 +107,21 @@ interface ContactRecord {
   note?: string;
 }
 
+interface MemberDirectoryRecord {
+  id: string;
+  secularName: string;
+  spiritualName: string;
+  phone: string;
+  email: string;
+  role: StoredUser['role'];
+  confessorPriest: string;
+  confessionStage: string;
+  sources: string[];
+  confessionCount: number;
+  walletTotalGiven: number;
+  lastUpdatedAt: string;
+}
+
 interface DatabaseSchema {
   users: StoredUser[];
   sessions: Record<string, string>; // token -> userId
@@ -126,6 +141,8 @@ interface DatabaseSchema {
     sharesCount: number;
   };
   contacts: ContactRecord[];
+  memberDirectory: MemberDirectoryRecord[];
+  memberDirectoryUpdatedAt?: string;
   aiCache?: Record<string, string>;
 }
 
@@ -166,6 +183,8 @@ function loadDatabase(): DatabaseSchema {
           sharesCount: Number(parsed.communityStats?.sharesCount ?? 0),
         },
         contacts: Array.isArray(parsed.contacts) ? parsed.contacts : [],
+        memberDirectory: Array.isArray(parsed.memberDirectory) ? parsed.memberDirectory : [],
+        memberDirectoryUpdatedAt: typeof parsed.memberDirectoryUpdatedAt === 'string' ? parsed.memberDirectoryUpdatedAt : undefined,
         aiCache: parsed.aiCache && typeof parsed.aiCache === 'object' ? parsed.aiCache : {},
       };
     }
@@ -192,14 +211,184 @@ function loadDatabase(): DatabaseSchema {
       sharesCount: 0,
     },
     contacts: [],
+    memberDirectory: [],
+    memberDirectoryUpdatedAt: undefined,
     aiCache: {},
   };
 }
 
+function normalizePhoneLookupKey(phone: string): string {
+  const clean = String(phone || '').replace(/[\s\-()]+/g, '').trim();
+  if (!clean) return '';
+  if (clean.startsWith('+251') && clean.length >= 13) return `0${clean.slice(4)}`;
+  if (clean.startsWith('251') && clean.length >= 12) return `0${clean.slice(3)}`;
+  return clean.toLowerCase();
+}
+
+function syncAndOrganizeMemberDirectory(targetDb: DatabaseSchema): MemberDirectoryRecord[] {
+  const byKey = new Map<string, MemberDirectoryRecord>();
+  const idToKey = new Map<string, string>();
+  const nameToKey = new Map<string, string>();
+  const nowIso = new Date().toISOString();
+
+  const registerKeys = (key: string, rec: MemberDirectoryRecord) => {
+    if (rec.id) idToKey.set(rec.id, key);
+    const secNorm = rec.secularName.trim().toLowerCase();
+    const spiNorm = rec.spiritualName.trim().toLowerCase();
+    if (secNorm) nameToKey.set(secNorm, key);
+    if (spiNorm && spiNorm !== 'የንስሐ ልጅ') nameToKey.set(spiNorm, key);
+  };
+
+  const ensureEntry = (
+    phone: string,
+    secularName: string,
+    spiritualName: string,
+    fallbackId: string
+  ): MemberDirectoryRecord => {
+    const phoneKey = normalizePhoneLookupKey(phone);
+    const secClean = secularName.trim();
+    const spiClean = spiritualName.trim();
+    const nameKey = (secClean || spiClean).toLowerCase();
+
+    let key = '';
+    if (phoneKey && byKey.has(`p:${phoneKey}`)) {
+      key = `p:${phoneKey}`;
+    } else if (fallbackId && idToKey.has(fallbackId)) {
+      key = idToKey.get(fallbackId)!;
+    } else if (!phoneKey && nameKey && nameToKey.has(nameKey)) {
+      key = nameToKey.get(nameKey)!;
+    } else if (phoneKey && nameKey && nameToKey.has(nameKey)) {
+      const existingByNameKey = nameToKey.get(nameKey)!;
+      const existingRec = byKey.get(existingByNameKey);
+      if (existingRec && !existingRec.phone) {
+        // Promote existing phone-less entry to a phone-indexed key
+        byKey.delete(existingByNameKey);
+        key = `p:${phoneKey}`;
+        existingRec.phone = phone.trim();
+        byKey.set(key, existingRec);
+        registerKeys(key, existingRec);
+      }
+    }
+
+    if (!key) {
+      key = phoneKey
+        ? `p:${phoneKey}`
+        : `n:${(secClean || spiClean || fallbackId).toLowerCase()}`;
+    }
+
+    let rec = byKey.get(key);
+    if (!rec) {
+      rec = {
+        id: fallbackId || `mem-${crypto.createHash('md5').update(key).digest('hex').slice(0, 8)}`,
+        secularName: secClean,
+        spiritualName: spiClean,
+        phone: phone.trim(),
+        email: '',
+        role: 'child',
+        confessorPriest: 'ቀሲስ ሄኖክ',
+        confessionStage: 'ጀማሪ',
+        sources: [],
+        confessionCount: 0,
+        walletTotalGiven: 0,
+        lastUpdatedAt: nowIso,
+      };
+      byKey.set(key, rec);
+    } else {
+      if (secClean && !rec.secularName) rec.secularName = secClean;
+      if (spiClean && (!rec.spiritualName || rec.spiritualName === 'የንስሐ ልጅ')) rec.spiritualName = spiClean;
+      if (phone.trim() && !rec.phone) rec.phone = phone.trim();
+    }
+    registerKeys(key, rec);
+    return rec;
+  };
+
+  // 1. Preserve any historical directory records first (reset dynamic counters before recounting)
+  for (const prev of targetDb.memberDirectory || []) {
+    if (!prev || typeof prev !== 'object') continue;
+    const rec = ensureEntry(
+      String(prev.phone || ''),
+      String(prev.secularName || ''),
+      String(prev.spiritualName || ''),
+      String(prev.id || '')
+    );
+    if (prev.email && !rec.email) rec.email = String(prev.email);
+    if (prev.role) rec.role = prev.role;
+    if (prev.confessorPriest) rec.confessorPriest = prev.confessorPriest;
+    if (prev.confessionStage) rec.confessionStage = prev.confessionStage;
+    if (Array.isArray(prev.sources)) {
+      for (const s of prev.sources) {
+        if (s && !rec.sources.includes(s)) rec.sources.push(s);
+      }
+    }
+  }
+
+  // 2. Registered Users (primary authority for secular + spiritual names, role, stage, phone)
+  for (const u of targetDb.users || []) {
+    const rec = ensureEntry(u.phone || '', u.fullName || '', u.baptismalName || '', u.id);
+    rec.id = u.id;
+    if (u.fullName) rec.secularName = u.fullName.trim();
+    if (u.baptismalName) rec.spiritualName = u.baptismalName.trim();
+    if (u.phone) rec.phone = u.phone.trim();
+    if (u.email) rec.email = u.email.trim();
+    rec.role = u.role || 'child';
+    rec.confessorPriest = u.confessorPriest || rec.confessorPriest;
+    rec.confessionStage = u.confessionStage || rec.confessionStage;
+    rec.lastUpdatedAt = u.createdAt || nowIso;
+    if (!rec.sources.includes('የተመዘገበ አካውንት')) rec.sources.push('የተመዘገበ አካውንት');
+    const finalKey = normalizePhoneLookupKey(rec.phone) ? `p:${normalizePhoneLookupKey(rec.phone)}` : `n:${(rec.secularName || rec.spiritualName || rec.id).toLowerCase()}`;
+    registerKeys(finalKey, rec);
+  }
+
+  // 3. Confession Bookings (merges secular childName, baptismalName, phone & booking count)
+  for (const b of targetDb.confessionBookings || []) {
+    const rec = ensureEntry(b.phone || '', b.childName || '', b.baptismalName || '', b.id);
+    rec.confessionCount += 1;
+    if (!rec.sources.includes('የንስሐ ቀጠሮ')) rec.sources.push('የንስሐ ቀጠሮ');
+  }
+
+  // 4. Invited / Added Phone Contacts
+  for (const c of targetDb.contacts || []) {
+    const rec = ensureEntry(c.phone || '', c.name || '', '', c.id);
+    if (!rec.sources.includes('የስልክ ማውጫ')) rec.sources.push('የስልክ ማውጫ');
+  }
+
+  // 5. Wallet Giving Transactions (enrich contributions)
+  for (const tx of targetDb.walletTransactions || []) {
+    if (tx.type === 'withdrawal') continue;
+    const txName = String(tx.userName || '').trim();
+    if (!txName && !tx.userId) continue;
+    let key = (tx.userId && idToKey.get(tx.userId)) || nameToKey.get(txName.toLowerCase()) || '';
+    if (!key && txName) {
+      const rec = ensureEntry('', txName, '', tx.userId || tx.id);
+      rec.walletTotalGiven += Number(tx.amount || 0);
+      if (!rec.sources.includes('ዋሌት')) rec.sources.push('ዋሌት');
+    } else if (key) {
+      const rec = byKey.get(key);
+      if (rec) {
+        rec.walletTotalGiven += Number(tx.amount || 0);
+        if (!rec.sources.includes('ዋሌት')) rec.sources.push('ዋሌት');
+      }
+    }
+  }
+
+  const organized = Array.from(byKey.values()).sort((a, b) => {
+    const rolePriority = (r: StoredUser['role']) => (r === 'priest' ? 0 : r === 'admin' ? 1 : r === 'deacon' ? 2 : 3);
+    const diff = rolePriority(a.role) - rolePriority(b.role);
+    if (diff !== 0) return diff;
+    return (a.secularName || a.spiritualName || '').localeCompare(b.secularName || b.spiritualName || '', 'am');
+  });
+
+  targetDb.memberDirectory = organized;
+  targetDb.memberDirectoryUpdatedAt = nowIso;
+  return organized;
+}
+
 let db: DatabaseSchema = loadDatabase();
+syncAndOrganizeMemberDirectory(db);
 
 function saveDatabase() {
   try {
+    syncAndOrganizeMemberDirectory(db);
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
@@ -1351,7 +1540,45 @@ app.get('/api/admin/export-db', (req: Request, res: Response) => {
       ministryBanks: db.ministryBanks,
       communityStats: db.communityStats,
       contacts: db.contacts,
+      memberDirectory: db.memberDirectory,
+      memberDirectoryUpdatedAt: db.memberDirectoryUpdatedAt,
     },
+  });
+});
+
+// --- 4C. PRIEST / ADMIN ORGANIZED MEMBERS DIRECTORY (SECULAR NAME, SPIRITUAL NAME & PHONE) ---
+function buildMemberDirectoryStats(members: MemberDirectoryRecord[]) {
+  return {
+    totalMembers: members.length,
+    withPhoneCount: members.filter((m) => Boolean(m.phone)).length,
+    registeredAccountsCount: members.filter((m) => m.sources.includes('የተመዘገበ አካውንት')).length,
+    confessionMembersCount: members.filter((m) => m.sources.includes('የንስሐ ቀጠሮ')).length,
+    contactsCount: members.filter((m) => m.sources.includes('የስልክ ማውጫ')).length,
+  };
+}
+
+app.get('/api/admin/members-directory', (req: Request, res: Response) => {
+  const adminUser = requirePriestOrAdmin(req, res);
+  if (!adminUser) return;
+
+  const members = syncAndOrganizeMemberDirectory(db);
+  res.json({
+    members,
+    updatedAt: db.memberDirectoryUpdatedAt || new Date().toISOString(),
+    stats: buildMemberDirectoryStats(members),
+  });
+});
+
+app.post('/api/admin/organize-members', (req: Request, res: Response) => {
+  const adminUser = requirePriestOrAdmin(req, res);
+  if (!adminUser) return;
+
+  saveDatabase();
+  res.json({
+    success: true,
+    members: db.memberDirectory,
+    updatedAt: db.memberDirectoryUpdatedAt || new Date().toISOString(),
+    stats: buildMemberDirectoryStats(db.memberDirectory),
   });
 });
 
@@ -1507,6 +1734,25 @@ app.post('/api/admin/import-db', (req: Request, res: Response) => {
       }));
   }
 
+  if (Array.isArray(payload.memberDirectory)) {
+    db.memberDirectory = payload.memberDirectory
+      .filter((m: any) => m && typeof m === 'object')
+      .map((m: any) => ({
+        id: String(m.id || `mem-${crypto.randomUUID().slice(0, 8)}`),
+        secularName: String(m.secularName || ''),
+        spiritualName: String(m.spiritualName || ''),
+        phone: String(m.phone || ''),
+        email: String(m.email || ''),
+        role: (['child', 'priest', 'deacon', 'admin'].includes(m.role) ? m.role : 'child') as StoredUser['role'],
+        confessorPriest: String(m.confessorPriest || 'ቀሲስ ሄኖክ'),
+        confessionStage: String(m.confessionStage || 'ጀማሪ'),
+        sources: Array.isArray(m.sources) ? m.sources.map((s: any) => String(s)) : [],
+        confessionCount: Number(m.confessionCount || 0),
+        walletTotalGiven: Number(m.walletTotalGiven || 0),
+        lastUpdatedAt: String(m.lastUpdatedAt || new Date().toISOString()),
+      }));
+  }
+
   saveDatabase();
 
   res.json({
@@ -1516,6 +1762,7 @@ app.post('/api/admin/import-db', (req: Request, res: Response) => {
       confessionBookings: db.confessionBookings.length,
       walletTransactions: db.walletTransactions.length,
       contacts: db.contacts.length,
+      memberDirectory: db.memberDirectory.length,
     },
   });
 });

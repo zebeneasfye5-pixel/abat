@@ -1,7 +1,34 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, ArrowLeft, Users, Calendar, Mic, Wallet, Shield, KeyRound, User, Save, Download, Upload, CheckCircle2, AlertCircle } from 'lucide-react';
-import { ConfessionBooking, WalletState, WalletTransaction, UserProfile } from '../types';
-import { fetchRegisteredUsers, updateUserProfile, exportDatabaseBackup, importDatabaseBackup } from '../services/api';
+import {
+  X,
+  ArrowLeft,
+  Users,
+  Calendar,
+  Mic,
+  Wallet,
+  Shield,
+  KeyRound,
+  User,
+  Save,
+  Download,
+  Upload,
+  CheckCircle2,
+  AlertCircle,
+  RefreshCw,
+  Search,
+  Phone,
+  Copy,
+  FileSpreadsheet,
+} from 'lucide-react';
+import { ConfessionBooking, WalletState, WalletTransaction, UserProfile, MemberDirectoryRecord } from '../types';
+import {
+  fetchMembersDirectory,
+  organizeMembersDirectory,
+  updateUserProfile,
+  exportDatabaseBackup,
+  importDatabaseBackup,
+  MemberDirectoryPayload,
+} from '../services/api';
 
 interface SuperDashboardDrawerProps {
   isOpen: boolean;
@@ -41,8 +68,15 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
   });
   const [profileSaved, setProfileSaved] = useState(false);
 
-  // Real registered users loaded from server (priest/admin only)
-  const [registeredUsers, setRegisteredUsers] = useState<UserProfile[]>([]);
+  // Auto-organized member directory loaded from server (priest/admin only)
+  const [directoryMembers, setDirectoryMembers] = useState<MemberDirectoryRecord[]>([]);
+  const [directoryStats, setDirectoryStats] = useState<MemberDirectoryPayload['stats'] | null>(null);
+  const [directoryUpdatedAt, setDirectoryUpdatedAt] = useState<string>('');
+  const [memberSearch, setMemberSearch] = useState('');
+  const [isOrganizingMembers, setIsOrganizingMembers] = useState(false);
+  const [memberNotice, setMemberNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [copiedPhoneId, setCopiedPhoneId] = useState<string | null>(null);
+
   const [systemStatus, setSystemStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [assemblyNotice, setAssemblyNotice] = useState<string | null>(null);
   const [isBackupBusy, setIsBackupBusy] = useState(false);
@@ -53,12 +87,21 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
   useEffect(() => {
     if (isOpen) {
       if (isPriestOrAdmin) {
-        fetchRegisteredUsers().then(setRegisteredUsers);
+        fetchMembersDirectory().then((payload) => {
+          if (payload) {
+            setDirectoryMembers(payload.members || []);
+            setDirectoryStats(payload.stats || null);
+            setDirectoryUpdatedAt(payload.updatedAt || '');
+          }
+        });
       } else {
-        setRegisteredUsers([]);
+        setDirectoryMembers([]);
+        setDirectoryStats(null);
+        setDirectoryUpdatedAt('');
       }
       setSystemStatus(null);
       setAssemblyNotice(null);
+      setMemberNotice(null);
       setProfileForm({
         fullName: currentUser.fullName || '',
         baptismalName: currentUser.baptismalName || '',
@@ -133,8 +176,12 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
       const rawText = await file.text();
       const parsed = JSON.parse(rawText);
       const result = await importDatabaseBackup(parsed);
-      const refreshedUsers = await fetchRegisteredUsers();
-      setRegisteredUsers(refreshedUsers);
+      const refreshedDirectory = await fetchMembersDirectory();
+      if (refreshedDirectory) {
+        setDirectoryMembers(refreshedDirectory.members || []);
+        setDirectoryStats(refreshedDirectory.stats || null);
+        setDirectoryUpdatedAt(refreshedDirectory.updatedAt || '');
+      }
       if (onDataRestored) onDataRestored();
       setSystemStatus({
         type: 'success',
@@ -149,6 +196,79 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
       setIsBackupBusy(false);
     }
   };
+
+  const handleOneClickOrganizeMembers = async () => {
+    setMemberNotice(null);
+    setIsOrganizingMembers(true);
+    try {
+      const result = await organizeMembersDirectory();
+      setDirectoryMembers(result.members || []);
+      setDirectoryStats(result.stats || null);
+      setDirectoryUpdatedAt(result.updatedAt || '');
+      setMemberNotice({
+        type: 'success',
+        message: `ሁሉም ${result.members.length} አባላት (ዓለማዊ ስም፣ መንፈሳዊ ስም እና ስልክ ቁጥር) በራስ-ሰር ተደራጅተው በዳሽቦርዱ ዳታቤዝ በስተጀርባ ተቀምጠዋል!`,
+      });
+    } catch (err: any) {
+      setMemberNotice({
+        type: 'error',
+        message: err?.message || 'የአባላቱን መረጃ ማደራጀት አልተቻለም።',
+      });
+    } finally {
+      setIsOrganizingMembers(false);
+    }
+  };
+
+  const handleExportMembersCsv = () => {
+    const header = ['ተ.ቁ', 'ዓለማዊ ስም', 'መንፈሳዊ (የክርስትና) ስም', 'ስልክ ቁጥር', 'ድርሻ', 'የንስሐ ደረጃ', 'ምንጮች', 'የቀጠሮ ብዛት'];
+    const escapeCsv = (val: string | number) => `"${String(val ?? '').replace(/"/g, '""')}"`;
+    const rows = directoryMembers.map((m, idx) =>
+      [
+        idx + 1,
+        m.secularName || '-',
+        m.spiritualName || '-',
+        m.phone || '-',
+        m.role === 'priest' ? 'ቀሲስ' : m.role === 'deacon' ? 'ዲያቆን' : m.role === 'admin' ? 'አስተዳዳሪ' : 'የንስሐ ልጅ',
+        m.confessionStage || '-',
+        (m.sources || []).join(' / '),
+        m.confessionCount || 0,
+      ]
+        .map(escapeCsv)
+        .join(',')
+    );
+    const csvContent = '\uFEFF' + [header.map(escapeCsv).join(','), ...rows].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `qesis-henok-members-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+    setMemberNotice({
+      type: 'success',
+      message: 'የአባላቱ ዝርዝር (ዓለማዊ ስም፣ መንፈሳዊ ስም እና ስልክ ቁጥር) በExcel/CSV ፋይል ወርዷል።',
+    });
+  };
+
+  const handleCopyPhone = (id: string, phone: string) => {
+    if (!phone) return;
+    navigator.clipboard?.writeText(phone).catch(() => {});
+    setCopiedPhoneId(id);
+    setTimeout(() => setCopiedPhoneId(null), 1500);
+  };
+
+  const filteredDirectoryMembers = directoryMembers.filter((m) => {
+    const q = memberSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      m.secularName.toLowerCase().includes(q) ||
+      m.spiritualName.toLowerCase().includes(q) ||
+      m.phone.toLowerCase().includes(q) ||
+      m.sources.some((s) => s.toLowerCase().includes(q))
+    );
+  });
 
   return (
     <div
@@ -321,43 +441,213 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
             </div>
           )}
 
-          {/* TAB 1: Real Registered Users Management */}
+          {/* TAB 1: Organized Master Member Directory (ዓለማዊ ስም፣ መንፈሳዊ ስም እና ስልክ ቁጥር) */}
           {activeTab === 'children' && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
-                  <h3 className="text-sm font-semibold text-amber-200">የተመዘገቡ ተጠቃሚዎች ዝርዝር ({registeredUsers.length})</h3>
-                  <p className="text-xs text-stone-400">በድህረገጹ አካውንት ከፍተው የተመዘገቡ እውነተኛ አባላት</p>
+                  <h3 className="text-sm font-semibold text-amber-200">
+                    የሁሉም አባላት ሙሉ መዝገብ ({directoryMembers.length})
+                  </h3>
+                  <p className="text-xs text-stone-400">
+                    የአባላት ዓለማዊ ስም፣ መንፈሳዊ (የክርስትና) ስም እና ስልክ ቁጥር በራስ-ሰር ተደራጅቶ በዳሽቦርዱ በስተጀርባ የሚቀመጥበት
+                  </p>
                 </div>
-                <span className="text-xs text-emerald-400 font-mono">ከሰርቨር የተጫነ</span>
+                {directoryUpdatedAt && (
+                  <span className="text-[11px] text-emerald-400 font-mono shrink-0">
+                    መጨረሻ የተቀመጠው፡ {directoryUpdatedAt.replace('T', ' ').slice(0, 16)}
+                  </span>
+                )}
               </div>
 
-              {registeredUsers.length === 0 ? (
-                <div className="p-6 rounded-xl border border-stone-800 bg-stone-900/40 text-center text-xs text-stone-400">
-                  እስካሁን የተመዘገበ ተጠቃሚ የለም። አዳዲስ ተጠቃሚዎች በ"ግባ / ተመዝገብ" ሲመዘገቡ እዚህ በቀጥታ ይታያሉ።
+              {!isPriestOrAdmin ? (
+                <div className="p-6 rounded-xl border border-amber-800/40 bg-stone-900/50 text-center text-xs text-stone-300 space-y-1.5">
+                  <p className="font-semibold text-amber-200">ይህ ዝርዝር ለቀሲስ / አስተዳዳሪ ብቻ የተጠበቀ ነው</p>
+                  <p className="text-stone-400">
+                    የሁሉንም አባላት ዓለማዊ ስም፣ መንፈሳዊ ስም እና ስልክ ቁጥር ለማየት እና ለማደራጀት በቀሲስ አካውንት ይግቡ።
+                  </p>
                 </div>
               ) : (
-                <div className="divide-y divide-stone-800 rounded-xl border border-stone-800 bg-stone-900/50 overflow-hidden">
-                  {registeredUsers.map((member) => (
-                    <div key={member.id} className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-                      <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 rounded-full bg-amber-950/80 border border-amber-700/40 flex items-center justify-center text-amber-300 font-bold">
-                          {(member.baptismalName || member.fullName).charAt(0)}
+                <>
+                  {/* One-Click Auto-Organize & Save Bar + Stats */}
+                  <div className="p-4 rounded-2xl bg-gradient-to-br from-amber-950/40 via-stone-900/80 to-stone-950 border border-amber-700/40 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2.5">
+                      <button
+                        type="button"
+                        disabled={isOrganizingMembers}
+                        onClick={handleOneClickOrganizeMembers}
+                        className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-amber-700 to-amber-600 hover:from-amber-600 hover:to-amber-500 text-stone-950 font-bold text-xs shadow-lg transition disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-4 h-4 ${isOrganizingMembers ? 'animate-spin' : ''}`} />
+                        <span>
+                          {isOrganizingMembers
+                            ? 'መረጃውን በማደራጀትና በማስቀመጥ ላይ...'
+                            : 'ሁሉንም አባላት በራስ-ሰር አደራጅና አስቀምጥ (One-Click Save)'}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={directoryMembers.length === 0}
+                        onClick={handleExportMembersCsv}
+                        className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl bg-stone-900 hover:bg-stone-800 border border-emerald-700/60 text-emerald-300 font-semibold text-xs transition disabled:opacity-40"
+                      >
+                        <FileSpreadsheet className="w-4 h-4" />
+                        <span>በExcel / CSV አውርድ</span>
+                      </button>
+                    </div>
+
+                    {directoryStats && (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-[11px]">
+                        <div className="p-2 rounded-lg bg-stone-950/80 border border-stone-800">
+                          <span className="text-stone-400 block">ጠቅላላ አባላት</span>
+                          <span className="text-sm font-bold text-amber-300 font-mono">{directoryStats.totalMembers}</span>
                         </div>
-                        <div>
-                          <p className="font-semibold text-stone-200">{member.fullName} ({member.baptismalName})</p>
-                          <p className="text-stone-400">{member.phone}</p>
+                        <div className="p-2 rounded-lg bg-stone-950/80 border border-stone-800">
+                          <span className="text-stone-400 block">ስልክ ቁጥር ያላቸው</span>
+                          <span className="text-sm font-bold text-emerald-300 font-mono">{directoryStats.withPhoneCount}</span>
                         </div>
+                        <div className="p-2 rounded-lg bg-stone-950/80 border border-stone-800">
+                          <span className="text-stone-400 block">አካውንት የከፈቱ</span>
+                          <span className="text-sm font-bold text-stone-100 font-mono">{directoryStats.registeredAccountsCount}</span>
+                        </div>
+                        <div className="p-2 rounded-lg bg-stone-950/80 border border-stone-800">
+                          <span className="text-stone-400 block">ቀጠሮ / ስልክ ማውጫ</span>
+                          <span className="text-sm font-bold text-amber-200 font-mono">
+                            {directoryStats.confessionMembersCount} / {directoryStats.contactsCount}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
+                    {memberNotice && (
+                      <div
+                        className={`p-3 rounded-xl border text-xs flex items-start gap-2 ${
+                          memberNotice.type === 'success'
+                            ? 'bg-emerald-950/70 border-emerald-700/60 text-emerald-200'
+                            : 'bg-red-950/70 border-red-700/60 text-red-200'
+                        }`}
+                      >
+                        {memberNotice.type === 'success' ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                        ) : (
+                          <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                        )}
+                        <span>{memberNotice.message}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Search Filter */}
+                  <div className="relative">
+                    <Search className="w-4 h-4 text-stone-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={memberSearch}
+                      onChange={(e) => setMemberSearch(e.target.value)}
+                      placeholder="በዓለማዊ ስም፣ በመንፈሳዊ ስም ወይም በስልክ ቁጥር ይፈልጉ..."
+                      className="w-full bg-stone-900 border border-stone-700 rounded-xl pl-9 pr-3 py-2 text-xs text-stone-100 focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+
+                  {filteredDirectoryMembers.length === 0 ? (
+                    <div className="p-6 rounded-xl border border-stone-800 bg-stone-900/40 text-center text-xs text-stone-400">
+                      {directoryMembers.length === 0
+                        ? 'እስካሁን የተመዘገበ አባል የለም። አዳዲስ ተጠቃሚዎች ሲመዘገቡ፣ ቀጠሮ ሲይዙ ወይም ከስልክ ሲጨመሩ እዚህ በራስ-ሰር ይደራጃሉ።'
+                        : 'ከፍለጋዎ ጋር የሚመሳሰል አባል አልተገኘም።'}
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-stone-800 bg-stone-900/50 overflow-hidden">
+                      {/* Column Headers (Desktop/Tablet) */}
+                      <div className="hidden sm:grid sm:grid-cols-12 gap-2 px-3.5 py-2.5 bg-stone-950/90 border-b border-stone-800 text-[11px] font-bold text-amber-300">
+                        <div className="col-span-1">#</div>
+                        <div className="col-span-3">ዓለማዊ ስም</div>
+                        <div className="col-span-3">መንፈሳዊ (ክርስትና) ስም</div>
+                        <div className="col-span-3">ስልክ ቁጥር</div>
+                        <div className="col-span-2 text-right">ደረጃ / ምንጭ</div>
                       </div>
 
-                      <div className="flex items-center gap-2 text-right">
-                        <span className="px-2 py-0.5 rounded bg-stone-950 border border-stone-700 text-amber-300 font-medium">
-                          {member.role === 'priest' ? 'ቀሲስ' : member.role === 'deacon' ? 'ዲያቆን' : member.confessionStage}
-                        </span>
+                      <div className="divide-y divide-stone-800">
+                        {filteredDirectoryMembers.map((member, index) => (
+                          <div
+                            key={member.id}
+                            className="p-3.5 grid grid-cols-1 sm:grid-cols-12 gap-2 sm:items-center text-xs hover:bg-stone-900/80 transition"
+                          >
+                            <div className="hidden sm:block sm:col-span-1 text-stone-500 font-mono">
+                              {index + 1}
+                            </div>
+
+                            <div className="sm:col-span-3 flex items-center gap-2.5">
+                              <div className="w-7 h-7 shrink-0 rounded-full bg-amber-950/80 border border-amber-700/40 flex items-center justify-center text-amber-300 font-bold text-[11px]">
+                                {(member.spiritualName || member.secularName || 'አ').charAt(0)}
+                              </div>
+                              <div className="min-w-0">
+                                <p className="font-semibold text-stone-100 truncate">
+                                  {member.secularName || '—'}
+                                </p>
+                                <p className="sm:hidden text-[11px] text-amber-300/90 truncate">
+                                  መንፈሳዊ ስም፡ {member.spiritualName || 'አልተሞላም'}
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="hidden sm:block sm:col-span-3 text-amber-200 font-medium truncate">
+                              {member.spiritualName || <span className="text-stone-500">አልተሞላም</span>}
+                            </div>
+
+                            <div className="sm:col-span-3 flex items-center gap-1.5">
+                              {member.phone ? (
+                                <>
+                                  <a
+                                    href={`tel:${member.phone}`}
+                                    className="inline-flex items-center gap-1 text-emerald-300 hover:text-emerald-200 font-mono font-medium"
+                                  >
+                                    <Phone className="w-3 h-3 shrink-0" />
+                                    <span>{member.phone}</span>
+                                  </a>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCopyPhone(member.id, member.phone)}
+                                    className="p-1 rounded bg-stone-950 border border-stone-700 text-stone-400 hover:text-amber-300 transition"
+                                    title="ስልክ ቁጥሩን ቅዳ"
+                                  >
+                                    {copiedPhoneId === member.id ? (
+                                      <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                                    ) : (
+                                      <Copy className="w-3 h-3" />
+                                    )}
+                                  </button>
+                                </>
+                              ) : (
+                                <span className="text-stone-500">ስልክ የለም</span>
+                              )}
+                            </div>
+
+                            <div className="sm:col-span-2 flex flex-wrap sm:justify-end gap-1">
+                              <span className="px-2 py-0.5 rounded bg-stone-950 border border-stone-700 text-amber-300 font-medium text-[10px]">
+                                {member.role === 'priest'
+                                  ? 'ቀሲስ'
+                                  : member.role === 'deacon'
+                                  ? 'ዲያቆን'
+                                  : member.role === 'admin'
+                                  ? 'አስተዳዳሪ'
+                                  : member.confessionStage || 'የንስሐ ልጅ'}
+                              </span>
+                              {member.sources.map((src) => (
+                                <span
+                                  key={src}
+                                  className="px-1.5 py-0.5 rounded bg-amber-950/40 border border-amber-800/30 text-stone-300 text-[10px]"
+                                >
+                                  {src}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  ))}
-                </div>
+                  )}
+                </>
               )}
             </div>
           )}

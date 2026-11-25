@@ -103,3 +103,17 @@ export interface PhoneContactRecord {
   note?: string;
 }
 
+export interface MemberDirectoryRecord {
+  id: string;
+  secularName: string;
+  spiritualName: string;
+  phone: string;
+  email: string;
+  role: UserRole;
+  confessorPriest: string;
+  confessionStage: string;
+  sources: string[];
+  confessionCount: number;
+  walletTotalGiven: number;
+  lastUpdatedAt: string;
+}

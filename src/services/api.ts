@@ -7,6 +7,7 @@ import {
   MinistryBankAccounts,
   CommunityEngagement,
   PhoneContactRecord,
+  MemberDirectoryRecord,
 } from '../types';
 
 const AUTH_TOKEN_KEY = 'qh_auth_token';
@@ -788,8 +789,49 @@ export async function importDatabaseBackup(backupData: Record<string, any>): Pro
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify(backupData),
+    body: JSON.stringify(backupData),
     },
     25000
+  );
+}
+
+export interface MemberDirectoryPayload {
+  members: MemberDirectoryRecord[];
+  updatedAt: string;
+  stats: {
+    totalMembers: number;
+    withPhoneCount: number;
+    registeredAccountsCount: number;
+    confessionMembersCount: number;
+    contactsCount: number;
+  };
+}
+
+export async function fetchMembersDirectory(): Promise<MemberDirectoryPayload | null> {
+  const token = getAuthToken();
+  if (!token) return null;
+  try {
+    return await safeFetchJson<MemberDirectoryPayload>(
+      '/api/admin/members-directory',
+      { headers: { Authorization: `Bearer ${token}` } },
+      15000
+    );
+  } catch {
+    return null;
+  }
+}
+
+export async function organizeMembersDirectory(): Promise<MemberDirectoryPayload> {
+  const token = getAuthToken();
+  if (!token) {
+    throw new Error('የአባላቱን መረጃ ለማደራጀት በቀሲስ/አስተዳዳሪ አካውንት መግባት ያስፈልጋል።');
+  }
+  return safeFetchJson<MemberDirectoryPayload>(
+    '/api/admin/organize-members',
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    },
+    20000
   );
 }

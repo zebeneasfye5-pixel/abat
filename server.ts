@@ -417,6 +417,8 @@ const ORTHODOX_UNIFIED_SYSTEM_INSTRUCTION = `
 const GEMINI_MODEL_CANDIDATES: Array<{ model: string }> = [
   { model: 'gemini-2.5-flash' },
   { model: 'gemini-2.5-flash-lite' },
+  { model: 'gemini-4-hydrogen' },
+  { model: 'gemini-3.1-flash-lite' },
 ];
 
 function sleepMs(ms: number): Promise<void> {
@@ -456,6 +458,23 @@ function isQuotaOrRateLimitError(err: any): boolean {
   return isTransientHighDemandError(err) || isDailyQuotaError(err);
 }
 
+function isModelUnavailableError(err: any): boolean {
+  const raw = `${err?.status || ''} ${err?.code || ''} ${err?.message || ''}`.toLowerCase();
+  return (
+    err?.status === 404 ||
+    err?.status === 400 ||
+    raw.includes('404') ||
+    raw.includes('not_found') ||
+    raw.includes('not found') ||
+    raw.includes('is not supported') ||
+    raw.includes('invalid argument')
+  );
+}
+
+function shouldTryNextCandidate(err: any): boolean {
+  return isQuotaOrRateLimitError(err) || isModelUnavailableError(err);
+}
+
 function formatReadableGeminiError(error: any): string {
   if (error?.code === 'GEMINI_API_KEY_MISSING') {
     return 'የኤአይ ቁልፍ (GEMINI_API_KEY) በሰርቨሩ ላይ አልተሞላም። በSettings > Secrets ወይም Render Environment ላይ GEMINI_API_KEY ያስገቡ።';
@@ -486,13 +505,13 @@ async function generateWithGemini(prompt: string, systemInstruction: string, cac
 
   const ai = getAiClient();
   let lastError: any = null;
-  const retryDelaysMs = [0, 650, 1400, 2200];
+  const retryDelaysMs = [0, 350, 750, 1200];
 
   for (let pass = 0; pass < GEMINI_MODEL_CANDIDATES.length; pass++) {
     const candidate = GEMINI_MODEL_CANDIDATES[pass];
-    const delay = retryDelaysMs[pass] ?? 1500;
+    const delay = lastError && isModelUnavailableError(lastError) ? 0 : (retryDelaysMs[pass] ?? 1000);
     if (delay > 0) {
-      await sleepMs(delay + Math.floor(Math.random() * 250));
+      await sleepMs(delay + Math.floor(Math.random() * 200));
     }
     try {
       const response = await ai.models.generateContent({
@@ -514,7 +533,7 @@ async function generateWithGemini(prompt: string, systemInstruction: string, cac
         err?.status || err?.code || '',
         String(err?.message || err).slice(0, 180)
       );
-      if (isQuotaOrRateLimitError(err)) {
+      if (shouldTryNextCandidate(err)) {
         continue;
       }
       throw err;
@@ -547,13 +566,13 @@ async function streamWithGemini(
   try {
     const ai = getAiClient();
     let lastError: any = null;
-    const retryDelaysMs = [0, 650, 1400, 2200];
+    const retryDelaysMs = [0, 350, 750, 1200];
 
     for (let pass = 0; pass < GEMINI_MODEL_CANDIDATES.length; pass++) {
       const candidate = GEMINI_MODEL_CANDIDATES[pass];
-      const delay = retryDelaysMs[pass] ?? 1500;
+      const delay = lastError && isModelUnavailableError(lastError) ? 0 : (retryDelaysMs[pass] ?? 1000);
       if (delay > 0) {
-        await sleepMs(delay + Math.floor(Math.random() * 250));
+        await sleepMs(delay + Math.floor(Math.random() * 200));
       }
 
       let emittedAnyChunk = false;
@@ -591,7 +610,7 @@ async function streamWithGemini(
           err?.status || err?.code || '',
           String(err?.message || err).slice(0, 180)
         );
-        if (!emittedAnyChunk && isQuotaOrRateLimitError(err)) {
+        if (!emittedAnyChunk && shouldTryNextCandidate(err)) {
           continue;
         }
         throw err;

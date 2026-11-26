@@ -41,10 +41,18 @@ interface AssemblyHallProps {
 type VideoQualityPreset = '1080p' | '720p' | '360p';
 
 const QUALITY_MAP: Record<VideoQualityPreset, { width: number; height: number; maxBitrate: number; label: string }> = {
-  '1080p': { width: 1920, height: 1080, maxBitrate: 1_800_000, label: 'Full HD 1080p' },
-  '720p': { width: 1280, height: 720, maxBitrate: 750_000, label: 'HD 720p' },
-  '360p': { width: 640, height: 360, maxBitrate: 350_000, label: 'ፈጣን 360p' },
+  '1080p': { width: 1280, height: 720, maxBitrate: 900_000, label: 'HD 720p' },
+  '720p': { width: 640, height: 360, maxBitrate: 400_000, label: 'መደበኛ 360p' },
+  '360p': { width: 426, height: 240, maxBitrate: 200_000, label: 'ፈጣን 240p' },
 };
+
+function setSdpFmtpParam(line: string, key: string, value: string): string {
+  const re = new RegExp(`([;\\s])${key}=[^;\\r\\n]*`, 'i');
+  if (re.test(line)) {
+    return line.replace(re, `$1${key}=${value}`);
+  }
+  return `${line};${key}=${value}`;
+}
 
 function preferRobustOpusSdp(sdp?: string): string | undefined {
   if (!sdp) return sdp;
@@ -59,10 +67,9 @@ function preferRobustOpusSdp(sdp?: string): string | undefined {
   const nextLines = lines.map((line) => {
     if (line.startsWith(fmtpPrefix)) {
       replaced = true;
-      let next = line;
-      if (!next.includes('useinbandfec=')) next += ';useinbandfec=1';
-      if (!next.includes('usedtx=')) next += ';usedtx=0';
-      if (!next.includes('maxaveragebitrate=')) next += ';maxaveragebitrate=48000';
+      let next = setSdpFmtpParam(line, 'useinbandfec', '1');
+      next = setSdpFmtpParam(next, 'usedtx', '1');
+      next = setSdpFmtpParam(next, 'maxaveragebitrate', '24000');
       return next;
     }
     return line;
@@ -70,7 +77,7 @@ function preferRobustOpusSdp(sdp?: string): string | undefined {
   if (!replaced) {
     const idx = nextLines.findIndex((l) => l.startsWith(`a=rtpmap:${opusPt} `));
     if (idx !== -1) {
-      nextLines.splice(idx + 1, 0, `${fmtpPrefix}minptime=10;useinbandfec=1;usedtx=0;maxaveragebitrate=48000`);
+      nextLines.splice(idx + 1, 0, `${fmtpPrefix}minptime=10;useinbandfec=1;usedtx=1;maxaveragebitrate=24000`);
     }
   }
   return nextLines.join('\r\n');
@@ -106,30 +113,41 @@ interface FloatingReaction {
   x: number;
 }
 
-async function applyStudioEncoderTuning(pc: RTCPeerConnection, quality: VideoQualityPreset) {
+async function applySenderPriority(sender: RTCRtpSender | undefined, kind: 'audio' | 'video', quality: VideoQualityPreset) {
+  if (!sender) return;
   const targetBitrate = QUALITY_MAP[quality].maxBitrate;
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    if (kind === 'video') {
+      params.encodings.forEach((enc, idx) => {
+        if (idx === params.encodings.length - 1) {
+          enc.maxBitrate = targetBitrate;
+        } else {
+          enc.maxBitrate = Math.min(enc.maxBitrate || targetBitrate, targetBitrate);
+        }
+        enc.maxFramerate = quality === '360p' ? 18 : 24;
+        (enc as any).priority = 'low';
+        (enc as any).networkPriority = 'low';
+      });
+      (params as any).degradationPreference = 'balanced';
+    } else {
+      params.encodings[0].maxBitrate = 24_000;
+      (params.encodings[0] as any).priority = 'high';
+      (params.encodings[0] as any).networkPriority = 'high';
+    }
+    await sender.setParameters(params);
+  } catch {
+    // Browser may skip unsupported RTCRtpEncodingParameters gracefully
+  }
+}
+
+async function applyStudioEncoderTuning(pc: RTCPeerConnection, quality: VideoQualityPreset) {
   for (const sender of pc.getSenders()) {
     if (!sender.track) continue;
-    try {
-      const params = sender.getParameters();
-      if (!params.encodings || params.encodings.length === 0) {
-        params.encodings = [{}];
-      }
-      if (sender.track.kind === 'video') {
-        params.encodings[0].maxBitrate = targetBitrate;
-        params.encodings[0].maxFramerate = quality === '360p' ? 20 : 24;
-        (params.encodings[0] as any).priority = 'low';
-        (params.encodings[0] as any).networkPriority = 'low';
-        (params as any).degradationPreference = 'balanced';
-      } else if (sender.track.kind === 'audio') {
-        params.encodings[0].maxBitrate = 48_000;
-        (params.encodings[0] as any).priority = 'high';
-        (params.encodings[0] as any).networkPriority = 'high';
-      }
-      await sender.setParameters(params);
-    } catch {
-      // Browser may skip unsupported RTCRtpEncodingParameters gracefully
-    }
+    await applySenderPriority(sender, sender.track.kind === 'audio' ? 'audio' : 'video', quality);
   }
 }
 
@@ -538,10 +556,11 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const [expandedTileId, setExpandedTileId] = useState<string | null>(null);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
-  const [videoQuality, setVideoQuality] = useState<VideoQualityPreset>('720p');
+  const [videoQuality, setVideoQuality] = useState<VideoQualityPreset>('360p');
 
   // Scalability & SFU Telemetry state
   const [broadcastMode, setBroadcastMode] = useState<'interactive-mesh' | 'stage-broadcast' | 'livekit-sfu'>('interactive-mesh');
+  const [liveKitActive, setLiveKitActive] = useState(false);
   const [selfOnStage, setSelfOnStage] = useState(true);
   const [serverClientCount, setServerClientCount] = useState<number>(1);
 
@@ -623,6 +642,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   remotePeersRef.current = remotePeers;
   const videoQualityRef = useRef<VideoQualityPreset>(videoQuality);
   videoQualityRef.current = videoQuality;
+  const liveKitActiveRef = useRef(liveKitActive);
+  liveKitActiveRef.current = liveKitActive;
 
   const meetingContainerRef = useRef<HTMLDivElement | null>(null);
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
@@ -684,6 +705,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     }
 
     pc.onicecandidate = (event) => {
+      if (liveKitRoomRef.current) return;
       if (event.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(
           JSON.stringify({
@@ -754,6 +776,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     };
 
     const handleConnState = () => {
+      if (liveKitRoomRef.current) return;
       const state = pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed'
         ? pc.iceConnectionState
         : pc.connectionState || pc.iceConnectionState;
@@ -807,15 +830,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         sampleRate: 48000,
       };
 
+      const initialSpec = QUALITY_MAP[videoQualityRef.current];
       const attempts: Array<{ constraints: MediaStreamConstraints; label: string }> = [
         {
-          label: '720p',
+          label: initialSpec.label,
           constraints: {
             video: {
               facingMode: 'user',
-              width: { ideal: 1280, min: 320 },
-              height: { ideal: 720, min: 240 },
-              frameRate: { ideal: 24, max: 30 },
+              width: { ideal: initialSpec.width, min: 240 },
+              height: { ideal: initialSpec.height, min: 180 },
+              frameRate: { ideal: videoQualityRef.current === '360p' ? 18 : 24, max: 24 },
             },
             audio: hdAudioConstraints,
           },
@@ -933,10 +957,22 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             true
           );
           if (lkData.sfuConfigured && lkData.url && lkData.token) {
-            const { Room, RoomEvent } = await import('livekit-client');
+            const { Room, RoomEvent, Track, ConnectionState } = await import('livekit-client');
+            const initialSpec = QUALITY_MAP[videoQualityRef.current];
             const lkRoom = new Room({
               adaptiveStream: true,
               dynacast: true,
+              publishDefaults: {
+                simulcast: true,
+                dtx: true,
+                red: true,
+                audioPreset: { maxBitrate: 24_000 },
+                videoEncoding: {
+                  maxBitrate: initialSpec.maxBitrate,
+                  maxFramerate: videoQualityRef.current === '360p' ? 18 : 24,
+                },
+                degradationPreference: 'maintain-framerate',
+              },
             });
             liveKitRoomRef.current = lkRoom;
 
@@ -970,20 +1006,87 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             lkRoom
               .on(RoomEvent.ParticipantConnected, syncLkParticipants)
               .on(RoomEvent.ParticipantDisconnected, syncLkParticipants)
-              .on(RoomEvent.TrackSubscribed, syncLkParticipants)
+              .on(RoomEvent.TrackSubscribed, () => {
+                syncLkParticipants();
+                unlockRemoteAudio();
+              })
               .on(RoomEvent.TrackUnsubscribed, syncLkParticipants)
               .on(RoomEvent.TrackMuted, syncLkParticipants)
-              .on(RoomEvent.TrackUnmuted, syncLkParticipants);
+              .on(RoomEvent.TrackUnmuted, syncLkParticipants)
+              .on(RoomEvent.LocalTrackPublished, (pub) => {
+                if (pub.track?.sender) {
+                  applySenderPriority(
+                    pub.track.sender,
+                    pub.track.kind === Track.Kind.Audio ? 'audio' : 'video',
+                    videoQualityRef.current
+                  );
+                }
+              })
+              .on(RoomEvent.ConnectionStateChanged, (state) => {
+                const connected = state === ConnectionState.Connected;
+                setLiveKitActive(connected);
+                if (connected) {
+                  wsMediaSenderRef.current?.stop();
+                  wsMediaSenderRef.current = null;
+                  setWsRelayActive(false);
+                  setVideoRelayForced(false);
+                  setAudioRelayForced(false);
+                }
+              })
+              .on(RoomEvent.Disconnected, () => {
+                setLiveKitActive(false);
+              });
 
             await lkRoom.connect(lkData.url, lkData.token);
+            setLiveKitActive(true);
+            setBroadcastMode('livekit-sfu');
+            wsMediaSenderRef.current?.stop();
+            wsMediaSenderRef.current = null;
+            setWsRelayActive(false);
+            setVideoRelayForced(false);
+            setAudioRelayForced(false);
+            peerConnectionsRef.current.forEach((pc) => pc.close());
+            peerConnectionsRef.current.clear();
+
             if (acquiredStream) {
+              const qSpec = QUALITY_MAP[videoQualityRef.current];
               for (const t of acquiredStream.getTracks()) {
-                await lkRoom.localParticipant.publishTrack(t);
+                if (t.kind === 'audio') {
+                  const pub = await lkRoom.localParticipant.publishTrack(t, {
+                    source: Track.Source.Microphone,
+                    dtx: true,
+                    red: true,
+                    audioPreset: { maxBitrate: 24_000 },
+                  });
+                  if (pub?.track?.sender) {
+                    applySenderPriority(pub.track.sender, 'audio', videoQualityRef.current);
+                  }
+                } else if (t.kind === 'video') {
+                  const pub = await lkRoom.localParticipant.publishTrack(t, {
+                    source: Track.Source.Camera,
+                    simulcast: true,
+                    videoEncoding: {
+                      maxBitrate: qSpec.maxBitrate,
+                      maxFramerate: videoQualityRef.current === '360p' ? 18 : 24,
+                    },
+                    degradationPreference: 'maintain-framerate',
+                  });
+                  if (pub?.track?.sender) {
+                    applySenderPriority(pub.track.sender, 'video', videoQualityRef.current);
+                  }
+                }
               }
             }
-            setBroadcastMode('livekit-sfu');
+            syncLkParticipants();
           }
         } catch (err) {
+          if (liveKitRoomRef.current) {
+            try {
+              liveKitRoomRef.current.disconnect();
+            } catch {}
+            liveKitRoomRef.current = null;
+          }
+          setLiveKitActive(false);
           console.warn('LiveKit SFU fallback to built-in Relay/Stage WS:', err);
         }
       }
@@ -1067,15 +1170,15 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             if (data.type === 'ws-pong') {
               return;
             } else if (data.type === 'request-video-relay') {
-              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              if (liveKitRoomRef.current || !data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setVideoRelayForced(true);
               return;
             } else if (data.type === 'request-audio-relay') {
-              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              if (liveKitRoomRef.current || !data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setAudioRelayForced(true);
               return;
             } else if (data.type === 'ws-video-frame') {
-              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              if (liveKitRoomRef.current || !data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setRemotePeers((prev) =>
                 prev.map((p) =>
                   p.peerId === data.senderPeerId
@@ -1085,7 +1188,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               );
               return;
             } else if (data.type === 'ws-audio-chunk') {
-              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              if (liveKitRoomRef.current || !data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               const senderPeer = remotePeersRef.current.find((p) => p.peerId === data.senderPeerId);
               const audioBytesFlowing = webrtcAudioFlowingRef.current.get(data.senderPeerId) === true;
               const hasLiveUnmutedTrack = Boolean(
@@ -1308,6 +1411,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                   localStreamRef.current?.getAudioTracks().forEach((t) => {
                     t.enabled = false;
                   });
+                  liveKitRoomRef.current?.localParticipant?.audioTrackPublications?.forEach((pub: any) => {
+                    pub.mute?.().catch(() => {});
+                  });
                 }
               } else {
                 setRemotePeers((prev) =>
@@ -1316,6 +1422,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               }
             } else if (data.type === 'peer-left') {
               if (typeof data.clientCount === 'number') setServerClientCount(data.clientCount);
+              if (liveKitRoomRef.current) return;
               const pc = peerConnectionsRef.current.get(data.peerId);
               if (pc) {
                 pc.close();
@@ -1343,6 +1450,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
               setIsMicOn(false);
               localStreamRef.current?.getAudioTracks().forEach((t) => {
                 t.enabled = false;
+              });
+              liveKitRoomRef.current?.localParticipant?.audioTrackPublications?.forEach((pub: any) => {
+                pub.mute?.().catch(() => {});
               });
             }
           } catch (err) {
@@ -1378,6 +1488,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         } catch {}
         liveKitRoomRef.current = null;
       }
+      setLiveKitActive(false);
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'leave-room' }));
         wsRef.current.close();
@@ -1436,7 +1547,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   // Automatic 4.5s CGNAT / Symmetric-4G Relay Detection + Video/Audio RTP Packet Health Fallback
   useEffect(() => {
     const activeStagePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest');
-    if (activeStagePeers.length === 0 || liveKitRoomRef.current) {
+    if (activeStagePeers.length === 0 || liveKitRoomRef.current || liveKitActive) {
       setWsRelayActive(false);
       setVideoRelayForced(false);
       setAudioRelayForced(false);
@@ -1461,15 +1572,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       setWsRelayActive(true);
     }, 4500);
     return () => clearTimeout(timer);
-  }, [remotePeers]);
+  }, [remotePeers, liveKitActive]);
 
   // Continuous RTP Stats Monitor (every 2.5s):
   // Guarantees bidirectional audio & video relay activate IMMEDIATELY if ICE claims "connected" yet 0 RTP packets flow over 4G CGNAT!
   useEffect(() => {
     const activeStagePeers = remotePeers.filter((p) => p.onStage !== false || p.role === 'priest');
-    if (activeStagePeers.length === 0 || !wsConnected || liveKitRoomRef.current) return;
+    if (activeStagePeers.length === 0 || !wsConnected || liveKitRoomRef.current || liveKitActive) return;
 
     const inspectMediaStats = async () => {
+      if (liveKitRoomRef.current || liveKitActiveRef.current) return;
       const peersNow = remotePeersRef.current.filter((p) => p.onStage !== false || p.role === 'priest');
       for (const peer of peersNow) {
         const isConn = peer.connectionState === 'connected' || peer.connectionState === 'completed';
@@ -1556,11 +1668,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       clearTimeout(initialTimer);
       clearInterval(intervalTimer);
     };
-  }, [remotePeers.length, wsConnected]);
+  }, [remotePeers.length, wsConnected, liveKitActive]);
 
-  // Run WebSocket Media Sender whenever full WS Relay OR Video/Audio Relay Fallback is active
+  // Run WebSocket Media Sender whenever full WS Relay OR Video/Audio Relay Fallback is active (disabled whenever LiveKit is active)
   useEffect(() => {
-    const needsSender = (wsRelayActive || videoRelayForced || audioRelayForced) && wsConnected && selfOnStage && !liveKitRoomRef.current;
+    const needsSender =
+      (wsRelayActive || videoRelayForced || audioRelayForced) &&
+      wsConnected &&
+      selfOnStage &&
+      !liveKitRoomRef.current &&
+      !liveKitActive;
     if (!needsSender) {
       wsMediaSenderRef.current?.stop();
       wsMediaSenderRef.current = null;
@@ -1574,8 +1691,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       getLocalStream: () => screenStreamRef.current || localStreamRef.current,
       isVideoEnabled: () => isVideoOnRef.current,
       isMicEnabled: () => isMicOnRef.current,
-      shouldSendVideo: () => (wsRelayActiveRef.current || videoRelayForcedRef.current) && isVideoOnRef.current,
-      shouldSendAudio: () => (wsRelayActiveRef.current || audioRelayForcedRef.current) && isMicOnRef.current,
+      shouldSendVideo: () =>
+        !liveKitRoomRef.current &&
+        !liveKitActiveRef.current &&
+        (wsRelayActiveRef.current || videoRelayForcedRef.current) &&
+        isVideoOnRef.current,
+      shouldSendAudio: () =>
+        !liveKitRoomRef.current &&
+        !liveKitActiveRef.current &&
+        (wsRelayActiveRef.current || audioRelayForcedRef.current) &&
+        isMicOnRef.current,
     });
     wsMediaSenderRef.current = sender;
     sender.start();
@@ -1586,7 +1711,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         wsMediaSenderRef.current = null;
       }
     };
-  }, [wsRelayActive, videoRelayForced, audioRelayForced, wsConnected, selfOnStage]);
+  }, [wsRelayActive, videoRelayForced, audioRelayForced, wsConnected, selfOnStage, liveKitActive]);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1616,15 +1741,23 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const handleChangeQuality = async (nextQuality: VideoQualityPreset) => {
     setVideoQuality(nextQuality);
     const spec = QUALITY_MAP[nextQuality];
+    const targetFps = nextQuality === '360p' ? 18 : 24;
     const videoTrack = localStreamRef.current?.getVideoTracks()[0];
     if (videoTrack) {
       try {
         await videoTrack.applyConstraints({
           width: { ideal: spec.width },
           height: { ideal: spec.height },
-          frameRate: { ideal: 30 },
+          frameRate: { ideal: targetFps, max: 24 },
         });
       } catch {}
+    }
+    if (liveKitRoomRef.current?.localParticipant?.videoTrackPublications) {
+      liveKitRoomRef.current.localParticipant.videoTrackPublications.forEach((pub: any) => {
+        if (pub.track?.sender) {
+          applySenderPriority(pub.track.sender, 'video', nextQuality);
+        }
+      });
     }
     peerConnectionsRef.current.forEach((pc) => {
       applyStudioEncoderTuning(pc, nextQuality);
@@ -1641,8 +1774,13 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       const spec = QUALITY_MAP[videoQuality];
       const candidates: MediaStreamConstraints[] = [
         {
-          video: { facingMode, width: { ideal: spec.width }, height: { ideal: spec.height }, frameRate: { ideal: 30 } },
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: {
+            facingMode,
+            width: { ideal: spec.width, min: 240 },
+            height: { ideal: spec.height, min: 180 },
+            frameRate: { ideal: videoQuality === '360p' ? 18 : 24, max: 24 },
+          },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48000 },
         },
         { video: { facingMode }, audio: true },
         { video: true, audio: true },
@@ -1688,46 +1826,82 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       setIsMicOn(hasAudio);
       setMediaWarning(null);
 
-      // Push new tracks to LiveKit if connected
+      // Push/replace new tracks on LiveKit if connected (without opening P2P/WS relay)
       if (liveKitRoomRef.current) {
+        const { Track } = await import('livekit-client');
         for (const t of stream.getTracks()) {
-          await liveKitRoomRef.current.localParticipant.publishTrack(t).catch(() => {});
-        }
-      }
-
-      // Push/upgrade transceivers & renegotiate new tracks cleanly across all WebRTC peer connections
-      for (const [peerId, pc] of peerConnectionsRef.current.entries()) {
-        for (const t of stream.getTracks()) {
-          const matchingTransceiver = pc.getTransceivers().find(
-            (tr) => tr.sender?.track?.kind === t.kind || tr.receiver?.track?.kind === t.kind
-          );
-          if (matchingTransceiver) {
-            try {
-              matchingTransceiver.direction = 'sendrecv';
-              await matchingTransceiver.sender.replaceTrack(t);
-            } catch {}
-          } else {
-            pc.addTrack(t, stream);
+          if (t.kind === 'audio') {
+            const existingAudioPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Microphone);
+            if (existingAudioPub?.track) {
+              await existingAudioPub.track.replaceTrack(t, true).catch(() => {});
+            } else {
+              const pub = await liveKitRoomRef.current.localParticipant
+                .publishTrack(t, {
+                  source: Track.Source.Microphone,
+                  dtx: true,
+                  red: true,
+                  audioPreset: { maxBitrate: 24_000 },
+                })
+                .catch(() => null);
+              if (pub?.track?.sender) applySenderPriority(pub.track.sender, 'audio', videoQuality);
+            }
+          } else if (t.kind === 'video') {
+            const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
+            if (existingCamPub?.track) {
+              await existingCamPub.track.replaceTrack(t, true).catch(() => {});
+            } else {
+              const pub = await liveKitRoomRef.current.localParticipant
+                .publishTrack(t, {
+                  source: Track.Source.Camera,
+                  simulcast: true,
+                  videoEncoding: {
+                    maxBitrate: spec.maxBitrate,
+                    maxFramerate: videoQuality === '360p' ? 18 : 24,
+                  },
+                  degradationPreference: 'maintain-framerate',
+                })
+                .catch(() => null);
+              if (pub?.track?.sender) applySenderPriority(pub.track.sender, 'video', videoQuality);
+            }
           }
         }
-        await applyStudioEncoderTuning(pc, videoQuality);
-        if (pc.signalingState === 'stable') {
-          try {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            wsRef.current?.send(
-              JSON.stringify({
-                type: 'webrtc-signal',
-                roomId: ROOM_ID,
-                targetPeerId: peerId,
-                signal: { sdp: offer },
-              })
+      } else {
+        // Push/upgrade transceivers & renegotiate new tracks cleanly across all WebRTC peer connections
+        for (const [peerId, pc] of peerConnectionsRef.current.entries()) {
+          for (const t of stream.getTracks()) {
+            const matchingTransceiver = pc.getTransceivers().find(
+              (tr) => tr.sender?.track?.kind === t.kind || tr.receiver?.track?.kind === t.kind
             );
-          } catch {}
+            if (matchingTransceiver) {
+              try {
+                matchingTransceiver.direction = 'sendrecv';
+                await matchingTransceiver.sender.replaceTrack(t);
+              } catch {}
+            } else {
+              pc.addTrack(t, stream);
+            }
+          }
+          await applyStudioEncoderTuning(pc, videoQuality);
+          if (pc.signalingState === 'stable') {
+            try {
+              const offer = await pc.createOffer();
+              const tunedSdp = preferRobustOpusSdp(offer.sdp);
+              const tunedOffer = tunedSdp ? { type: offer.type, sdp: tunedSdp } : offer;
+              await pc.setLocalDescription(tunedOffer);
+              wsRef.current?.send(
+                JSON.stringify({
+                  type: 'webrtc-signal',
+                  roomId: ROOM_ID,
+                  targetPeerId: peerId,
+                  signal: { sdp: tunedOffer },
+                })
+              );
+            } catch {}
+          }
         }
+        wsMediaSenderRef.current?.ensureAudioCapture();
       }
 
-      wsMediaSenderRef.current?.ensureAudioCapture();
       unlockRemoteAudio();
       broadcastMediaState({ isVideoOn: hasVideo, isMicOn: hasAudio });
     } finally {
@@ -1746,6 +1920,12 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     tracks.forEach((t) => {
       t.enabled = next;
     });
+    if (liveKitRoomRef.current?.localParticipant?.audioTrackPublications) {
+      liveKitRoomRef.current.localParticipant.audioTrackPublications.forEach((pub: any) => {
+        if (next) pub.unmute?.().catch(() => {});
+        else pub.mute?.().catch(() => {});
+      });
+    }
     isMicOnRef.current = next;
     setIsMicOn(next);
     if (!next) setMyVolume(0);
@@ -1763,6 +1943,12 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     tracks.forEach((t) => {
       t.enabled = next;
     });
+    if (liveKitRoomRef.current?.localParticipant?.videoTrackPublications) {
+      liveKitRoomRef.current.localParticipant.videoTrackPublications.forEach((pub: any) => {
+        if (next) pub.unmute?.().catch(() => {});
+        else pub.mute?.().catch(() => {});
+      });
+    }
     isVideoOnRef.current = next || isScreenSharingRef.current;
     setIsVideoOn(next);
     broadcastMediaState({ isVideoOn: next });
@@ -1775,9 +1961,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       const newCamStream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: nextFacing,
-          width: { ideal: spec.width },
-          height: { ideal: spec.height },
-          frameRate: { ideal: 30 },
+          width: { ideal: spec.width, min: 240 },
+          height: { ideal: spec.height, min: 180 },
+          frameRate: { ideal: videoQuality === '360p' ? 18 : 24, max: 24 },
         },
       });
       const newVideoTrack = newCamStream.getVideoTracks()[0];
@@ -1791,6 +1977,14 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         localStreamRef.current.addTrack(newVideoTrack);
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = localStreamRef.current;
+        }
+        if (liveKitRoomRef.current) {
+          const { Track } = await import('livekit-client');
+          const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
+          if (existingCamPub?.track) {
+            await existingCamPub.track.replaceTrack(newVideoTrack, true).catch(() => {});
+            if (existingCamPub.track.sender) applySenderPriority(existingCamPub.track.sender, 'video', videoQuality);
+          }
         }
         peerConnectionsRef.current.forEach((pc) => {
           const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
@@ -1810,6 +2004,13 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       screenStreamRef.current = null;
       const camTrack = localStreamRef.current?.getVideoTracks()[0];
       if (camTrack) {
+        if (liveKitRoomRef.current) {
+          const { Track } = await import('livekit-client');
+          const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
+          if (existingCamPub?.track) {
+            await existingCamPub.track.replaceTrack(camTrack, true).catch(() => {});
+          }
+        }
         peerConnectionsRef.current.forEach((pc) => {
           const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
           if (sender) sender.replaceTrack(camTrack).catch(() => {});
@@ -1826,6 +2027,17 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         const screenTrack = displayStream.getVideoTracks()[0];
         screenStreamRef.current = displayStream;
 
+        if (liveKitRoomRef.current) {
+          const { Track } = await import('livekit-client');
+          const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
+          if (existingCamPub?.track) {
+            await existingCamPub.track.replaceTrack(screenTrack, true).catch(() => {});
+          } else {
+            await liveKitRoomRef.current.localParticipant
+              .publishTrack(screenTrack, { source: Track.Source.ScreenShare, simulcast: true })
+              .catch(() => {});
+          }
+        }
         peerConnectionsRef.current.forEach((pc) => {
           const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
           if (sender) sender.replaceTrack(screenTrack).catch(() => {});
@@ -1841,6 +2053,14 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
           broadcastMediaState({ isScreenSharing: false });
           const camTrack = localStreamRef.current?.getVideoTracks()[0];
           if (camTrack) {
+            if (liveKitRoomRef.current) {
+              import('livekit-client').then(({ Track }) => {
+                const existingCamPub = liveKitRoomRef.current?.localParticipant?.getTrackPublication(Track.Source.Camera);
+                if (existingCamPub?.track) {
+                  existingCamPub.track.replaceTrack(camTrack, true).catch(() => {});
+                }
+              });
+            }
             peerConnectionsRef.current.forEach((pc) => {
               const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
               if (sender) sender.replaceTrack(camTrack).catch(() => {});
@@ -1998,9 +2218,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             className="bg-stone-900 border border-amber-700/50 text-amber-200 text-xs font-bold rounded-lg px-2 py-1 focus:outline-none"
             title="የቪዲዮ ጥራት ምረጥ"
           >
-            <option value="1080p">Full HD 1080p</option>
-            <option value="720p">HD 720p</option>
-            <option value="360p">ፈጣን 360p</option>
+            <option value="1080p">{QUALITY_MAP['1080p'].label}</option>
+            <option value="720p">{QUALITY_MAP['720p'].label}</option>
+            <option value="360p">{QUALITY_MAP['360p'].label}</option>
           </select>
 
           <div

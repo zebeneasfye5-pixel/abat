@@ -2,10 +2,18 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Shield, Lock, Video, VideoOff, Mic, MicOff, PhoneOff, Check, Sparkles, KeyRound, Flame, Volume2, RefreshCw, Maximize2, Minimize2 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { UserProfile, ConfessionBooking } from '../types';
-import { fetchWebRTCConfig, verifySecretRoomPasscode, getRealtimeWsUrl } from '../services/api';
+import { fetchWebRTCConfig, fetchLiveKitToken, verifySecretRoomPasscode, getRealtimeWsUrl } from '../services/api';
 import { playChurchBell, speakBlessingPrayer } from '../utils/audio';
 import { WsMediaAudioPlayer, WsMediaSender } from '../utils/wsMediaRelay';
 import sacredSanctuaryImg from '../assets/images/sacred_confession_sanctuary_1794468348510.jpg';
+
+function setSdpFmtpParam(line: string, key: string, value: string): string {
+  const re = new RegExp(`([;\\s])${key}=[^;\\r\\n]*`, 'i');
+  if (re.test(line)) {
+    return line.replace(re, `$1${key}=${value}`);
+  }
+  return `${line};${key}=${value}`;
+}
 
 function preferRobustOpusSdp(sdp?: string): string | undefined {
   if (!sdp) return sdp;
@@ -20,10 +28,9 @@ function preferRobustOpusSdp(sdp?: string): string | undefined {
   const nextLines = lines.map((line) => {
     if (line.startsWith(fmtpPrefix)) {
       replaced = true;
-      let next = line;
-      if (!next.includes('useinbandfec=')) next += ';useinbandfec=1';
-      if (!next.includes('usedtx=')) next += ';usedtx=0';
-      if (!next.includes('maxaveragebitrate=')) next += ';maxaveragebitrate=48000';
+      let next = setSdpFmtpParam(line, 'useinbandfec', '1');
+      next = setSdpFmtpParam(next, 'usedtx', '1');
+      next = setSdpFmtpParam(next, 'maxaveragebitrate', '24000');
       return next;
     }
     return line;
@@ -31,10 +38,38 @@ function preferRobustOpusSdp(sdp?: string): string | undefined {
   if (!replaced) {
     const idx = nextLines.findIndex((l) => l.startsWith(`a=rtpmap:${opusPt} `));
     if (idx !== -1) {
-      nextLines.splice(idx + 1, 0, `${fmtpPrefix}minptime=10;useinbandfec=1;usedtx=0;maxaveragebitrate=48000`);
+      nextLines.splice(idx + 1, 0, `${fmtpPrefix}minptime=10;useinbandfec=1;usedtx=1;maxaveragebitrate=24000`);
     }
   }
   return nextLines.join('\r\n');
+}
+
+async function applySecretSenderPriority(sender: RTCRtpSender | undefined, kind: 'audio' | 'video') {
+  if (!sender) return;
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    if (kind === 'video') {
+      params.encodings.forEach((enc, idx) => {
+        if (idx === params.encodings.length - 1) {
+          enc.maxBitrate = 400_000;
+        } else {
+          enc.maxBitrate = Math.min(enc.maxBitrate || 400_000, 400_000);
+        }
+        enc.maxFramerate = 20;
+        (enc as any).priority = 'low';
+        (enc as any).networkPriority = 'low';
+      });
+      (params as any).degradationPreference = 'balanced';
+    } else {
+      params.encodings[0].maxBitrate = 24_000;
+      (params.encodings[0] as any).priority = 'high';
+      (params.encodings[0] as any).networkPriority = 'high';
+    }
+    await sender.setParameters(params);
+  } catch {}
 }
 
 interface SecretConfessionRoomProps {
@@ -75,6 +110,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const [audioRelayForced, setAudioRelayForced] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
+  const [liveKitActive, setLiveKitActive] = useState(false);
 
   // Confession Ritual Steps (1: ጸሎት, 2: መናዘዝ, 3: ቀኖና, 4: ፍትሐት)
   const [activeStep, setActiveStep] = useState<1 | 2 | 3 | 4>(1);
@@ -92,6 +128,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const streamRef = useRef<MediaStream | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
+  const liveKitRoomRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsAudioPlayerRef = useRef<WsMediaAudioPlayer | null>(null);
   const wsMediaSenderRef = useRef<WsMediaSender | null>(null);
@@ -118,6 +155,8 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   remoteVideoHasFramesRef.current = remoteVideoHasFrames;
   const remoteIsVideoOnRef = useRef(remoteIsVideoOn);
   remoteIsVideoOnRef.current = remoteIsVideoOn;
+  const liveKitActiveRef = useRef(liveKitActive);
+  liveKitActiveRef.current = liveKitActive;
 
   const unlockSecretAudio = () => {
     wsAudioPlayerRef.current?.unlock().then((ok) => {
@@ -195,27 +234,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       pcRef.current = pc;
 
       const applyEncoderParams = (conn: RTCPeerConnection) => {
-        try {
-          conn.getSenders().forEach((sender) => {
-            if (!sender.track) return;
-            const params = sender.getParameters();
-            if (!params.encodings || params.encodings.length === 0) {
-              params.encodings = [{}];
-            }
-            if (sender.track.kind === 'video') {
-              params.encodings[0].maxBitrate = 750_000;
-              params.encodings[0].maxFramerate = 24;
-              (params.encodings[0] as any).priority = 'low';
-              (params.encodings[0] as any).networkPriority = 'low';
-              (params as any).degradationPreference = 'balanced';
-            } else if (sender.track.kind === 'audio') {
-              params.encodings[0].maxBitrate = 48_000;
-              (params.encodings[0] as any).priority = 'high';
-              (params.encodings[0] as any).networkPriority = 'high';
-            }
-            sender.setParameters(params).catch(() => {});
-          });
-        } catch {}
+        conn.getSenders().forEach((sender) => {
+          if (!sender.track) return;
+          applySecretSenderPriority(sender, sender.track.kind === 'audio' ? 'audio' : 'video');
+        });
       };
 
       const stream = streamRef.current;
@@ -327,7 +349,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         };
         const candidates: MediaStreamConstraints[] = [
           {
-            video: { facingMode: 'user', width: { ideal: 1280, min: 320 }, height: { ideal: 720, min: 240 }, frameRate: { ideal: 24, max: 30 } },
+            video: { facingMode: 'user', width: { ideal: 640, min: 320 }, height: { ideal: 360, min: 180 }, frameRate: { ideal: 20, max: 24 } },
             audio: hdAudio,
           },
           { video: { facingMode: 'user' }, audio: true },
@@ -401,6 +423,158 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         wsAudioPlayerRef.current = new WsMediaAudioPlayer((blocked) => setAudioBlocked(blocked));
       }
 
+      // Primary Transport: Connect via LiveKit SFU when configured on server
+      if (rtcConfig.sfuConfigured) {
+        try {
+          const lkData = await fetchLiveKitToken(
+            roomId,
+            selfPeerIdRef.current,
+            user.baptismalName || user.fullName || 'ተሳታፊ',
+            true
+          );
+          if (lkData.sfuConfigured && lkData.url && lkData.token && !isCancelled) {
+            const { Room, RoomEvent, Track, ConnectionState } = await import('livekit-client');
+            const lkRoom = new Room({
+              adaptiveStream: true,
+              dynacast: true,
+              publishDefaults: {
+                simulcast: true,
+                dtx: true,
+                red: true,
+                audioPreset: { maxBitrate: 24_000 },
+                videoEncoding: {
+                  maxBitrate: 400_000,
+                  maxFramerate: 20,
+                },
+                degradationPreference: 'maintain-framerate',
+              },
+            });
+            liveKitRoomRef.current = lkRoom;
+
+            const syncSecretLkParticipants = () => {
+              const rp = Array.from(lkRoom.remoteParticipants.values())[0];
+              if (!rp) {
+                remoteStreamRef.current = null;
+                setRemoteUserConnected(false);
+                setRemoteUserName('');
+                setRemoteVideoHasFrames(false);
+                setIceState('waiting');
+                return;
+              }
+              const tracks: MediaStreamTrack[] = [];
+              rp.trackPublications.forEach((pub) => {
+                if (pub.track?.mediaStreamTrack) {
+                  tracks.push(pub.track.mediaStreamTrack);
+                }
+              });
+              const wrapped = new MediaStream(tracks);
+              remoteStreamRef.current = wrapped;
+              if (remoteVideoRef.current) {
+                remoteVideoRef.current.srcObject = wrapped;
+                remoteVideoRef.current.muted = true;
+                remoteVideoRef.current.play().catch(() => {});
+              }
+              if (remoteAudioRef.current) {
+                remoteAudioRef.current.srcObject = wrapped;
+                if (wrapped.getAudioTracks().length > 0) {
+                  remoteAudioRef.current
+                    .play()
+                    .then(() => setAudioBlocked(false))
+                    .catch(() => setAudioBlocked(true));
+                }
+              }
+              setRemoteRelayFrame(null);
+              setRemoteUserName(rp.name || rp.identity || 'ተሳታፊ');
+              setRemoteIsVideoOn(rp.isCameraEnabled);
+              setRemoteUserConnected(true);
+              setIceState('connected');
+            };
+
+            lkRoom
+              .on(RoomEvent.ParticipantConnected, syncSecretLkParticipants)
+              .on(RoomEvent.ParticipantDisconnected, syncSecretLkParticipants)
+              .on(RoomEvent.TrackSubscribed, () => {
+                syncSecretLkParticipants();
+                unlockSecretAudio();
+              })
+              .on(RoomEvent.TrackUnsubscribed, syncSecretLkParticipants)
+              .on(RoomEvent.TrackMuted, syncSecretLkParticipants)
+              .on(RoomEvent.TrackUnmuted, syncSecretLkParticipants)
+              .on(RoomEvent.LocalTrackPublished, (pub) => {
+                if (pub.track?.sender) {
+                  applySecretSenderPriority(pub.track.sender, pub.track.kind === Track.Kind.Audio ? 'audio' : 'video');
+                }
+              })
+              .on(RoomEvent.ConnectionStateChanged, (state) => {
+                const connected = state === ConnectionState.Connected;
+                setLiveKitActive(connected);
+                if (connected) {
+                  wsMediaSenderRef.current?.stop();
+                  wsMediaSenderRef.current = null;
+                  setWsRelayActive(false);
+                  setVideoRelayForced(false);
+                  setAudioRelayForced(false);
+                }
+              })
+              .on(RoomEvent.Disconnected, () => {
+                setLiveKitActive(false);
+              });
+
+            await lkRoom.connect(lkData.url, lkData.token);
+            if (isCancelled) {
+              lkRoom.disconnect();
+              liveKitRoomRef.current = null;
+              return;
+            }
+            setLiveKitActive(true);
+            wsMediaSenderRef.current?.stop();
+            wsMediaSenderRef.current = null;
+            setWsRelayActive(false);
+            setVideoRelayForced(false);
+            setAudioRelayForced(false);
+            if (pcRef.current) {
+              pcRef.current.close();
+              pcRef.current = null;
+            }
+
+            if (stream) {
+              for (const t of stream.getTracks()) {
+                if (t.kind === 'audio') {
+                  const pub = await lkRoom.localParticipant.publishTrack(t, {
+                    source: Track.Source.Microphone,
+                    dtx: true,
+                    red: true,
+                    audioPreset: { maxBitrate: 24_000 },
+                  });
+                  if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'audio');
+                } else if (t.kind === 'video') {
+                  const pub = await lkRoom.localParticipant.publishTrack(t, {
+                    source: Track.Source.Camera,
+                    simulcast: true,
+                    videoEncoding: {
+                      maxBitrate: 400_000,
+                      maxFramerate: 20,
+                    },
+                    degradationPreference: 'maintain-framerate',
+                  });
+                  if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'video');
+                }
+              }
+            }
+            syncSecretLkParticipants();
+          }
+        } catch (err) {
+          if (liveKitRoomRef.current) {
+            try {
+              liveKitRoomRef.current.disconnect();
+            } catch {}
+            liveKitRoomRef.current = null;
+          }
+          setLiveKitActive(false);
+          console.warn('Secret Room LiveKit fallback to WebRTC/WS:', err);
+        }
+      }
+
       let reconnectTimer: number | null = null;
       let keepaliveTimer: number | null = null;
 
@@ -450,22 +624,22 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
             if (data.type === 'ws-pong') {
               return;
             } else if (data.type === 'request-video-relay') {
-              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              if (liveKitRoomRef.current || !data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setVideoRelayForced(true);
               return;
             } else if (data.type === 'request-audio-relay') {
-              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              if (liveKitRoomRef.current || !data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setAudioRelayForced(true);
               return;
             } else if (data.type === 'ws-video-frame') {
-              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              if (liveKitRoomRef.current || !data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               setRemoteRelayFrame(data.frame);
               setRemoteIsVideoOn(data.isVideoOn !== false);
               if (data.senderName) setRemoteUserName(data.senderName);
               setRemoteUserConnected(true);
               return;
             } else if (data.type === 'ws-audio-chunk') {
-              if (!data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
+              if (liveKitRoomRef.current || !data.senderPeerId || data.senderPeerId === selfPeerIdRef.current) return;
               const hasVerifiedWebRtcAudio =
                 (iceStateRef.current === 'connected' || iceStateRef.current === 'completed') &&
                 webrtcAudioFlowingRef.current &&
@@ -473,6 +647,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               if (!hasVerifiedWebRtcAudio) {
                 wsAudioPlayerRef.current?.playChunk(data.senderPeerId, data.pcm16, data.sr || 16000, false);
               }
+              return;
+            }
+
+            if (liveKitRoomRef.current) {
               return;
             }
 
@@ -604,6 +782,13 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       wsMediaSenderRef.current = null;
       wsAudioPlayerRef.current?.dispose();
       wsAudioPlayerRef.current = null;
+      if (liveKitRoomRef.current) {
+        try {
+          liveKitRoomRef.current.disconnect();
+        } catch {}
+        liveKitRoomRef.current = null;
+      }
+      setLiveKitActive(false);
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'leave-room' }));
         wsRef.current.close();
@@ -624,9 +809,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     };
   }, [isAuthenticated, roomId, user.id, user.fullName, user.baptismalName, user.role]);
 
-  // Automatic 4.5s WebSocket Relay Fallback in 1-on-1 Confession Room if 4G CGNAT blocks WebRTC ICE
+  // Automatic 4.5s WebSocket Relay Fallback in 1-on-1 Confession Room if 4G CGNAT blocks WebRTC ICE (disabled when LiveKit is active)
   useEffect(() => {
-    if (!isAuthenticated || !wsConnected) {
+    if (!isAuthenticated || !wsConnected || liveKitRoomRef.current || liveKitActive) {
       setWsRelayActive(false);
       setVideoRelayForced(false);
       setAudioRelayForced(false);
@@ -644,11 +829,11 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       setWsRelayActive(true);
     }, 4500);
     return () => clearTimeout(timer);
-  }, [isAuthenticated, wsConnected, iceState]);
+  }, [isAuthenticated, wsConnected, iceState, liveKitActive]);
 
   // Monitor decoded WebRTC video frames AND real audio RTP byte counters in Secret Room
   useEffect(() => {
-    if (!isAuthenticated || !wsConnected || !remoteUserConnected) return;
+    if (!isAuthenticated || !remoteUserConnected) return;
 
     const healthCheck = window.setInterval(() => {
       const vid = remoteVideoRef.current;
@@ -663,6 +848,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     }, 600);
 
     const checkMediaStats = async () => {
+      if (liveKitRoomRef.current || liveKitActiveRef.current || !wsConnected) return;
       const isConn = iceStateRef.current === 'connected' || iceStateRef.current === 'completed';
       if (!isConn) return;
 
@@ -748,10 +934,15 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       clearTimeout(initialStatsTimer);
       clearInterval(intervalStatsTimer);
     };
-  }, [isAuthenticated, wsConnected, remoteUserConnected, roomId]);
+  }, [isAuthenticated, wsConnected, remoteUserConnected, roomId, liveKitActive]);
 
   useEffect(() => {
-    const needsSender = (wsRelayActive || videoRelayForced || audioRelayForced) && wsConnected && Boolean(roomId);
+    const needsSender =
+      (wsRelayActive || videoRelayForced || audioRelayForced) &&
+      wsConnected &&
+      Boolean(roomId) &&
+      !liveKitRoomRef.current &&
+      !liveKitActive;
     if (!needsSender) {
       wsMediaSenderRef.current?.stop();
       wsMediaSenderRef.current = null;
@@ -764,8 +955,16 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       getLocalStream: () => streamRef.current,
       isVideoEnabled: () => isVideoOnRef.current,
       isMicEnabled: () => isMicOnRef.current,
-      shouldSendVideo: () => (wsRelayActiveRef.current || videoRelayForcedRef.current) && isVideoOnRef.current,
-      shouldSendAudio: () => (wsRelayActiveRef.current || audioRelayForcedRef.current) && isMicOnRef.current,
+      shouldSendVideo: () =>
+        !liveKitRoomRef.current &&
+        !liveKitActiveRef.current &&
+        (wsRelayActiveRef.current || videoRelayForcedRef.current) &&
+        isVideoOnRef.current,
+      shouldSendAudio: () =>
+        !liveKitRoomRef.current &&
+        !liveKitActiveRef.current &&
+        (wsRelayActiveRef.current || audioRelayForcedRef.current) &&
+        isMicOnRef.current,
     });
     wsMediaSenderRef.current = sender;
     sender.start();
@@ -775,7 +974,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         wsMediaSenderRef.current = null;
       }
     };
-  }, [wsRelayActive, videoRelayForced, audioRelayForced, wsConnected, roomId]);
+  }, [wsRelayActive, videoRelayForced, audioRelayForced, wsConnected, roomId, liveKitActive]);
 
   const handleRequestSecretMedia = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -785,7 +984,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     setRequestingMedia(true);
     try {
       const candidates: MediaStreamConstraints[] = [
-        { video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true },
+        {
+          video: { facingMode, width: { ideal: 640, min: 320 }, height: { ideal: 360, min: 180 }, frameRate: { ideal: 20, max: 24 } },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48000 },
+        },
         { video: { facingMode }, audio: true },
         { video: true, audio: true },
         { video: true },
@@ -824,37 +1026,78 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       setIsMicOn(hasAudio);
       setMediaPermissionMsg(null);
 
-      if (pcRef.current) {
-        for (const track of stream.getTracks()) {
-          const matchingTransceiver = pcRef.current.getTransceivers().find(
-            (tr) => tr.sender?.track?.kind === track.kind || tr.receiver?.track?.kind === track.kind
-          );
-          if (matchingTransceiver) {
-            try {
-              matchingTransceiver.direction = 'sendrecv';
-              await matchingTransceiver.sender.replaceTrack(track);
-            } catch {}
-          } else {
-            pcRef.current.addTrack(track, stream);
+      if (liveKitRoomRef.current) {
+        const { Track } = await import('livekit-client');
+        for (const t of stream.getTracks()) {
+          if (t.kind === 'audio') {
+            const existingAudioPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Microphone);
+            if (existingAudioPub?.track) {
+              await existingAudioPub.track.replaceTrack(t, true).catch(() => {});
+            } else {
+              const pub = await liveKitRoomRef.current.localParticipant
+                .publishTrack(t, {
+                  source: Track.Source.Microphone,
+                  dtx: true,
+                  red: true,
+                  audioPreset: { maxBitrate: 24_000 },
+                })
+                .catch(() => null);
+              if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'audio');
+            }
+          } else if (t.kind === 'video') {
+            const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
+            if (existingCamPub?.track) {
+              await existingCamPub.track.replaceTrack(t, true).catch(() => {});
+            } else {
+              const pub = await liveKitRoomRef.current.localParticipant
+                .publishTrack(t, {
+                  source: Track.Source.Camera,
+                  simulcast: true,
+                  videoEncoding: { maxBitrate: 400_000, maxFramerate: 20 },
+                  degradationPreference: 'maintain-framerate',
+                })
+                .catch(() => null);
+              if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'video');
+            }
           }
         }
-        if (pcRef.current.signalingState === 'stable') {
-          try {
-            const offer = await pcRef.current.createOffer();
-            await pcRef.current.setLocalDescription(offer);
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(
-                JSON.stringify({
-                  type: 'webrtc-signal',
-                  roomId,
-                  targetPeerId: remotePeerIdRef.current,
-                  signal: { sdp: offer },
-                })
-              );
+      } else {
+        if (pcRef.current) {
+          for (const track of stream.getTracks()) {
+            const matchingTransceiver = pcRef.current.getTransceivers().find(
+              (tr) => tr.sender?.track?.kind === track.kind || tr.receiver?.track?.kind === track.kind
+            );
+            if (matchingTransceiver) {
+              try {
+                matchingTransceiver.direction = 'sendrecv';
+                await matchingTransceiver.sender.replaceTrack(track);
+              } catch {}
+            } else {
+              pcRef.current.addTrack(track, stream);
             }
-          } catch {}
+          }
+          if (pcRef.current.signalingState === 'stable') {
+            try {
+              const offer = await pcRef.current.createOffer();
+              const tunedSdp = preferRobustOpusSdp(offer.sdp);
+              const tunedOffer = tunedSdp ? { type: offer.type, sdp: tunedSdp } : offer;
+              await pcRef.current.setLocalDescription(tunedOffer);
+              if (wsRef.current?.readyState === WebSocket.OPEN) {
+                wsRef.current.send(
+                  JSON.stringify({
+                    type: 'webrtc-signal',
+                    roomId,
+                    targetPeerId: remotePeerIdRef.current,
+                    signal: { sdp: tunedOffer },
+                  })
+                );
+              }
+            } catch {}
+          }
         }
+        wsMediaSenderRef.current?.ensureAudioCapture();
       }
+
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(
           JSON.stringify({
@@ -864,7 +1107,6 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
           })
         );
       }
-      wsMediaSenderRef.current?.ensureAudioCapture();
       unlockSecretAudio();
     } finally {
       setRequestingMedia(false);
@@ -885,6 +1127,12 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     tracks.forEach((track) => {
       track.enabled = newState;
     });
+    if (liveKitRoomRef.current?.localParticipant?.videoTrackPublications) {
+      liveKitRoomRef.current.localParticipant.videoTrackPublications.forEach((pub: any) => {
+        if (newState) pub.unmute?.().catch(() => {});
+        else pub.mute?.().catch(() => {});
+      });
+    }
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
@@ -910,6 +1158,12 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     tracks.forEach((track) => {
       track.enabled = newState;
     });
+    if (liveKitRoomRef.current?.localParticipant?.audioTrackPublications) {
+      liveKitRoomRef.current.localParticipant.audioTrackPublications.forEach((pub: any) => {
+        if (newState) pub.unmute?.().catch(() => {});
+        else pub.mute?.().catch(() => {});
+      });
+    }
     if (!newState) setMicVolumeLevel(0);
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
@@ -922,16 +1176,16 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     }
   };
 
-  // Seamless HD camera flip without tearing down call
+  // Seamless camera flip without tearing down call
   const handleSwitchCamera = async () => {
     const nextFacing = facingMode === 'user' ? 'environment' : 'user';
     try {
       const newCamStream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: nextFacing,
-          width: { ideal: 1920, min: 640 },
-          height: { ideal: 1080, min: 480 },
-          frameRate: { ideal: 30 },
+          width: { ideal: 640, min: 320 },
+          height: { ideal: 360, min: 180 },
+          frameRate: { ideal: 20, max: 24 },
         },
       });
       const newTrack = newCamStream.getVideoTracks()[0];
@@ -944,6 +1198,14 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
         streamRef.current.addTrack(newTrack);
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = streamRef.current;
+        }
+        if (liveKitRoomRef.current) {
+          const { Track } = await import('livekit-client');
+          const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
+          if (existingCamPub?.track) {
+            await existingCamPub.track.replaceTrack(newTrack, true).catch(() => {});
+            if (existingCamPub.track.sender) applySecretSenderPriority(existingCamPub.track.sender, 'video');
+          }
         }
         const sender = pcRef.current?.getSenders().find((s) => s.track?.kind === 'video');
         if (sender) {
@@ -1115,6 +1377,15 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
 
           <button
             onClick={() => {
+              wsMediaSenderRef.current?.stop();
+              wsMediaSenderRef.current = null;
+              if (liveKitRoomRef.current) {
+                try {
+                  liveKitRoomRef.current.disconnect();
+                } catch {}
+                liveKitRoomRef.current = null;
+              }
+              setLiveKitActive(false);
               if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
               if (pcRef.current) pcRef.current.close();
               if (wsRef.current) wsRef.current.close();

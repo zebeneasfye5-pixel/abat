@@ -333,9 +333,9 @@ export class WsMediaSender {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
     // Prioritize audio packets: throttle or skip JPEG video frames whenever WS buffer starts backing up
-    if (ws.bufferedAmount > 65_000) return;
+    if (ws.bufferedAmount > 45_000) return;
     const now = performance.now();
-    const minInterval = ws.bufferedAmount > 25_000 ? 360 : 180;
+    const minInterval = ws.bufferedAmount > 15_000 ? 1500 : 800;
     if (now - this.lastVideoSentAt < minInterval) return;
 
     const videoEl = this.resolveReadyVideoElement();
@@ -355,7 +355,7 @@ export class WsMediaSender {
       const ctx = this.canvas.getContext('2d');
       if (!ctx) return;
       ctx.drawImage(videoEl, 0, 0, targetW, targetH);
-      const frame = this.canvas.toDataURL('image/jpeg', 0.52);
+      const frame = this.canvas.toDataURL('image/jpeg', 0.25);
       this.lastVideoSentAt = now;
       ws.send(
         JSON.stringify({

@@ -885,7 +885,7 @@ app.get('/api/webrtc-config', (_req: Request, res: Response) => {
   });
 });
 
-app.post('/api/livekit/token', (req: Request, res: Response) => {
+app.post(['/api/livekit/token', '/api/livekit-token'], (req: Request, res: Response) => {
   const livekitUrl = process.env.LIVEKIT_URL?.trim();
   const apiKey = process.env.LIVEKIT_API_KEY?.trim();
   const apiSecret = process.env.LIVEKIT_API_SECRET?.trim();

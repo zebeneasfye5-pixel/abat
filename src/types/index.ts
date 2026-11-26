@@ -117,3 +117,39 @@ export interface MemberDirectoryRecord {
   walletTotalGiven: number;
   lastUpdatedAt: string;
 }
+
+export interface AbatRoomRecord {
+  roomId: string;
+  title: string;
+  hostUid: string;
+  hostName: string;
+  roomType: 'assembly' | 'confession' | 'study';
+  status: 'live' | 'scheduled' | 'ended';
+  visibility: 'community' | 'private';
+  qualityPreset: '360p' | '720p' | '1080p';
+  participantCount: number;
+}
+
+export interface AbatAnnouncementRecord {
+  id: string;
+  authorUid: string;
+  authorName: string;
+  title: string;
+  body: string;
+  category: 'general' | 'assembly' | 'fasting' | 'urgent';
+  visibility: 'public' | 'archived';
+  createdAtMs: number;
+}
+
+export interface AbatMessageRecord {
+  id: string;
+  roomId: string;
+  senderUid: string;
+  senderName: string;
+  isPriest: boolean;
+  text: string;
+  timeLabel: string;
+  visibility: 'room' | 'deleted';
+  createdAtMs: number;
+}
+

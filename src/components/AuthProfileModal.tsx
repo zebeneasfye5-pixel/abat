@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { X, LogIn, LogOut, Flame, Shield, AlertCircle, CheckCircle2 } from 'lucide-react';
 import { UserProfile, UserRole } from '../types';
-import { registerUser, loginUser, updateUserProfile, logoutUser } from '../services/api';
+import { registerUser, loginUser, updateUserProfile, logoutUser, getAuthToken } from '../services/api';
+import { auth, signInWithGooglePopup, signOutFirebase, updateAbatUserProfile } from '../firebase';
 
 interface AuthProfileModalProps {
   isOpen: boolean;
@@ -117,8 +118,28 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
     }
   };
 
+  const handleGoogleSignIn = async () => {
+    setErrorMsg('');
+    setSuccessMsg('');
+    setLoading(true);
+    try {
+      const profile = await signInWithGooglePopup();
+      onUpdateUser(profile);
+      setMode('profile');
+      onClose();
+    } catch (err: any) {
+      if (err?.code === 'auth/popup-closed-by-user') {
+        setErrorMsg('የGoogle መግቢያ መስኮቱ ተዘግቷል። እባክዎ ደግመው ይሞክሩ።');
+      } else {
+        setErrorMsg(err?.message || 'በGoogle አካውንት መግባት አልተቻለም።');
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleSignOut = async () => {
-    await logoutUser();
+    await Promise.allSettled([logoutUser(), signOutFirebase()]);
     onUpdateUser({
       id: '',
       fullName: '',
@@ -142,14 +163,30 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
     setSuccessMsg('');
     setLoading(true);
     try {
-      const updated = await updateUserProfile({
-        fullName: formData.fullName,
-        baptismalName: formData.baptismalName,
-        phone: formData.phone,
-        email: formData.email,
-        confessorPriest: formData.confessorPriest,
-        confessionStage: formData.confessionStage as any,
-      });
+      let updated: UserProfile | null = null;
+      if (auth.currentUser) {
+        updated = await updateAbatUserProfile(auth.currentUser, {
+          fullName: formData.fullName,
+          baptismalName: formData.baptismalName,
+          phone: formData.phone,
+          confessorPriest: formData.confessorPriest,
+          confessionStage: formData.confessionStage as any,
+        });
+      }
+      if (getAuthToken()) {
+        const apiUpdated = await updateUserProfile({
+          fullName: formData.fullName,
+          baptismalName: formData.baptismalName,
+          phone: formData.phone,
+          email: formData.email,
+          confessorPriest: formData.confessorPriest,
+          confessionStage: formData.confessionStage as any,
+        });
+        if (!updated) updated = apiUpdated;
+      }
+      if (!updated) {
+        throw new Error('መረጃውን ለማደስ መግባት ያስፈልጋል።');
+      }
       onUpdateUser(updated);
       setSuccessMsg('መረጃዎ በሰርቨሩ ላይ በትክክል ተቀምጧል!');
       setTimeout(() => {
@@ -310,6 +347,27 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
         {/* SIGN IN VIEW */}
         {mode === 'signin' && (
           <form onSubmit={handleSignIn} className="space-y-4 text-xs">
+            <button
+              type="button"
+              disabled={loading}
+              onClick={handleGoogleSignIn}
+              className="w-full py-3 rounded-xl bg-stone-900 hover:bg-stone-800 border border-amber-500/60 text-amber-100 font-bold transition flex items-center justify-center gap-2.5 shadow-md disabled:opacity-50"
+            >
+              <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill="#EA4335" d="M12 5c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 1.09 14.97 0 12 0 7.39 0 3.4 2.64 1.44 6.5l3.66 2.84C5.98 6.81 8.75 5 12 5z" />
+                <path fill="#4285F4" d="M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58l3.76 2.91c2.2-2.03 3.66-5.02 3.66-8.73z" />
+                <path fill="#FBBC05" d="M5.1 14.66A7.16 7.16 0 0 1 4.72 12c0-.92.16-1.82.38-2.66L1.44 6.5A11.97 11.97 0 0 0 0 12c0 1.94.46 3.77 1.44 5.5l3.66-2.84z" />
+                <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.76-2.91c-1.08.72-2.45 1.16-4.17 1.16-3.25 0-6.02-1.81-6.9-4.34l-3.66 2.84C3.4 21.36 7.39 24 12 24z" />
+              </svg>
+              <span>በGoogle አካውንት ይግቡ (Sign in with Google)</span>
+            </button>
+
+            <div className="flex items-center gap-2 text-[11px] text-stone-500">
+              <div className="flex-1 h-px bg-stone-800" />
+              <span>ወይም በስልክ ቁጥር</span>
+              <div className="flex-1 h-px bg-stone-800" />
+            </div>
+
             <div>
               <label className="block text-stone-300 font-semibold mb-1">ስልክ ቁጥር</label>
               <input
@@ -361,6 +419,21 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
         {/* SIGN UP VIEW */}
         {mode === 'signup' && (
           <form onSubmit={handleSignUp} className="space-y-3 text-xs">
+            <button
+              type="button"
+              disabled={loading}
+              onClick={handleGoogleSignIn}
+              className="w-full py-2.5 rounded-xl bg-stone-900 hover:bg-stone-800 border border-amber-500/60 text-amber-100 font-bold transition flex items-center justify-center gap-2.5 shadow-md disabled:opacity-50"
+            >
+              <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill="#EA4335" d="M12 5c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 1.09 14.97 0 12 0 7.39 0 3.4 2.64 1.44 6.5l3.66 2.84C5.98 6.81 8.75 5 12 5z" />
+                <path fill="#4285F4" d="M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58l3.76 2.91c2.2-2.03 3.66-5.02 3.66-8.73z" />
+                <path fill="#FBBC05" d="M5.1 14.66A7.16 7.16 0 0 1 4.72 12c0-.92.16-1.82.38-2.66L1.44 6.5A11.97 11.97 0 0 0 0 12c0 1.94.46 3.77 1.44 5.5l3.66-2.84z" />
+                <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.76-2.91c-1.08.72-2.45 1.16-4.17 1.16-3.25 0-6.02-1.81-6.9-4.34l-3.66 2.84C3.4 21.36 7.39 24 12 24z" />
+              </svg>
+              <span>በGoogle በቀጥታ ተመዝገብ / ግባ</span>
+            </button>
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="block text-stone-300 font-semibold mb-1">መጠሪያ ሙሉ ስም *</label>

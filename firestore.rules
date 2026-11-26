@@ -1,0 +1,501 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Pillar 1 / Phase 4.1: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- GLOBAL HARDENED PRIMITIVES ---
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    // Token-only bootstrapped admin check (safe for allow list queries, zero DB reads)
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'zebeneasfye5@gmail.com';
+    }
+
+    // Full admin check (bootstrapped verified email OR trusted abat_admins doc)
+    function isAdmin() {
+      return isBootstrappedAdmin() || (
+        isVerifiedUser() &&
+        exists(/databases/$(database)/documents/abat_admins/$(request.auth.uid))
+      );
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    // --- ENTITY VALIDATION BLUEPRINTS ---
+    function isValidAbatAdmin(data) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'email', 'role', 'createdAt'])
+        && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 180
+        && data.role in ['admin', 'priest']
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAbatUser(data) {
+      return data.keys().hasAll([
+          'uid',
+          'fullName',
+          'baptismalName',
+          'phone',
+          'email',
+          'role',
+          'confessorPriest',
+          'confessionStage',
+          'avatarSeed',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid',
+          'fullName',
+          'baptismalName',
+          'phone',
+          'email',
+          'role',
+          'confessorPriest',
+          'confessionStage',
+          'avatarSeed',
+          'spiritualNotes',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120
+        && data.baptismalName is string && data.baptismalName.size() >= 1 && data.baptismalName.size() <= 120
+        && data.phone is string && data.phone.size() <= 40
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 180
+        && data.role in ['child', 'deacon', 'priest', 'admin']
+        && data.confessorPriest is string && data.confessorPriest.size() <= 120
+        && data.confessionStage in ['ጀማሪ', 'መካከለኛ', 'የበረታ/የቆረበ']
+        && data.avatarSeed is string && data.avatarSeed.size() <= 200
+        && (!('spiritualNotes' in data) || (data.spiritualNotes is string && data.spiritualNotes.size() <= 1000))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAbatRoom(data) {
+      return data.keys().hasAll([
+          'roomId',
+          'title',
+          'hostUid',
+          'hostName',
+          'roomType',
+          'status',
+          'visibility',
+          'qualityPreset',
+          'participantCount',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'roomId',
+          'title',
+          'hostUid',
+          'hostName',
+          'roomType',
+          'status',
+          'visibility',
+          'qualityPreset',
+          'participantCount',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.roomId)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 160
+        && isValidId(data.hostUid)
+        && data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 120
+        && data.roomType in ['assembly', 'confession', 'study']
+        && data.status in ['live', 'scheduled', 'ended']
+        && data.visibility in ['community', 'private']
+        && data.qualityPreset in ['360p', '720p', '1080p']
+        && data.participantCount is number && data.participantCount >= 0 && data.participantCount <= 50000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAbatSchedule(data) {
+      return data.keys().hasAll([
+          'ownerUid',
+          'childName',
+          'baptismalName',
+          'phone',
+          'date',
+          'time',
+          'scheduleType',
+          'status',
+          'secretPasscode',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerUid',
+          'childName',
+          'baptismalName',
+          'phone',
+          'date',
+          'time',
+          'scheduleType',
+          'status',
+          'secretPasscode',
+          'penanceNotes',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.ownerUid)
+        && data.childName is string && data.childName.size() >= 1 && data.childName.size() <= 120
+        && data.baptismalName is string && data.baptismalName.size() >= 1 && data.baptismalName.size() <= 120
+        && data.phone is string && data.phone.size() <= 40
+        && data.date is string && data.date.size() >= 1 && data.date.size() <= 40
+        && data.time is string && data.time.size() >= 1 && data.time.size() <= 40
+        && data.scheduleType in ['confession', 'assembly', 'prayer']
+        && data.status in ['pending', 'confirmed', 'completed', 'cancelled']
+        && data.secretPasscode is string && data.secretPasscode.size() <= 24
+        && (!('penanceNotes' in data) || (data.penanceNotes is string && data.penanceNotes.size() <= 1000))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAbatAnnouncement(data) {
+      return data.keys().hasAll([
+          'authorUid',
+          'authorName',
+          'title',
+          'body',
+          'category',
+          'visibility',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'authorUid',
+          'authorName',
+          'title',
+          'body',
+          'category',
+          'visibility',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.authorUid)
+        && data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 120
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 160
+        && data.body is string && data.body.size() >= 1 && data.body.size() <= 2000
+        && data.category in ['general', 'assembly', 'fasting', 'urgent']
+        && data.visibility in ['public', 'archived']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAbatMessage(data) {
+      return data.keys().hasAll([
+          'roomId',
+          'senderUid',
+          'senderName',
+          'isPriest',
+          'text',
+          'timeLabel',
+          'visibility',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'roomId',
+          'senderUid',
+          'senderName',
+          'isPriest',
+          'text',
+          'timeLabel',
+          'visibility',
+          'createdAt'
+        ])
+        && isValidId(data.roomId)
+        && isValidId(data.senderUid)
+        && data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 120
+        && data.isPriest is bool
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 1000
+        && data.timeLabel is string && data.timeLabel.size() >= 1 && data.timeLabel.size() <= 32
+        && data.visibility in ['room', 'deleted']
+        && data.createdAt is timestamp;
+    }
+
+    // --- 1. ADMIN ALLOWLIST ---
+    match /abat_admins/{userId} {
+      allow get: if isValidId(userId) && isVerifiedUser() && (isOwner(userId) || isAdmin());
+      allow list: if isBootstrappedAdmin();
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidAbatAdmin(incoming())
+        && isBootstrappedAdmin()
+        && incoming().uid == userId
+        && incoming().createdAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidAbatAdmin(incoming())
+        && isBootstrappedAdmin()
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'role']);
+      allow delete: if isVerifiedUser() && isValidId(userId) && isBootstrappedAdmin();
+    }
+
+    // --- 2. USER PROFILES (STRICT PII ISOLATION) ---
+    match /abat_users/{userId} {
+      allow get: if isValidId(userId) && isVerifiedUser() && (isOwner(userId) || isAdmin());
+      allow list: if isVerifiedUser() && (existing().uid == request.auth.uid || isBootstrappedAdmin());
+
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidAbatUser(incoming())
+        && incoming().uid == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() || (
+            isOwner(userId)
+            && incoming().email == request.auth.token.email
+            && incoming().role in ['child', 'deacon']
+          )
+        );
+
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidAbatUser(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'fullName',
+            'baptismalName',
+            'phone',
+            'role',
+            'confessorPriest',
+            'confessionStage',
+            'avatarSeed',
+            'spiritualNotes',
+            'updatedAt'
+          ])) ||
+          (isOwner(userId)
+            && incoming().email == existing().email
+            && incoming().role == existing().role
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName',
+              'baptismalName',
+              'phone',
+              'confessorPriest',
+              'confessionStage',
+              'avatarSeed',
+              'spiritualNotes',
+              'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerifiedUser() && isValidId(userId) && isAdmin();
+    }
+
+    // --- 3. MEETING ROOMS ---
+    match /abat_rooms/{roomId} {
+      allow get: if isValidId(roomId) && isVerifiedUser() && (
+        existing().visibility == 'community' ||
+        existing().hostUid == request.auth.uid ||
+        isAdmin()
+      );
+      allow list: if isVerifiedUser() && (
+        existing().visibility == 'community' ||
+        existing().hostUid == request.auth.uid ||
+        isBootstrappedAdmin()
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(roomId)
+        && isValidAbatRoom(incoming())
+        && incoming().roomId == roomId
+        && incoming().hostUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (incoming().visibility == 'private' || isAdmin());
+
+      allow update: if isVerifiedUser()
+        && isValidId(roomId)
+        && isValidAbatRoom(incoming())
+        && incoming().roomId == existing().roomId
+        && incoming().hostUid == existing().hostUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (existing().status != 'ended' || isAdmin())
+        && (
+          ((isAdmin() || existing().hostUid == request.auth.uid) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'title',
+              'hostName',
+              'status',
+              'visibility',
+              'qualityPreset',
+              'participantCount',
+              'updatedAt'
+            ])) ||
+          (existing().visibility == 'community' &&
+            existing().status == 'live' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['participantCount', 'updatedAt']))
+        );
+
+      allow delete: if isVerifiedUser() && isValidId(roomId) && (existing().hostUid == request.auth.uid || isAdmin());
+    }
+
+    // --- 4. SCHEDULES & CONFESSION SLOTS (PII ISOLATED) ---
+    match /abat_schedules/{scheduleId} {
+      allow get: if isValidId(scheduleId) && isVerifiedUser() && (
+        existing().ownerUid == request.auth.uid || isAdmin()
+      );
+      allow list: if isVerifiedUser() && (
+        existing().ownerUid == request.auth.uid || isBootstrappedAdmin()
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(scheduleId)
+        && isValidAbatSchedule(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().status == 'pending'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(scheduleId)
+        && isValidAbatSchedule(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (existing().status != 'completed' && existing().status != 'cancelled') || isAdmin()
+        )
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'status',
+            'date',
+            'time',
+            'penanceNotes',
+            'updatedAt'
+          ])) ||
+          (existing().ownerUid == request.auth.uid &&
+            incoming().status == 'cancelled' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+          (existing().ownerUid == request.auth.uid &&
+            existing().status == 'pending' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['date', 'time', 'updatedAt']))
+        );
+
+      allow delete: if isVerifiedUser() && isValidId(scheduleId) && (
+        (existing().ownerUid == request.auth.uid && existing().status == 'pending') || isAdmin()
+      );
+    }
+
+    // --- 5. ANNOUNCEMENTS ---
+    match /abat_announcements/{announcementId} {
+      allow get: if isValidId(announcementId) && isVerifiedUser() && (
+        existing().visibility == 'public' || isAdmin()
+      );
+      allow list: if isVerifiedUser() && (
+        existing().visibility == 'public' || isBootstrappedAdmin()
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(announcementId)
+        && isValidAbatAnnouncement(incoming())
+        && isAdmin()
+        && incoming().authorUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(announcementId)
+        && isValidAbatAnnouncement(incoming())
+        && isAdmin()
+        && incoming().authorUid == existing().authorUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'title',
+          'body',
+          'category',
+          'visibility',
+          'updatedAt'
+        ]);
+
+      allow delete: if isVerifiedUser() && isValidId(announcementId) && isAdmin();
+    }
+
+    // --- 6. ROOM CHAT MESSAGES ---
+    match /abat_messages/{messageId} {
+      allow get: if isValidId(messageId) && isVerifiedUser() && (
+        existing().visibility == 'room' ||
+        existing().senderUid == request.auth.uid ||
+        isAdmin()
+      );
+      allow list: if isVerifiedUser() && (
+        existing().visibility == 'room' ||
+        existing().senderUid == request.auth.uid ||
+        isBootstrappedAdmin()
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(messageId)
+        && isValidAbatMessage(incoming())
+        && incoming().senderUid == request.auth.uid
+        && incoming().visibility == 'room'
+        && incoming().createdAt == request.time
+        && (!incoming().isPriest || isAdmin())
+        && (
+          incoming().roomId == 'assembly-zoom-main' ||
+          exists(/databases/$(database)/documents/abat_rooms/$(incoming().roomId))
+        );
+
+      allow update: if isVerifiedUser()
+        && isValidId(messageId)
+        && isValidAbatMessage(incoming())
+        && incoming().roomId == existing().roomId
+        && incoming().senderUid == existing().senderUid
+        && incoming().senderName == existing().senderName
+        && incoming().isPriest == existing().isPriest
+        && incoming().timeLabel == existing().timeLabel
+        && incoming().createdAt == existing().createdAt
+        && (existing().visibility != 'deleted' || isAdmin())
+        && (
+          ((isAdmin() || existing().senderUid == request.auth.uid) &&
+            incoming().visibility == 'deleted' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['visibility'])) ||
+          (existing().senderUid == request.auth.uid &&
+            existing().visibility == 'room' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['text']))
+        );
+
+      allow delete: if isVerifiedUser() && isValidId(messageId) && (
+        existing().senderUid == request.auth.uid || isAdmin()
+      );
+    }
+  }
+}

@@ -9,6 +9,8 @@ import {
   BankAccountInfo,
   MinistryBankAccounts,
   CommunityEngagement,
+  AbatAnnouncementRecord,
+  AbatRoomRecord,
 } from './types';
 import {
   fetchConfessions,
@@ -20,6 +22,15 @@ import {
   toggleWebsiteLike,
   recordWebsiteShare,
 } from './services/api';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import {
+  auth,
+  ensureAbatUserProfile,
+  subscribeAbatSchedules,
+  subscribeAbatAnnouncements,
+  subscribeAbatRooms,
+  updateAbatScheduleStatus,
+} from './firebase';
 import { usePWAInstall } from './hooks/usePWAInstall';
 import {
   Shield,
@@ -105,8 +116,12 @@ export default function App() {
   // Immediately hydrate saved authenticated user synchronously so closing & reopening NEVER asks to re-register
   const [user, setUser] = useState<UserProfile>(() => getSavedUserSnapshot() || EMPTY_GUEST_USER);
 
-  // Confession bookings
+  // Confession bookings & Firestore announcements/rooms
   const [bookings, setBookings] = useState<ConfessionBooking[]>([]);
+  const [announcements, setAnnouncements] = useState<AbatAnnouncementRecord[]>([]);
+  const [rooms, setRooms] = useState<AbatRoomRecord[]>([]);
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [firestoreError, setFirestoreError] = useState<Error | null>(null);
 
   // Wallet & Bank Accounts
   const [walletState, setWalletState] = useState<WalletState>({
@@ -120,6 +135,10 @@ export default function App() {
   const [ministryBanks, setMinistryBanks] = useState<MinistryBankAccounts | undefined>(undefined);
   const [userBankAccount, setUserBankAccount] = useState<BankAccountInfo | null>(null);
 
+  if (firestoreError) {
+    throw firestoreError;
+  }
+
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
@@ -127,12 +146,26 @@ export default function App() {
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
+    const unsubAuth = onAuthStateChanged(auth, async (fbUser) => {
+      setFirebaseUser(fbUser);
+      if (fbUser && fbUser.emailVerified) {
+        try {
+          const profile = await ensureAbatUserProfile(fbUser);
+          setUser(profile);
+        } catch (err: any) {
+          console.warn('Firebase profile sync notice:', err?.message || err);
+        } finally {
+          setAuthChecked(true);
+        }
+      }
+    });
+
     // Sync/re-hydrate verified user with backend without erasing local session on Render cold restarts
     fetchCurrentUser()
       .then((loggedInUser) => {
         if (loggedInUser) {
-          setUser(loggedInUser);
-        } else {
+          setUser((prev) => (prev.isAuthenticated ? prev : loggedInUser));
+        } else if (!auth.currentUser) {
           const params = new URLSearchParams(window.location.search);
           if (params.get('inviteName') || params.get('invitePhone')) {
             setIsAuthModalOpen(true);
@@ -144,14 +177,61 @@ export default function App() {
     fetchCommunityEngagement().then(setEngagement).catch(() => {});
 
     return () => {
+      unsubAuth();
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
 
+  // Only attach Firestore real-time listeners once Firebase Auth user is signed in & verified
+  useEffect(() => {
+    if (!firebaseUser || !firebaseUser.emailVerified) {
+      setAnnouncements([]);
+      setRooms([]);
+      return;
+    }
+
+    const unsubSchedules = subscribeAbatSchedules(
+      (fsBookings) => {
+        setBookings((prev) => {
+          const fsIds = new Set(fsBookings.map((b) => b.id));
+          const apiOnly = prev.filter((b) => !fsIds.has(b.id) && !b.id.startsWith('sch_'));
+          return [...fsBookings, ...apiOnly];
+        });
+      },
+      (err) => setFirestoreError(err)
+    );
+
+    const unsubAnnouncements = subscribeAbatAnnouncements(
+      (list) => setAnnouncements(list),
+      (err) => setFirestoreError(err)
+    );
+
+    const unsubRooms = subscribeAbatRooms(
+      (list) => setRooms(list),
+      (err) => setFirestoreError(err)
+    );
+
+    return () => {
+      unsubSchedules();
+      unsubAnnouncements();
+      unsubRooms();
+    };
+  }, [firebaseUser]);
+
   const refreshProtectedData = useCallback(() => {
     if (!user.isAuthenticated) return;
-    fetchConfessions().then(setBookings);
+    fetchConfessions().then((apiBookings) => {
+      if (!apiBookings || apiBookings.length === 0) return;
+      setBookings((prev) => {
+        const existingIds = new Set(prev.map((b) => b.id));
+        const merged = [...prev];
+        for (const b of apiBookings) {
+          if (!existingIds.has(b.id)) merged.push(b);
+        }
+        return merged;
+      });
+    });
     fetchWalletData().then((data) => {
       if (data.balance) setWalletState(data.balance);
       if (data.transactions) setTransactions(data.transactions);
@@ -269,7 +349,10 @@ export default function App() {
   const handleUpdateBookingStatus = async (id: string, status: 'confirmed' | 'completed' | 'cancelled') => {
     setBookings((prev) => prev.map((b) => (b.id === id ? { ...b, status } : b)));
     try {
-      await updateConfessionStatus(id, status);
+      await Promise.allSettled([
+        updateConfessionStatus(id, status),
+        updateAbatScheduleStatus(id, status),
+      ]);
     } catch {}
   };
 
@@ -659,6 +742,8 @@ export default function App() {
             onUpdateUser={handleUpdateUser}
             onOpenAuthModal={() => setIsAuthModalOpen(true)}
             onDataRestored={refreshProtectedData}
+            announcements={announcements}
+            rooms={rooms}
           />
         )}
 

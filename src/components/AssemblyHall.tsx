@@ -32,6 +32,13 @@ import { UserProfile } from '../types';
 import { fetchLiveKitToken, fetchWebRTCConfig, getRealtimeWsUrl } from '../services/api';
 import { toggleSpiritualHymn, stopSpiritualHymn, playChurchBell } from '../utils/audio';
 import { WsMediaAudioPlayer, WsMediaSender } from '../utils/wsMediaRelay';
+import { onAuthStateChanged } from 'firebase/auth';
+import {
+  auth,
+  sendAbatRoomMessage,
+  subscribeAbatRoomMessages,
+  syncAbatRoomMetadata,
+} from '../firebase';
 
 interface AssemblyHallProps {
   user: UserProfile;
@@ -1508,6 +1515,65 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     };
   }, [createPeerConnection, triggerReaction, user.id, user.fullName, user.baptismalName, user.role, wsReconnectNonce]);
 
+  // Firestore abat_messages real-time chat sync (complements live WebSocket chat)
+  useEffect(() => {
+    let unsubMessages: (() => void) | undefined;
+    const unsubAuth = onAuthStateChanged(auth, (fbUser) => {
+      unsubMessages?.();
+      unsubMessages = undefined;
+      if (!fbUser || !fbUser.emailVerified) return;
+
+      unsubMessages = subscribeAbatRoomMessages(
+        ROOM_ID,
+        (fsMessages) => {
+          setChatMessages((prev) => {
+            const seen = new Set<string>();
+            const merged: ChatMessage[] = [];
+            for (const m of fsMessages) {
+              const key = `${m.senderName}::${m.timeLabel}::${m.text}`;
+              seen.add(key);
+              merged.push({
+                id: m.id,
+                sender: m.senderName,
+                text: m.text,
+                time: m.timeLabel,
+                isPriest: m.isPriest,
+              });
+            }
+            for (const p of prev) {
+              const key = `${p.sender}::${p.time}::${p.text}`;
+              if (!seen.has(key)) {
+                seen.add(key);
+                merged.push(p);
+              }
+            }
+            return merged;
+          });
+        },
+        (err) => console.warn('abat_messages sync notice:', err.message)
+      );
+    });
+    return () => {
+      unsubMessages?.();
+      unsubAuth();
+    };
+  }, [ROOM_ID]);
+
+  // Firestore abat_rooms metadata sync when authenticated via Google
+  useEffect(() => {
+    if (!auth.currentUser || !auth.currentUser.emailVerified) return;
+    syncAbatRoomMetadata({
+      roomId: ROOM_ID,
+      title: 'የቀጥታ ዙም ጉባኤ (Assembly Hall)',
+      roomType: 'assembly',
+      status: 'live',
+      visibility: 'community',
+      qualityPreset: videoQuality === '1080p' ? '1080p' : videoQuality === '720p' ? '720p' : '360p',
+      participantCount: Math.max(1, serverClientCount, 1 + remotePeers.length),
+      hostName: user.baptismalName || user.fullName || 'ቀሲስ ሄኖክ',
+    }).catch((err) => console.warn('abat_rooms sync notice:', err?.message || err));
+  }, [ROOM_ID, videoQuality, serverClientCount, remotePeers.length, user.baptismalName, user.fullName]);
+
   // Sync expanded/fullscreen state when user presses browser Back/ESC
   useEffect(() => {
     const onFsChange = () => {
@@ -2110,7 +2176,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   };
 
   const sendChatText = (text: string) => {
-    if (!text.trim()) return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
     const sender = user.baptismalName || user.fullName;
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -2119,10 +2186,19 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
           type: 'assembly-chat',
           roomId: ROOM_ID,
           sender,
-          text: text.trim(),
+          text: trimmed,
           time,
         })
       );
+    }
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      sendAbatRoomMessage({
+        roomId: ROOM_ID,
+        senderName: sender || 'ተሳታፊ',
+        isPriest: user.role === 'priest' || user.role === 'admin',
+        text: trimmed,
+        timeLabel: time,
+      }).catch((err) => console.warn('abat_messages send notice:', err?.message || err));
     }
   };
 

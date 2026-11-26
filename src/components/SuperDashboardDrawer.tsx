@@ -20,7 +20,15 @@ import {
   Copy,
   FileSpreadsheet,
 } from 'lucide-react';
-import { ConfessionBooking, WalletState, WalletTransaction, UserProfile, MemberDirectoryRecord } from '../types';
+import {
+  ConfessionBooking,
+  WalletState,
+  WalletTransaction,
+  UserProfile,
+  MemberDirectoryRecord,
+  AbatAnnouncementRecord,
+  AbatRoomRecord,
+} from '../types';
 import {
   fetchMembersDirectory,
   organizeMembersDirectory,
@@ -28,7 +36,17 @@ import {
   exportDatabaseBackup,
   importDatabaseBackup,
   MemberDirectoryPayload,
+  getAuthToken,
 } from '../services/api';
+import {
+  auth,
+  isFirebaseBootstrappedAdmin,
+  fetchAllAbatUsersForAdmin,
+  updateAbatUserProfile,
+  createAbatSchedule,
+  publishAbatAnnouncement,
+  archiveAbatAnnouncement,
+} from '../firebase';
 
 interface SuperDashboardDrawerProps {
   isOpen: boolean;
@@ -41,6 +59,8 @@ interface SuperDashboardDrawerProps {
   onUpdateUser?: (updated: UserProfile) => void;
   onOpenAuthModal?: () => void;
   onDataRestored?: () => void;
+  announcements?: AbatAnnouncementRecord[];
+  rooms?: AbatRoomRecord[];
 }
 
 export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
@@ -54,6 +74,8 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
   onUpdateUser,
   onOpenAuthModal,
   onDataRestored,
+  announcements = [],
+  rooms = [],
 }) => {
   const [activeTab, setActiveTab] = useState<'profile' | 'children' | 'confessions' | 'assembly_control' | 'wallet_audit' | 'system'>('profile');
 
@@ -80,19 +102,52 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
   const [systemStatus, setSystemStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [assemblyNotice, setAssemblyNotice] = useState<string | null>(null);
   const [isBackupBusy, setIsBackupBusy] = useState(false);
+  const [scheduleDate, setScheduleDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [scheduleTime, setScheduleTime] = useState('10:00');
+  const [scheduleSaving, setScheduleSaving] = useState(false);
+  const [annTitle, setAnnTitle] = useState('');
+  const [annBody, setAnnBody] = useState('');
+  const [annCategory, setAnnCategory] = useState<'general' | 'assembly' | 'fasting' | 'urgent'>('general');
+  const [annBusy, setAnnBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const isPriestOrAdmin = currentUser.isAuthenticated && (currentUser.role === 'priest' || currentUser.role === 'admin');
+  const isPriestOrAdmin =
+    (currentUser.isAuthenticated && (currentUser.role === 'priest' || currentUser.role === 'admin')) ||
+    isFirebaseBootstrappedAdmin(auth.currentUser);
 
   useEffect(() => {
     if (isOpen) {
       if (isPriestOrAdmin) {
-        fetchMembersDirectory().then((payload) => {
-          if (payload) {
-            setDirectoryMembers(payload.members || []);
-            setDirectoryStats(payload.stats || null);
-            setDirectoryUpdatedAt(payload.updatedAt || '');
+        Promise.all([
+          fetchMembersDirectory().catch(() => null),
+          isFirebaseBootstrappedAdmin(auth.currentUser)
+            ? fetchAllAbatUsersForAdmin().catch(() => [] as UserProfile[])
+            : Promise.resolve([] as UserProfile[]),
+        ]).then(([payload, fbUsers]) => {
+          const baseMembers: MemberDirectoryRecord[] = payload?.members ? [...payload.members] : [];
+          const seenEmails = new Set(baseMembers.map((m) => (m.email || '').toLowerCase()).filter(Boolean));
+          const seenIds = new Set(baseMembers.map((m) => m.id));
+          for (const u of fbUsers) {
+            const em = (u.email || '').toLowerCase();
+            if ((em && seenEmails.has(em)) || seenIds.has(u.id)) continue;
+            baseMembers.push({
+              id: u.id,
+              secularName: u.fullName,
+              spiritualName: u.baptismalName,
+              phone: u.phone,
+              email: u.email,
+              role: u.role,
+              confessorPriest: u.confessorPriest,
+              confessionStage: u.confessionStage,
+              sources: ['Firestore'],
+              confessionCount: 0,
+              walletTotalGiven: 0,
+              lastUpdatedAt: new Date().toISOString(),
+            });
           }
+          setDirectoryMembers(baseMembers);
+          setDirectoryStats(payload?.stats || null);
+          setDirectoryUpdatedAt(payload?.updatedAt || '');
         });
       } else {
         setDirectoryMembers([]);
@@ -112,26 +167,87 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
         role: currentUser.role || 'child',
       });
     }
-  }, [isOpen, currentUser]);
+  }, [isOpen, currentUser, isPriestOrAdmin]);
 
   if (!isOpen) return null;
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const updated = await updateUserProfile({
-        fullName: profileForm.fullName,
-        baptismalName: profileForm.baptismalName,
-        phone: profileForm.phone,
-        email: profileForm.email,
-        confessorPriest: profileForm.confessorPriest,
-        confessionStage: profileForm.confessionStage as any,
-      });
+      let updated: UserProfile | null = null;
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        updated = await updateAbatUserProfile(auth.currentUser, {
+          fullName: profileForm.fullName,
+          baptismalName: profileForm.baptismalName,
+          phone: profileForm.phone,
+          confessorPriest: profileForm.confessorPriest,
+          confessionStage: profileForm.confessionStage as any,
+        });
+      }
+      if (getAuthToken()) {
+        const apiUpdated = await updateUserProfile({
+          fullName: profileForm.fullName,
+          baptismalName: profileForm.baptismalName,
+          phone: profileForm.phone,
+          email: profileForm.email,
+          confessorPriest: profileForm.confessorPriest,
+          confessionStage: profileForm.confessionStage as any,
+        });
+        if (!updated) updated = apiUpdated;
+      }
+      if (!updated) {
+        if (onOpenAuthModal) onOpenAuthModal();
+        return;
+      }
       if (onUpdateUser) onUpdateUser(updated);
       setProfileSaved(true);
       setTimeout(() => setProfileSaved(false), 2000);
     } catch {
       if (onOpenAuthModal) onOpenAuthModal();
+    }
+  };
+
+  const handleCreateSchedule = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!auth.currentUser || !auth.currentUser.emailVerified) {
+      if (onOpenAuthModal) onOpenAuthModal();
+      return;
+    }
+    setScheduleSaving(true);
+    try {
+      await createAbatSchedule({
+        childName: currentUser.fullName || 'ተጠቃሚ',
+        baptismalName: currentUser.baptismalName || currentUser.fullName || 'የንስሐ ልጅ',
+        phone: currentUser.phone || '',
+        date: scheduleDate,
+        time: scheduleTime,
+        scheduleType: 'confession',
+      });
+    } catch (err: any) {
+      setSystemStatus({ type: 'error', message: err?.message || 'ቀጠሮ ማስመዝገብ አልተቻለም።' });
+    } finally {
+      setScheduleSaving(false);
+    }
+  };
+
+  const handlePublishAnnouncement = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!annTitle.trim() || !annBody.trim()) return;
+    setAnnBusy(true);
+    try {
+      await publishAbatAnnouncement({
+        title: annTitle.trim(),
+        body: annBody.trim(),
+        category: annCategory,
+        authorName: currentUser.baptismalName || currentUser.fullName || 'ቀሲስ ሄኖክ',
+      });
+      setAnnTitle('');
+      setAnnBody('');
+      setAssemblyNotice('አዲስ መንፈሳዊ ማስታወቂያ በFirestore ላይ ተለቋል!');
+    } catch (err: any) {
+      setAssemblyNotice(err?.message || 'ማስታወቂያ መልቀቅ አልተቻለም።');
+    } finally {
+      setAnnBusy(false);
     }
   };
 
@@ -662,6 +778,41 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
                 </div>
               </div>
 
+              {auth.currentUser?.emailVerified && (
+                <form
+                  onSubmit={handleCreateSchedule}
+                  className="p-3.5 rounded-xl bg-stone-900/70 border border-amber-800/40 flex flex-wrap items-end gap-2.5 text-xs"
+                >
+                  <div>
+                    <label className="block text-[11px] text-stone-400 mb-1">የቀጠሮ ቀን</label>
+                    <input
+                      type="date"
+                      required
+                      value={scheduleDate}
+                      onChange={(e) => setScheduleDate(e.target.value)}
+                      className="bg-stone-950 border border-stone-700 rounded-lg px-2.5 py-1.5 text-stone-100"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-stone-400 mb-1">ሰዓት</label>
+                    <input
+                      type="time"
+                      required
+                      value={scheduleTime}
+                      onChange={(e) => setScheduleTime(e.target.value)}
+                      className="bg-stone-950 border border-stone-700 rounded-lg px-2.5 py-1.5 text-stone-100"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={scheduleSaving}
+                    className="px-3.5 py-1.5 rounded-lg bg-amber-800 hover:bg-amber-700 text-amber-100 font-bold transition disabled:opacity-50"
+                  >
+                    {scheduleSaving ? 'በማስቀመጥ ላይ...' : 'ቀጠሮ ያዝ'}
+                  </button>
+                </form>
+              )}
+
               <div className="space-y-3">
                 {bookings.map((booking) => (
                   <div key={booking.id} className="p-4 rounded-xl bg-stone-900/50 border border-stone-800 space-y-2 text-xs">
@@ -751,6 +902,86 @@ export const SuperDashboardDrawer: React.FC<SuperDashboardDrawerProps> = ({
                 <div className="p-3 rounded-xl bg-emerald-950/60 border border-emerald-700/60 text-emerald-200 text-xs flex items-center gap-2">
                   <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                   <span>{assemblyNotice}</span>
+                </div>
+              )}
+
+              {rooms.length > 0 && (
+                <div className="p-4 rounded-xl bg-stone-900/60 border border-stone-800 space-y-2 text-xs">
+                  <p className="font-semibold text-amber-200">የቀጥታ አዳራሾች ({rooms.length})</p>
+                  {rooms.map((r) => (
+                    <div key={r.roomId} className="flex items-center justify-between p-2 rounded-lg bg-stone-950/80 border border-stone-800">
+                      <span className="text-stone-200 font-semibold truncate">{r.title}</span>
+                      <span className="text-[11px] text-emerald-400 font-mono">
+                        {r.status} · {r.participantCount} ተሳታፊ
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {isPriestOrAdmin && auth.currentUser?.emailVerified && (
+                <form onSubmit={handlePublishAnnouncement} className="p-4 rounded-xl bg-stone-900/60 border border-amber-800/40 space-y-2.5 text-xs">
+                  <p className="font-semibold text-amber-200">መንፈሳዊ ማስታወቂያ አውጣ (Announcements)</p>
+                  <input
+                    type="text"
+                    required
+                    maxLength={160}
+                    value={annTitle}
+                    onChange={(e) => setAnnTitle(e.target.value)}
+                    placeholder="የማስታወቂያ ርዕስ"
+                    className="w-full bg-stone-950 border border-stone-700 rounded-lg px-3 py-2 text-stone-100"
+                  />
+                  <textarea
+                    required
+                    maxLength={2000}
+                    rows={2}
+                    value={annBody}
+                    onChange={(e) => setAnnBody(e.target.value)}
+                    placeholder="ዝርዝር መልእክት..."
+                    className="w-full bg-stone-950 border border-stone-700 rounded-lg px-3 py-2 text-stone-100"
+                  />
+                  <div className="flex items-center justify-between gap-2">
+                    <select
+                      value={annCategory}
+                      onChange={(e) => setAnnCategory(e.target.value as any)}
+                      className="bg-stone-950 border border-stone-700 rounded-lg px-2.5 py-1.5 text-stone-100"
+                    >
+                      <option value="general">አጠቃላይ</option>
+                      <option value="assembly">የጉባኤ ጥሪ</option>
+                      <option value="fasting">የጾምና ጸሎት</option>
+                      <option value="urgent">አስቸኳይ</option>
+                    </select>
+                    <button
+                      type="submit"
+                      disabled={annBusy}
+                      className="px-4 py-1.5 rounded-lg bg-amber-800 hover:bg-amber-700 text-amber-100 font-bold transition disabled:opacity-50"
+                    >
+                      {annBusy ? 'በመላክ ላይ...' : 'ማስታወቂያ ልቀቅ'}
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {announcements.length > 0 && (
+                <div className="space-y-2 text-xs">
+                  <p className="font-semibold text-stone-300">የተለቀቁ ማስታወቂያዎች ({announcements.length})</p>
+                  {announcements.map((a) => (
+                    <div key={a.id} className="p-3 rounded-xl bg-stone-900/50 border border-stone-800 space-y-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-bold text-amber-200">{a.title}</span>
+                        {isPriestOrAdmin && auth.currentUser?.emailVerified && (
+                          <button
+                            type="button"
+                            onClick={() => archiveAbatAnnouncement(a.id)}
+                            className="text-[11px] text-stone-400 hover:text-red-300"
+                          >
+                            አንሳ
+                          </button>
+                        )}
+                      </div>
+                      <p className="text-stone-300">{a.body}</p>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>

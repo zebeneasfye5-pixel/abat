@@ -901,9 +901,223 @@ app.post(['/api/livekit/token', '/api/livekit-token'], (req: Request, res: Respo
   res.json({ sfuConfigured: true, url: livekitUrl, token });
 });
 
-// --- 1. REAL AUTHENTICATION & USER PROFILE ENDPOINTS ---
+// --- 1. REAL AUTHENTICATION, 6-DIGIT SMS OTP & USER PROFILE ENDPOINTS ---
+interface PendingOtpRecord {
+  codeHash: string;
+  expiresAt: number;
+  attempts: number;
+}
+
+const otpStore = new Map<string, PendingOtpRecord>();
+const otpSendHistory = new Map<string, number[]>();
+const consumedOtpJtis = new Map<string, number>();
+
+const OTP_EXPIRY_MS = 5 * 60 * 1000;
+const OTP_RATE_WINDOW_MS = 10 * 60 * 1000;
+const OTP_MAX_SENDS_PER_WINDOW = 3;
+const OTP_MAX_ATTEMPTS = 5;
+
+function pruneOtpStores() {
+  const now = Date.now();
+  for (const [key, rec] of otpStore.entries()) {
+    if (rec.expiresAt <= now) otpStore.delete(key);
+  }
+  for (const [key, times] of otpSendHistory.entries()) {
+    const recent = times.filter((t) => now - t < OTP_RATE_WINDOW_MS);
+    if (recent.length === 0) otpSendHistory.delete(key);
+    else otpSendHistory.set(key, recent);
+  }
+  for (const [jti, exp] of consumedOtpJtis.entries()) {
+    if (exp <= now) consumedOtpJtis.delete(jti);
+  }
+}
+
+function hashOtpCode(phoneKey: string, code: string): string {
+  return crypto.createHmac('sha256', getSessionSecret()).update(`${phoneKey}:${code}`).digest('hex');
+}
+
+function formatSmsDestination(rawPhone: string): string {
+  const clean = String(rawPhone || '').replace(/[\s\-()]+/g, '').trim();
+  if (!clean) return '';
+  if (clean.startsWith('+') && /^\+\d{9,15}$/.test(clean)) return clean;
+  if (clean.startsWith('251') && clean.length >= 12) return `+${clean}`;
+  if ((clean.startsWith('09') || clean.startsWith('07')) && clean.length === 10) {
+    return `+251${clean.slice(1)}`;
+  }
+  if (/^\d{9,15}$/.test(clean)) return `+${clean}`;
+  return '';
+}
+
+async function dispatchSmsOtp(
+  smsTo: string,
+  code: string
+): Promise<{ sent: boolean; provider: 'afromessage' | 'twilio' | 'dev'; error?: string }> {
+  const message = `ቀሲስ ሄኖክ - የምዝገባ ማረጋገጫ ኮድዎ ${code} ነው። ኮዱ በ5 ደቂቃ ውስጥ ጊዜው ያልፋል።`;
+
+  const afroKey = process.env.AFROMESSAGE_API_KEY?.trim();
+  const afroSender = process.env.AFROMESSAGE_SENDER?.trim();
+  if (afroKey && smsTo.startsWith('+251')) {
+    const bodyPayload: Record<string, string> = {
+      to: smsTo,
+      message,
+    };
+    if (afroSender) {
+      bodyPayload.from = afroSender;
+    }
+    const resp = await fetch('https://api.afromessage.com/api/send', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${afroKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(bodyPayload),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      return { sent: false, provider: 'afromessage', error: `AfroMessage error (${resp.status}): ${errText.slice(0, 120)}` };
+    }
+    return { sent: true, provider: 'afromessage' };
+  }
+
+  const twilioSid = process.env.TWILIO_ACCOUNT_SID?.trim();
+  const twilioToken = process.env.TWILIO_AUTH_TOKEN?.trim();
+  const twilioFrom = process.env.TWILIO_FROM_NUMBER?.trim();
+  if (twilioSid && twilioToken && twilioFrom) {
+    const authHeader = Buffer.from(`${twilioSid}:${twilioToken}`).toString('base64');
+    const formBody = new URLSearchParams({
+      To: smsTo,
+      From: twilioFrom,
+      Body: message,
+    });
+    const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(twilioSid)}/Messages.json`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${authHeader}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: formBody.toString(),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      return { sent: false, provider: 'twilio', error: `Twilio error (${resp.status}): ${errText.slice(0, 120)}` };
+    }
+    return { sent: true, provider: 'twilio' };
+  }
+
+  return { sent: false, provider: 'dev' };
+}
+
+app.post('/api/auth/send-otp', async (req: Request, res: Response) => {
+  pruneOtpStores();
+  const rawPhone = String(req.body?.phone || '').trim();
+  const phoneKey = normalizePhoneLookupKey(rawPhone);
+  const smsTo = formatSmsDestination(rawPhone);
+
+  if (!phoneKey || phoneKey.replace(/\D/g, '').length < 9 || !smsTo) {
+    res.status(400).json({ error: 'እባክዎ ትክክለኛ የስልክ ቁጥር ያስገቡ (ለምሳሌ 0911... ወይም +2519...)።' });
+    return;
+  }
+
+  const alreadyRegistered = db.users.find((u) => normalizePhoneLookupKey(u.phone) === phoneKey);
+  if (alreadyRegistered) {
+    res.status(409).json({ error: 'ይህ ስልክ ቁጥር ቀደም ሲል ተመዝግቧል። እባክዎ በአካውንትዎ ይግቡ (Sign In)።' });
+    return;
+  }
+
+  const now = Date.now();
+  const recentSends = (otpSendHistory.get(phoneKey) || []).filter((ts) => now - ts < OTP_RATE_WINDOW_MS);
+  if (recentSends.length >= OTP_MAX_SENDS_PER_WINDOW) {
+    res.status(429).json({ error: 'በ10 ደቂቃ ውስጥ ከ3 ጊዜ በላይ የማረጋገጫ ኮድ መላክ አይቻልም። እባክዎ ትንሽ ቆይተው ይሞክሩ።' });
+    return;
+  }
+
+  const code = crypto.randomInt(100000, 1000000).toString();
+  try {
+    const smsResult = await dispatchSmsOtp(smsTo, code);
+    if (smsResult.error) {
+      console.error('SMS OTP dispatch failure:', smsResult.error);
+      res.status(502).json({ error: 'የSMS ማረጋገጫ መላክ አልተቻለም። እባክዎ ትንሽ ቆይተው ደግመው ይሞክሩ።' });
+      return;
+    }
+
+    otpStore.set(phoneKey, {
+      codeHash: hashOtpCode(phoneKey, code),
+      expiresAt: now + OTP_EXPIRY_MS,
+      attempts: 0,
+    });
+    otpSendHistory.set(phoneKey, [...recentSends, now]);
+
+    if (smsResult.provider === 'dev') {
+      res.json({
+        ok: true,
+        delivery: 'dev',
+        expiresInSeconds: 300,
+        devOtp: code,
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      delivery: 'sms',
+      expiresInSeconds: 300,
+    });
+  } catch (err) {
+    console.error('Send OTP error:', err);
+    res.status(500).json({ error: 'የማረጋገጫ ኮድ ማዘጋጀት አልተቻለም።' });
+  }
+});
+
+app.post('/api/auth/verify-otp', (req: Request, res: Response) => {
+  pruneOtpStores();
+  const rawPhone = String(req.body?.phone || '').trim();
+  const code = String(req.body?.code || '').trim();
+  const phoneKey = normalizePhoneLookupKey(rawPhone);
+
+  if (!phoneKey || !/^\d{6}$/.test(code)) {
+    res.status(400).json({ error: 'እባክዎ ትክክለኛ ባለ 6-አሃዝ የማረጋገጫ ኮድ ያስገቡ።' });
+    return;
+  }
+
+  const record = otpStore.get(phoneKey);
+  if (!record || record.expiresAt <= Date.now()) {
+    otpStore.delete(phoneKey);
+    res.status(400).json({ error: 'የማረጋገጫ ኮዱ ጊዜው አልፏል ወይም አልተላከም። እባክዎ አዲስ ኮድ ይጠይቁ።' });
+    return;
+  }
+
+  if (record.attempts >= OTP_MAX_ATTEMPTS) {
+    otpStore.delete(phoneKey);
+    res.status(429).json({ error: 'ከፍተኛ የሙከራ ገደብ አልፏል። እባክዎ አዲስ ኮድ ይጠይቁ።' });
+    return;
+  }
+
+  const providedHash = Buffer.from(hashOtpCode(phoneKey, code), 'hex');
+  const storedHash = Buffer.from(record.codeHash, 'hex');
+  const matches = providedHash.length === storedHash.length && crypto.timingSafeEqual(providedHash, storedHash);
+
+  if (!matches) {
+    record.attempts += 1;
+    otpStore.set(phoneKey, record);
+    res.status(400).json({ error: 'ያስገቡት ባለ 6-አሃዝ ኮድ የተሳሳተ ነው።' });
+    return;
+  }
+
+  otpStore.delete(phoneKey);
+  const otpToken = signPayload({
+    typ: 'otp_verified',
+    phoneKey,
+    phone: rawPhone,
+    exp: Date.now() + 15 * 60 * 1000,
+    jti: crypto.randomUUID(),
+  });
+
+  res.json({ ok: true, otpToken });
+});
+
 app.post('/api/auth/register', (req: Request, res: Response) => {
-  const { fullName, baptismalName, phone, email, password, role, confessorPriest, confessionStage, priestCode } = req.body;
+  pruneOtpStores();
+  const { fullName, baptismalName, phone, email, password, role, confessorPriest, confessionStage, priestCode, otpToken } = req.body;
 
   if (!fullName || !baptismalName || !phone || !password) {
     res.status(400).json({ error: 'እባክዎ ሙሉ ስም፣ የክርስትና ስም፣ ስልክ ቁጥር እና የይለፍ ቃል ያስገቡ።' });
@@ -916,10 +1130,30 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
   }
 
   const normalizedPhone = String(phone).trim();
+  const phoneKey = normalizePhoneLookupKey(normalizedPhone);
   const normalizedEmail = String(email || '').trim().toLowerCase();
 
+  if (!otpToken || typeof otpToken !== 'string') {
+    res.status(403).json({ error: 'እባክዎ በቅድሚያ ስልክ ቁጥርዎን በባለ 6-አሃዝ የማረጋገጫ ኮድ (OTP) ያረጋግጡ።' });
+    return;
+  }
+
+  const verifiedOtp = verifySignedPayload<{ typ: string; phoneKey: string; exp: number; jti: string }>(otpToken);
+  if (
+    !verifiedOtp ||
+    verifiedOtp.typ !== 'otp_verified' ||
+    verifiedOtp.phoneKey !== phoneKey ||
+    !verifiedOtp.exp ||
+    verifiedOtp.exp < Date.now() ||
+    !verifiedOtp.jti ||
+    consumedOtpJtis.has(verifiedOtp.jti)
+  ) {
+    res.status(403).json({ error: 'የስልክ ማረጋገጫው ትክክለኛ አይደለም ወይም ጊዜው አልፏል። እባክዎ ኮዱን ደግመው ያረጋግጡ።' });
+    return;
+  }
+
   const exists = db.users.find(
-    (u) => u.phone === normalizedPhone || (normalizedEmail && u.email.toLowerCase() === normalizedEmail)
+    (u) => normalizePhoneLookupKey(u.phone) === phoneKey || (normalizedEmail && u.email.toLowerCase() === normalizedEmail)
   );
   if (exists) {
     res.status(409).json({ error: 'ይህ ስልክ ቁጥር ወይም ኢሜይል ቀደም ሲል ተመዝግቧል። እባክዎ በአካውንትዎ ይግቡ (Sign In)።' });
@@ -944,6 +1178,8 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
   } else if (role === 'deacon') {
     finalRole = 'deacon';
   }
+
+  consumedOtpJtis.set(verifiedOtp.jti, verifiedOtp.exp);
 
   const { hash, salt } = hashPassword(String(password));
   const newUser: StoredUser = {
@@ -982,8 +1218,12 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
   }
 
   const cleanId = String(identifier).trim();
+  const idPhoneKey = normalizePhoneLookupKey(cleanId);
   const user = db.users.find(
-    (u) => u.phone === cleanId || (u.email && u.email.toLowerCase() === cleanId.toLowerCase())
+    (u) =>
+      u.phone === cleanId ||
+      (idPhoneKey && normalizePhoneLookupKey(u.phone) === idPhoneKey) ||
+      (u.email && u.email.toLowerCase() === cleanId.toLowerCase())
   );
 
   if (!user) {

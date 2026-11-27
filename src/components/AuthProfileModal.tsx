@@ -1,7 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { X, LogIn, LogOut, Flame, Shield, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { X, LogIn, LogOut, Flame, Shield, AlertCircle, CheckCircle2, Smartphone, ArrowLeft, RefreshCw } from 'lucide-react';
 import { UserProfile, UserRole } from '../types';
-import { registerUser, loginUser, updateUserProfile, logoutUser, getAuthToken } from '../services/api';
+import {
+  registerUser,
+  loginUser,
+  updateUserProfile,
+  logoutUser,
+  getAuthToken,
+  sendRegistrationOtp,
+  verifyRegistrationOtp,
+} from '../services/api';
 import { auth, signInWithGooglePopup, signOutFirebase, updateAbatUserProfile } from '../firebase';
 
 interface AuthProfileModalProps {
@@ -27,6 +35,12 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
   const [loginIdentifier, setLoginIdentifier] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
 
+  // 2-step SMS OTP registration state
+  const [signupStep, setSignupStep] = useState<1 | 2>(1);
+  const [otpCode, setOtpCode] = useState('');
+  const [devOtpNotice, setDevOtpNotice] = useState('');
+  const [resendCountdown, setResendCountdown] = useState(0);
+
   const [formData, setFormData] = useState({
     fullName: currentUser.fullName || '',
     baptismalName: currentUser.baptismalName || '',
@@ -40,9 +54,21 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
   });
 
   useEffect(() => {
+    if (resendCountdown <= 0) return;
+    const timer = window.setTimeout(() => {
+      setResendCountdown((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [resendCountdown]);
+
+  useEffect(() => {
     if (isOpen) {
       setErrorMsg('');
       setSuccessMsg('');
+      setSignupStep(1);
+      setOtpCode('');
+      setDevOtpNotice('');
+      setResendCountdown(0);
       const params = new URLSearchParams(window.location.search);
       const inviteName = params.get('inviteName')?.trim() || '';
       const invitePhone = params.get('invitePhone')?.trim() || '';
@@ -92,11 +118,44 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
     }
   };
 
-  const handleSignUp = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleRequestOtp = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     setErrorMsg('');
+    setSuccessMsg('');
+    if (!formData.fullName.trim() || !formData.baptismalName.trim() || !formData.phone.trim() || formData.password.length < 4) {
+      setErrorMsg('እባክዎ ሙሉ ስም፣ የክርስትና ስም፣ ስልክ ቁጥር እና ቢያንስ 4 ፊደል/ቁጥር የይለፍ ቃል ያስገቡ።');
+      return;
+    }
     setLoading(true);
     try {
+      const otpRes = await sendRegistrationOtp(formData.phone);
+      setDevOtpNotice(otpRes.devOtp || '');
+      setOtpCode('');
+      setSignupStep(2);
+      setResendCountdown(60);
+      setSuccessMsg(
+        otpRes.delivery === 'dev'
+          ? 'ባለ 6-አሃዝ የሙከራ ማረጋገጫ ኮድ ተዘጋጅቷል።'
+          : `ባለ 6-አሃዝ የማረጋገጫ ኮድ ወደ ${formData.phone} ተልኳል።`
+      );
+    } catch (err: any) {
+      setErrorMsg(err.message || 'የማረጋገጫ ኮድ መላክ አልተቻለም።');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleVerifyAndSignUp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg('');
+    const cleanCode = otpCode.replace(/\D/g, '');
+    if (cleanCode.length !== 6) {
+      setErrorMsg('እባክዎ ባለ 6-አሃዝ የማረጋገጫ ኮድ ያስገቡ።');
+      return;
+    }
+    setLoading(true);
+    try {
+      const { otpToken } = await verifyRegistrationOtp(formData.phone, cleanCode);
       const { user } = await registerUser({
         fullName: formData.fullName,
         baptismalName: formData.baptismalName,
@@ -107,6 +166,7 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
         confessorPriest: formData.confessorPriest,
         confessionStage: formData.confessionStage,
         priestCode: formData.priestCode,
+        otpToken,
       });
       onUpdateUser(user);
       setMode('profile');
@@ -416,9 +476,9 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
           </form>
         )}
 
-        {/* SIGN UP VIEW */}
-        {mode === 'signup' && (
-          <form onSubmit={handleSignUp} className="space-y-3 text-xs">
+        {/* SIGN UP VIEW (2-Step SMS OTP Verification) */}
+        {mode === 'signup' && signupStep === 1 && (
+          <form onSubmit={handleRequestOtp} className="space-y-3 text-xs">
             <button
               type="button"
               disabled={loading}
@@ -467,7 +527,7 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
                 required
                 value={formData.phone}
                 onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-                placeholder="09..."
+                placeholder="09... ወይም +2519..."
                 className="w-full bg-stone-900 border border-stone-700 rounded-xl px-3 py-2 text-stone-100"
               />
             </div>
@@ -520,9 +580,10 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
             <button
               type="submit"
               disabled={loading}
-              className="w-full py-3 rounded-xl bg-gradient-to-r from-red-950 via-amber-900 to-red-950 border border-amber-600 text-amber-200 font-bold transition disabled:opacity-50"
+              className="w-full py-3 rounded-xl bg-gradient-to-r from-red-950 via-amber-900 to-red-950 border border-amber-600 text-amber-200 font-bold transition flex items-center justify-center gap-2 disabled:opacity-50"
             >
-              {loading ? 'በመመዝገብ ላይ...' : 'አካውንት ፍጠርና ተመዝገብ (Register)'}
+              <Smartphone className="w-4 h-4" />
+              <span>{loading ? 'ኮድ በመላክ ላይ...' : 'ባለ 6-አሃዝ የማረጋገጫ ኮድ ላክ (Send OTP)'}</span>
             </button>
 
             <div className="text-center pt-1">
@@ -530,11 +591,87 @@ export const AuthProfileModal: React.FC<AuthProfileModalProps> = ({
                 type="button"
                 onClick={() => {
                   setErrorMsg('');
+                  setSuccessMsg('');
                   setMode('signin');
                 }}
                 className="text-stone-400 hover:text-amber-300 hover:underline"
               >
                 ቀደም ሲል ተመዝግበዋል? ወደ አካውንት ይግቡ
+              </button>
+            </div>
+          </form>
+        )}
+
+        {mode === 'signup' && signupStep === 2 && (
+          <form onSubmit={handleVerifyAndSignUp} className="space-y-4 text-xs">
+            <div className="p-3.5 rounded-xl bg-stone-900/70 border border-amber-700/40 space-y-1.5">
+              <div className="flex items-center gap-2 text-amber-200 font-bold">
+                <Smartphone className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>የስልክ ቁጥር ማረጋገጫ ({formData.phone})</span>
+              </div>
+              <p className="text-stone-300 leading-relaxed">
+                በSMS የተላከውን ባለ 6-አሃዝ የማረጋገጫ ኮድ ከታች ያስገቡ። ኮዱ ለ5 ደቂቃ ያገለግላል።
+              </p>
+            </div>
+
+            {devOtpNotice && (
+              <div className="p-3 rounded-xl bg-amber-950/60 border border-amber-500/60 text-amber-100 flex items-center justify-between gap-2">
+                <span>የSMS አቅራቢ ቁልፍ ስላልተዋቀረ የሙከራ ኮድ (Dev OTP)፡</span>
+                <span className="font-mono font-extrabold text-sm text-amber-300 tracking-widest bg-stone-950 px-2.5 py-1 rounded-lg border border-amber-700/60">
+                  {devOtpNotice}
+                </span>
+              </div>
+            )}
+
+            <div>
+              <label className="block text-stone-300 font-semibold mb-1.5">ባለ 6-አሃዝ የማረጋገጫ ኮድ *</label>
+              <input
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                required
+                maxLength={6}
+                value={otpCode}
+                onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                placeholder="000000"
+                className="w-full bg-stone-900 border border-amber-600/60 rounded-xl px-4 py-3 text-center text-lg font-mono font-bold tracking-[0.45em] text-amber-200 focus:outline-none focus:border-amber-400"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading || otpCode.length !== 6}
+              className="w-full py-3 rounded-xl bg-gradient-to-r from-red-950 via-amber-900 to-red-950 border border-amber-600 text-amber-200 font-bold transition disabled:opacity-50"
+            >
+              {loading ? 'በማረጋገጥ ላይ...' : 'አረጋግጥና ምዝገባውን አጠናቅቅ (Verify & Register)'}
+            </button>
+
+            <div className="flex items-center justify-between gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setErrorMsg('');
+                  setSuccessMsg('');
+                  setSignupStep(1);
+                }}
+                className="inline-flex items-center gap-1 text-stone-400 hover:text-amber-300"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                <span>ስልክ ቁጥር አስተካክል</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={loading || resendCountdown > 0}
+                onClick={() => handleRequestOtp()}
+                className="inline-flex items-center gap-1.5 text-amber-400 hover:text-amber-300 disabled:text-stone-500 font-semibold"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>
+                  {resendCountdown > 0
+                    ? `እንደገና ላክ (${resendCountdown}ሰ)`
+                    : 'ኮድ እንደገና ላክ'}
+                </span>
               </button>
             </div>
           </form>

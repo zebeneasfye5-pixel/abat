@@ -154,7 +154,36 @@ async function safeFetchJson<T = any>(
   return data as T;
 }
 
-// --- 1. REAL PERMANENT AUTHENTICATION API ---
+// --- 1. REAL PERMANENT AUTHENTICATION & SMS OTP API ---
+export async function sendRegistrationOtp(phone: string): Promise<{
+  ok: boolean;
+  delivery: 'sms' | 'dev';
+  expiresInSeconds: number;
+  devOtp?: string;
+}> {
+  return safeFetchJson<{
+    ok: boolean;
+    delivery: 'sms' | 'dev';
+    expiresInSeconds: number;
+    devOtp?: string;
+  }>('/api/auth/send-otp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone }),
+  });
+}
+
+export async function verifyRegistrationOtp(
+  phone: string,
+  code: string
+): Promise<{ ok: boolean; otpToken: string }> {
+  return safeFetchJson<{ ok: boolean; otpToken: string }>('/api/auth/verify-otp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone, code }),
+  });
+}
+
 export async function registerUser(payload: {
   fullName: string;
   baptismalName: string;
@@ -165,6 +194,7 @@ export async function registerUser(payload: {
   confessorPriest?: string;
   confessionStage?: string;
   priestCode?: string;
+  otpToken: string;
 }): Promise<{ user: UserProfile; token: string }> {
   const data = await safeFetchJson<{ user: UserProfile; token: string; recoveryRecord?: string }>(
     '/api/auth/register',

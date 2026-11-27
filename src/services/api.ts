@@ -546,30 +546,54 @@ export interface ExtendedRTCConfig extends RTCConfiguration {
   livekitUrl?: string | null;
 }
 
+let cachedRtcConfig: { value: ExtendedRTCConfig; expiresAt: number } | null = null;
+let inflightRtcConfig: Promise<ExtendedRTCConfig> | null = null;
+
 export async function fetchWebRTCConfig(): Promise<ExtendedRTCConfig> {
-  try {
-    const data = await safeFetchJson<{
-      iceServers: RTCIceServer[];
-      sfuConfigured?: boolean;
-      livekitUrl?: string | null;
-    }>('/api/webrtc-config', {}, 10000);
-    if (Array.isArray(data.iceServers)) {
-      return {
-        iceServers: data.iceServers,
-        sfuConfigured: Boolean(data.sfuConfigured),
-        livekitUrl: data.livekitUrl || null,
-      };
-    }
-  } catch {}
-  return {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' },
-    ],
-    sfuConfigured: false,
-    livekitUrl: null,
-  };
+  if (cachedRtcConfig && cachedRtcConfig.expiresAt > Date.now()) {
+    return cachedRtcConfig.value;
+  }
+  if (inflightRtcConfig) {
+    return inflightRtcConfig;
+  }
+
+  inflightRtcConfig = (async () => {
+    try {
+      const data = await safeFetchJson<{
+        iceServers: RTCIceServer[];
+        sfuConfigured?: boolean;
+        livekitUrl?: string | null;
+      }>('/api/webrtc-config', {}, 10000);
+      if (Array.isArray(data.iceServers)) {
+        const result: ExtendedRTCConfig = {
+          iceServers: data.iceServers,
+          sfuConfigured: Boolean(data.sfuConfigured),
+          livekitUrl: data.livekitUrl || null,
+        };
+        cachedRtcConfig = { value: result, expiresAt: Date.now() + 60_000 };
+        return result;
+      }
+    } catch {}
+    return {
+      iceServers: [
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+      ],
+      sfuConfigured: false,
+      livekitUrl: null,
+    };
+  })().finally(() => {
+    inflightRtcConfig = null;
+  });
+
+  return inflightRtcConfig;
+}
+
+export function prewarmMediaConnection(): void {
+  fetchWebRTCConfig().catch(() => {});
+  import('livekit-client').catch(() => {});
 }
 
 export async function fetchLiveKitToken(

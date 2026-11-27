@@ -57,14 +57,14 @@ export class WsMediaAudioPlayer {
       try {
         const ctx = this.ctx;
         // Continuous single output stream eliminates per-chunk BufferSource gaps & clicks
-        const processor = ctx.createScriptProcessor(2048, 1, 1);
+        const processor = ctx.createScriptProcessor(1024, 1, 1);
         const silentInput = ctx.createGain();
         silentInput.gain.value = 0;
 
         const outSampleRate = ctx.sampleRate || 48000;
-        const targetJitterSamples = Math.round(outSampleRate * 0.14); // 140ms jitter cushion for 4G/Render RTT
-        const maxBufferSamples = Math.round(outSampleRate * 0.45);
-        const fadeLen = Math.round(outSampleRate * 0.008); // 8ms smooth fade
+        const targetJitterSamples = Math.round(outSampleRate * 0.045); // 45ms ultra-fast start jitter cushion
+        const maxBufferSamples = Math.round(outSampleRate * 0.35);
+        const fadeLen = Math.round(outSampleRate * 0.006); // 6ms smooth fade
 
         processor.onaudioprocess = (ev) => {
           const out = ev.outputBuffer.getChannelData(0);
@@ -87,7 +87,7 @@ export class WsMediaAudioPlayer {
             }
 
             if (!q.primed) {
-              if (q.bufferedSamples >= targetJitterSamples || (q.bufferedSamples > 0 && nowMs - q.lastChunkAt > 160)) {
+              if (q.bufferedSamples >= targetJitterSamples || (q.bufferedSamples > 0 && nowMs - q.lastChunkAt > 75)) {
                 q.primed = true;
                 q.fadeInRemaining = fadeLen;
               } else {
@@ -354,6 +354,9 @@ export class WsMediaSender {
       }
       const ctx = this.canvas.getContext('2d');
       if (!ctx) return;
+      if ('filter' in ctx) {
+        ctx.filter = 'brightness(1.12) contrast(1.06) saturate(1.06)';
+      }
       ctx.drawImage(videoEl, 0, 0, targetW, targetH);
       const frame = this.canvas.toDataURL('image/jpeg', 0.25);
       this.lastVideoSentAt = now;
@@ -396,8 +399,8 @@ export class WsMediaSender {
 
       const audioOnlyStream = new MediaStream(stream.getAudioTracks());
       const source = ctx.createMediaStreamSource(audioOnlyStream);
-      // 4096 samples (~85ms @ 48kHz) halves WS framing overhead and dramatically improves jitter stability
-      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      // 2048 samples (~42ms @ 48kHz) delivers fast voice startup while keeping framing overhead low
+      const processor = ctx.createScriptProcessor(2048, 1, 1);
       const muteGain = ctx.createGain();
       muteGain.gain.value = 0;
 

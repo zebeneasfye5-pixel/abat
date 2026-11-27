@@ -21,7 +21,9 @@ import {
   fetchCommunityEngagement,
   toggleWebsiteLike,
   recordWebsiteShare,
+  prewarmMediaConnection,
 } from './services/api';
+import { prewarmAudioPlayback } from './utils/videoEnhancer';
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import {
   auth,
@@ -176,7 +178,15 @@ export default function App() {
 
     fetchCommunityEngagement().then(setEngagement).catch(() => {});
 
+    // Preload video/audio modules & ICE/SFU config silently after initial render for instant room opening
+    const prewarmTimer = window.setTimeout(() => {
+      prewarmMediaConnection();
+      import('./components/AssemblyHall').catch(() => {});
+      import('./components/SecretConfessionRoom').catch(() => {});
+    }, 600);
+
     return () => {
+      clearTimeout(prewarmTimer);
       unsubAuth();
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
@@ -297,6 +307,10 @@ export default function App() {
   );
 
   const handleNavigate = (tab: string) => {
+    if (tab === 'assembly' || tab === 'secret-room') {
+      prewarmAudioPlayback();
+      prewarmMediaConnection();
+    }
     const protectedTabs = ['assembly', 'secret-room', 'wallet'];
     if (protectedTabs.includes(tab) && !user.isAuthenticated) {
       navigateToTab(tab);

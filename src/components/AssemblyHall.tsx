@@ -27,11 +27,24 @@ import {
   Sparkles,
   ArrowUpCircle,
   ArrowDownCircle,
+  Sun,
+  Moon,
+  Eye,
 } from 'lucide-react';
 import { UserProfile } from '../types';
 import { fetchLiveKitToken, fetchWebRTCConfig, getRealtimeWsUrl } from '../services/api';
 import { toggleSpiritualHymn, stopSpiritualHymn, playChurchBell } from '../utils/audio';
 import { WsMediaAudioPlayer, WsMediaSender } from '../utils/wsMediaRelay';
+import {
+  VideoEnhancerFilters,
+  VideoLightMode,
+  DetectedLighting,
+  sampleElementBrightness,
+  classifyBrightness,
+  resolveVideoFilterCss,
+  enhanceCameraTrackHardware,
+  prewarmAudioPlayback,
+} from '../utils/videoEnhancer';
 import { onAuthStateChanged } from 'firebase/auth';
 import {
   auth,
@@ -48,9 +61,9 @@ interface AssemblyHallProps {
 type VideoQualityPreset = '1080p' | '720p' | '360p';
 
 const QUALITY_MAP: Record<VideoQualityPreset, { width: number; height: number; maxBitrate: number; label: string }> = {
-  '1080p': { width: 1280, height: 720, maxBitrate: 900_000, label: 'HD 720p' },
-  '720p': { width: 640, height: 360, maxBitrate: 400_000, label: 'መደበኛ 360p' },
-  '360p': { width: 426, height: 240, maxBitrate: 200_000, label: 'ፈጣን 240p' },
+  '1080p': { width: 1920, height: 1080, maxBitrate: 1_800_000, label: 'Ultra HD 1080p' },
+  '720p': { width: 1280, height: 720, maxBitrate: 950_000, label: 'HD 720p (ቀንና ሌሊት)' },
+  '360p': { width: 640, height: 360, maxBitrate: 380_000, label: 'ፈጣን 360p' },
 };
 
 function setSdpFmtpParam(line: string, key: string, value: string): string {
@@ -135,7 +148,7 @@ async function applySenderPriority(sender: RTCRtpSender | undefined, kind: 'audi
         } else {
           enc.maxBitrate = Math.min(enc.maxBitrate || targetBitrate, targetBitrate);
         }
-        enc.maxFramerate = quality === '360p' ? 18 : 24;
+        enc.maxFramerate = quality === '360p' ? 24 : 30;
         (enc as any).priority = 'low';
         (enc as any).networkPriority = 'low';
       });
@@ -165,6 +178,7 @@ interface PipCornerData {
   isVideoOn?: boolean;
   isMicOn?: boolean;
   mirror?: boolean;
+  lightMode?: VideoLightMode;
   onClick?: () => void;
 }
 
@@ -175,10 +189,12 @@ const PipCornerTile: React.FC<PipCornerData> = ({
   isVideoOn = true,
   isMicOn = true,
   mirror = false,
+  lightMode = 'auto',
   onClick,
 }) => {
   const pipVideoRef = useRef<HTMLVideoElement | null>(null);
   const [hasFrames, setHasFrames] = useState(false);
+  const [detectedLight, setDetectedLight] = useState<DetectedLighting>('dim');
 
   useEffect(() => {
     const el = pipVideoRef.current;
@@ -192,11 +208,17 @@ const PipCornerTile: React.FC<PipCornerData> = ({
     el.defaultMuted = true;
     el.muted = true;
     el.play().catch(() => {});
-    const check = () => setHasFrames(Boolean(el.videoWidth > 0 && el.videoHeight > 0));
+    const check = () => {
+      setHasFrames(Boolean(el.videoWidth > 0 && el.videoHeight > 0));
+      if (lightMode === 'auto') {
+        const luma = sampleElementBrightness(el);
+        if (luma !== null) setDetectedLight((prev) => classifyBrightness(luma, prev));
+      }
+    };
     check();
     const timer = window.setInterval(check, 500);
     return () => clearInterval(timer);
-  }, [stream]);
+  }, [stream, lightMode]);
 
   const showStream = Boolean(
     stream &&
@@ -204,6 +226,7 @@ const PipCornerTile: React.FC<PipCornerData> = ({
         (isVideoOn !== false && stream.getVideoTracks().some((t) => t.readyState === 'live' && !t.muted)))
   );
   const showRelay = Boolean(!showStream && relayFrame);
+  const filterCss = resolveVideoFilterCss(lightMode, detectedLight);
 
   return (
     <div
@@ -226,8 +249,10 @@ const PipCornerTile: React.FC<PipCornerData> = ({
           pipVideoRef.current?.play().catch(() => {});
           setHasFrames(Boolean(pipVideoRef.current && pipVideoRef.current.videoWidth > 0));
         }}
+        onCanPlay={() => setHasFrames(Boolean(pipVideoRef.current && pipVideoRef.current.videoWidth > 0))}
         onPlaying={() => setHasFrames(Boolean(pipVideoRef.current && pipVideoRef.current.videoWidth > 0))}
-        className={`absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.05] ${
+        style={{ filter: filterCss }}
+        className={`absolute inset-0 w-full h-full object-cover ${
           mirror ? 'mirror' : ''
         } ${showStream ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
       />
@@ -235,7 +260,8 @@ const PipCornerTile: React.FC<PipCornerData> = ({
         <img
           src={relayFrame}
           alt={label}
-          className="absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.05]"
+          style={{ filter: filterCss }}
+          className="absolute inset-0 w-full h-full object-cover"
         />
       )}
       {!showStream && !showRelay && (
@@ -259,6 +285,7 @@ const RemoteVideoTile: React.FC<{
   isGlobalAudioMuted: boolean;
   isPinned: boolean;
   isExpanded: boolean;
+  lightMode: VideoLightMode;
   onPin: (peerId: string) => void;
   onToggleExpand: (peerId: string) => void;
   onUnlockAudio?: () => void;
@@ -270,6 +297,7 @@ const RemoteVideoTile: React.FC<{
   isGlobalAudioMuted,
   isPinned,
   isExpanded,
+  lightMode,
   onPin,
   onToggleExpand,
   onUnlockAudio,
@@ -284,6 +312,7 @@ const RemoteVideoTile: React.FC<{
   const [hasDecodedVideo, setHasDecodedVideo] = useState(false);
   const [hasLiveVideoTrack, setHasLiveVideoTrack] = useState(false);
   const [hasLiveAudioTrack, setHasLiveAudioTrack] = useState(false);
+  const [detectedLight, setDetectedLight] = useState<DetectedLighting>('dim');
 
   const checkVideoFrames = useCallback(() => {
     const vid = videoRef.current;
@@ -346,6 +375,7 @@ const RemoteVideoTile: React.FC<{
     }
 
     checkVideoFrames();
+    const initialQuickCheck = window.setTimeout(checkVideoFrames, 120);
     const healthPoll = window.setInterval(() => {
       updateTrackStatus();
       checkVideoFrames();
@@ -358,17 +388,25 @@ const RemoteVideoTile: React.FC<{
           audioEl.play().then(() => setNeedsAudioTap(false)).catch(() => {});
         }
       }
-    }, 600);
+    }, 350);
+
+    const lightPoll = window.setInterval(() => {
+      if (lightMode !== 'auto') return;
+      const luma = sampleElementBrightness(videoEl);
+      if (luma !== null) setDetectedLight((prev) => classifyBrightness(luma, prev));
+    }, 1100);
 
     return () => {
+      clearTimeout(initialQuickCheck);
       clearInterval(healthPoll);
+      clearInterval(lightPoll);
       tracks.forEach((t) => {
         t.removeEventListener('unmute', updateTrackStatus);
         t.removeEventListener('mute', updateTrackStatus);
         t.removeEventListener('ended', updateTrackStatus);
       });
     };
-  }, [peer.stream, peer.peerId, isGlobalAudioMuted, checkVideoFrames, onVideoHealthChange]);
+  }, [peer.stream, peer.peerId, isGlobalAudioMuted, checkVideoFrames, onVideoHealthChange, lightMode]);
 
   const isWebRtcConnected = peer.connectionState === 'connected' || peer.connectionState === 'completed';
   // Never hide actual decoded WebRTC video pixels behind a stale boolean flag!
@@ -378,6 +416,7 @@ const RemoteVideoTile: React.FC<{
   const hasRelayVideo = Boolean(!hasWebRtcVideo && peer.relayFrame);
   const showVisualFeed = hasWebRtcVideo || hasRelayVideo;
   const effectiveMicOn = peer.isMicOn || hasLiveAudioTrack;
+  const remoteFilterCss = resolveVideoFilterCss(lightMode, detectedLight);
 
   const handleTileFullscreen = async () => {
     if (document.fullscreenElement) {
@@ -430,9 +469,17 @@ const RemoteVideoTile: React.FC<{
           checkVideoFrames();
         }}
         onLoadedData={checkVideoFrames}
-        onPlaying={checkVideoFrames}
+        onCanPlay={checkVideoFrames}
+        onPlaying={() => {
+          checkVideoFrames();
+          if (lightMode === 'auto') {
+            const luma = sampleElementBrightness(videoRef.current);
+            if (luma !== null) setDetectedLight((prev) => classifyBrightness(luma, prev));
+          }
+        }}
         onResize={checkVideoFrames}
-        className={`absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.06] transition-opacity ${
+        style={{ filter: remoteFilterCss }}
+        className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-75 ${
           hasWebRtcVideo ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       />
@@ -442,7 +489,8 @@ const RemoteVideoTile: React.FC<{
         <img
           src={peer.relayFrame}
           alt={peer.baptismalName || peer.userName}
-          className="absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.06]"
+          style={{ filter: remoteFilterCss }}
+          className="absolute inset-0 w-full h-full object-cover"
         />
       )}
 
@@ -563,7 +611,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const [expandedTileId, setExpandedTileId] = useState<string | null>(null);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
-  const [videoQuality, setVideoQuality] = useState<VideoQualityPreset>('360p');
+  const [videoQuality, setVideoQuality] = useState<VideoQualityPreset>('720p');
+  const [lightMode, setLightMode] = useState<VideoLightMode>('auto');
+  const [localDetectedLight, setLocalDetectedLight] = useState<DetectedLighting>('dim');
 
   // Scalability & SFU Telemetry state
   const [broadcastMode, setBroadcastMode] = useState<'interactive-mesh' | 'stage-broadcast' | 'livekit-sfu'>('interactive-mesh');
@@ -649,6 +699,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   remotePeersRef.current = remotePeers;
   const videoQualityRef = useRef<VideoQualityPreset>(videoQuality);
   videoQualityRef.current = videoQuality;
+  const lightModeRef = useRef<VideoLightMode>(lightMode);
+  lightModeRef.current = lightMode;
   const liveKitActiveRef = useRef(liveKitActive);
   liveKitActiveRef.current = liveKitActive;
 
@@ -660,6 +712,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   }, []);
 
   const unlockRemoteAudio = useCallback(() => {
+    prewarmAudioPlayback();
     wsAudioPlayerRef.current?.unlock().then((ok) => {
       if (ok) setAudioBlocked(false);
     });
@@ -692,7 +745,12 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       return existing;
     }
 
-    const pc = new RTCPeerConnection(rtcConfigRef.current);
+    const pc = new RTCPeerConnection({
+      ...rtcConfigRef.current,
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+      iceCandidatePoolSize: 6,
+    });
     peerConnectionsRef.current.set(targetPeerId, pc);
 
     const localStream = screenStreamRef.current || localStreamRef.current;
@@ -844,9 +902,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
           constraints: {
             video: {
               facingMode: 'user',
-              width: { ideal: initialSpec.width, min: 240 },
+              width: { ideal: initialSpec.width, min: 320 },
               height: { ideal: initialSpec.height, min: 180 },
-              frameRate: { ideal: videoQualityRef.current === '360p' ? 18 : 24, max: 24 },
+              frameRate: { ideal: videoQualityRef.current === '360p' ? 24 : 30, max: 30 },
             },
             audio: hdAudioConstraints,
           },
@@ -883,6 +941,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             setMediaWarning('ካሜራ አልተገኘም ወይም ፍቃድ ይፈልጋል፤ «ካሜራና ማይክ ፍቀድ / ክፈት» የሚለውን ይጫኑ።');
           } else {
             setMediaWarning(null);
+            enhanceCameraTrackHardware(stream.getVideoTracks()[0], lightModeRef.current);
           }
           return stream;
         } catch (err: any) {
@@ -903,21 +962,86 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     };
 
     const boot = async () => {
-      const extConfig = await fetchWebRTCConfig();
-      rtcConfigRef.current = {
-        iceServers: extConfig.iceServers,
-        iceCandidatePoolSize: 4,
-      };
-
-      // 1. Acquire Video & Audio with universal fallbacks
-      const acquiredStream = await acquireInitialMedia();
-
-      if (isCancelled) {
-        acquiredStream?.getTracks().forEach((t) => t.stop());
-        return;
+      prewarmAudioPlayback();
+      if (!wsAudioPlayerRef.current) {
+        wsAudioPlayerRef.current = new WsMediaAudioPlayer((blocked) => setAudioBlocked(blocked));
       }
 
-      if (acquiredStream) {
+      let reconnectTimer: number | null = null;
+      let keepaliveTimer: number | null = null;
+      let diagTimer: number | null = null;
+
+      // Launch Media, ICE/SFU Config, LiveKit SDK/Token, and WebSocket Signaling IN PARALLEL for instant video & audio startup!
+      const rtcConfigPromise = fetchWebRTCConfig().then((extConfig) => {
+        rtcConfigRef.current = {
+          iceServers: extConfig.iceServers,
+          iceCandidatePoolSize: 6,
+          bundlePolicy: 'max-bundle',
+          rtcpMuxPolicy: 'require',
+        };
+        return extConfig;
+      });
+
+      const lkImportPromise = import('livekit-client');
+      const lkTokenPromise = fetchLiveKitToken(
+        ROOM_ID,
+        selfPeerIdRef.current,
+        user.baptismalName || user.fullName || 'ተሳታፊ',
+        true
+      ).catch(() => ({ sfuConfigured: false } as { sfuConfigured: boolean; url?: string; token?: string }));
+
+      const publishStreamToLiveKit = async (lkRoom: any, Track: any, stream: MediaStream) => {
+        const qSpec = QUALITY_MAP[videoQualityRef.current];
+        const fps = videoQualityRef.current === '360p' ? 24 : 30;
+        await Promise.all(
+          stream.getTracks().map(async (t) => {
+            try {
+              if (t.kind === 'audio') {
+                const existing = lkRoom.localParticipant.getTrackPublication(Track.Source.Microphone);
+                if (existing?.track) {
+                  await existing.track.replaceTrack(t, true);
+                } else {
+                  const pub = await lkRoom.localParticipant.publishTrack(t, {
+                    source: Track.Source.Microphone,
+                    dtx: true,
+                    red: true,
+                    audioPreset: { maxBitrate: 28_000 },
+                  });
+                  if (pub?.track?.sender) {
+                    applySenderPriority(pub.track.sender, 'audio', videoQualityRef.current);
+                  }
+                }
+              } else if (t.kind === 'video') {
+                const existing = lkRoom.localParticipant.getTrackPublication(Track.Source.Camera);
+                if (existing?.track) {
+                  await existing.track.replaceTrack(t, true);
+                } else {
+                  const pub = await lkRoom.localParticipant.publishTrack(t, {
+                    source: Track.Source.Camera,
+                    simulcast: true,
+                    videoEncoding: {
+                      maxBitrate: qSpec.maxBitrate,
+                      maxFramerate: fps,
+                    },
+                    degradationPreference: 'maintain-framerate',
+                  });
+                  if (pub?.track?.sender) {
+                    applySenderPriority(pub.track.sender, 'video', videoQualityRef.current);
+                  }
+                }
+              }
+            } catch {}
+          })
+        );
+      };
+
+      const mediaPromise = acquireInitialMedia().then(async (acquiredStream) => {
+        if (isCancelled) {
+          acquiredStream?.getTracks().forEach((t) => t.stop());
+          return null;
+        }
+        if (!acquiredStream) return null;
+
         localStreamRef.current = acquiredStream;
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = acquiredStream;
@@ -930,6 +1054,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
             const ctx = new AudioCtx();
             audioContextRef.current = ctx;
+            if (ctx.state === 'suspended') ctx.resume().catch(() => {});
             const source = ctx.createMediaStreamSource(acquiredStream);
             const analyser = ctx.createAnalyser();
             analyser.fftSize = 64;
@@ -952,140 +1077,181 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             updateVol();
           } catch {}
         }
-      }
 
-      // 2. If LiveKit Enterprise SFU is configured on server, use SFU for 1,000 - 10,000+ concurrent viewers!
-      if (extConfig.sfuConfigured) {
-        try {
-          const lkData = await fetchLiveKitToken(
-            ROOM_ID,
-            selfPeerIdRef.current,
-            user.baptismalName || user.fullName || 'ተሳታፊ',
-            true
-          );
-          if (lkData.sfuConfigured && lkData.url && lkData.token) {
-            const { Room, RoomEvent, Track, ConnectionState } = await import('livekit-client');
-            const initialSpec = QUALITY_MAP[videoQualityRef.current];
-            const lkRoom = new Room({
-              adaptiveStream: true,
-              dynacast: true,
-              publishDefaults: {
-                simulcast: true,
-                dtx: true,
-                red: true,
-                audioPreset: { maxBitrate: 24_000 },
-                videoEncoding: {
-                  maxBitrate: initialSpec.maxBitrate,
-                  maxFramerate: videoQualityRef.current === '360p' ? 18 : 24,
-                },
-                degradationPreference: 'maintain-framerate',
-              },
-            });
-            liveKitRoomRef.current = lkRoom;
-
-            const syncLkParticipants = () => {
-              const list: RemotePeer[] = [];
-              lkRoom.remoteParticipants.forEach((rp) => {
-                const tracks: MediaStreamTrack[] = [];
-                rp.trackPublications.forEach((pub) => {
-                  if (pub.track?.mediaStreamTrack) {
-                    tracks.push(pub.track.mediaStreamTrack);
-                  }
-                });
-                list.push({
-                  peerId: rp.identity,
-                  userName: rp.name || rp.identity,
-                  baptismalName: rp.name || rp.identity,
-                  role: 'attendee',
-                  stream: tracks.length > 0 ? new MediaStream(tracks) : null,
-                  connectionState: 'connected',
-                  isMicOn: rp.isMicrophoneEnabled,
-                  isVideoOn: rp.isCameraEnabled,
-                  isHandRaised: false,
-                  isScreenSharing: rp.isScreenShareEnabled,
-                  onStage: true,
-                });
-              });
-              setRemotePeers(list);
-              setServerClientCount(1 + lkRoom.remoteParticipants.size);
-            };
-
-            lkRoom
-              .on(RoomEvent.ParticipantConnected, syncLkParticipants)
-              .on(RoomEvent.ParticipantDisconnected, syncLkParticipants)
-              .on(RoomEvent.TrackSubscribed, () => {
-                syncLkParticipants();
-                unlockRemoteAudio();
-              })
-              .on(RoomEvent.TrackUnsubscribed, syncLkParticipants)
-              .on(RoomEvent.TrackMuted, syncLkParticipants)
-              .on(RoomEvent.TrackUnmuted, syncLkParticipants)
-              .on(RoomEvent.LocalTrackPublished, (pub) => {
-                if (pub.track?.sender) {
-                  applySenderPriority(
-                    pub.track.sender,
-                    pub.track.kind === Track.Kind.Audio ? 'audio' : 'video',
-                    videoQualityRef.current
-                  );
-                }
-              })
-              .on(RoomEvent.ConnectionStateChanged, (state) => {
-                const connected = state === ConnectionState.Connected;
-                setLiveKitActive(connected);
-                if (connected) {
-                  wsMediaSenderRef.current?.stop();
-                  wsMediaSenderRef.current = null;
-                  setWsRelayActive(false);
-                  setVideoRelayForced(false);
-                  setAudioRelayForced(false);
-                }
-              })
-              .on(RoomEvent.Disconnected, () => {
-                setLiveKitActive(false);
-              });
-
-            await lkRoom.connect(lkData.url, lkData.token);
-            setLiveKitActive(true);
-            setBroadcastMode('livekit-sfu');
-            wsMediaSenderRef.current?.stop();
-            wsMediaSenderRef.current = null;
-            setWsRelayActive(false);
-            setVideoRelayForced(false);
-            setAudioRelayForced(false);
-            peerConnectionsRef.current.forEach((pc) => pc.close());
-            peerConnectionsRef.current.clear();
-
-            if (acquiredStream) {
-              const qSpec = QUALITY_MAP[videoQualityRef.current];
-              for (const t of acquiredStream.getTracks()) {
-                if (t.kind === 'audio') {
-                  const pub = await lkRoom.localParticipant.publishTrack(t, {
-                    source: Track.Source.Microphone,
-                    dtx: true,
-                    red: true,
-                    audioPreset: { maxBitrate: 24_000 },
-                  });
-                  if (pub?.track?.sender) {
-                    applySenderPriority(pub.track.sender, 'audio', videoQualityRef.current);
-                  }
-                } else if (t.kind === 'video') {
-                  const pub = await lkRoom.localParticipant.publishTrack(t, {
-                    source: Track.Source.Camera,
-                    simulcast: true,
-                    videoEncoding: {
-                      maxBitrate: qSpec.maxBitrate,
-                      maxFramerate: videoQualityRef.current === '360p' ? 18 : 24,
-                    },
-                    degradationPreference: 'maintain-framerate',
-                  });
-                  if (pub?.track?.sender) {
-                    applySenderPriority(pub.track.sender, 'video', videoQualityRef.current);
-                  }
-                }
+        // If LiveKit connected before camera/mic finished, publish tracks immediately
+        if (liveKitRoomRef.current) {
+          try {
+            const { Track } = await lkImportPromise;
+            await publishStreamToLiveKit(liveKitRoomRef.current, Track, acquiredStream);
+          } catch {}
+        } else if (peerConnectionsRef.current.size > 0) {
+          // If WebRTC P2P connections opened before getUserMedia resolved, attach tracks & renegotiate
+          for (const [peerId, pc] of peerConnectionsRef.current.entries()) {
+            for (const t of acquiredStream.getTracks()) {
+              const matching = pc.getTransceivers().find(
+                (tr) => tr.sender?.track?.kind === t.kind || tr.receiver?.track?.kind === t.kind
+              );
+              if (matching) {
+                try {
+                  matching.direction = 'sendrecv';
+                  await matching.sender.replaceTrack(t);
+                } catch {}
+              } else {
+                pc.addTrack(t, acquiredStream);
               }
             }
+            await applyStudioEncoderTuning(pc, videoQualityRef.current);
+            if (pc.signalingState === 'stable' && wsRef.current?.readyState === WebSocket.OPEN) {
+              try {
+                const offer = await pc.createOffer();
+                const tunedSdp = preferRobustOpusSdp(offer.sdp);
+                const tunedOffer = tunedSdp ? { type: offer.type, sdp: tunedSdp } : offer;
+                await pc.setLocalDescription(tunedOffer);
+                wsRef.current.send(
+                  JSON.stringify({
+                    type: 'webrtc-signal',
+                    roomId: ROOM_ID,
+                    targetPeerId: peerId,
+                    signal: { sdp: tunedOffer },
+                  })
+                );
+              } catch {}
+            }
+          }
+        }
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'room-media-state',
+              isMicOn: acquiredStream.getAudioTracks().length > 0 && isMicOnRef.current,
+              isVideoOn: acquiredStream.getVideoTracks().length > 0 && isVideoOnRef.current,
+              isHandRaised: isHandRaisedRef.current,
+              isScreenSharing: isScreenSharingRef.current,
+            })
+          );
+        }
+        return acquiredStream;
+      });
+
+      const sfuConnectPromise = (async (): Promise<boolean> => {
+        try {
+          const [extConfig, lkData, lkSdk] = await Promise.all([
+            rtcConfigPromise,
+            lkTokenPromise,
+            lkImportPromise,
+          ]);
+          if (isCancelled) return false;
+          if (!extConfig.sfuConfigured || !lkData.sfuConfigured || !lkData.url || !lkData.token) {
+            return false;
+          }
+
+          const { Room, RoomEvent, Track, ConnectionState } = lkSdk;
+          const initialSpec = QUALITY_MAP[videoQualityRef.current];
+          const lkRoom = new Room({
+            adaptiveStream: { pixelDensity: 'screen' },
+            dynacast: true,
+            stopLocalTrackOnUnpublish: false,
+            publishDefaults: {
+              simulcast: true,
+              dtx: true,
+              red: true,
+              audioPreset: { maxBitrate: 28_000 },
+              videoEncoding: {
+                maxBitrate: initialSpec.maxBitrate,
+                maxFramerate: videoQualityRef.current === '360p' ? 24 : 30,
+              },
+              degradationPreference: 'maintain-framerate',
+            },
+          });
+          liveKitRoomRef.current = lkRoom;
+
+          const syncLkParticipants = () => {
+            const list: RemotePeer[] = [];
+            lkRoom.remoteParticipants.forEach((rp) => {
+              const tracks: MediaStreamTrack[] = [];
+              rp.trackPublications.forEach((pub) => {
+                if (pub.track?.mediaStreamTrack) {
+                  tracks.push(pub.track.mediaStreamTrack);
+                }
+              });
+              list.push({
+                peerId: rp.identity,
+                userName: rp.name || rp.identity,
+                baptismalName: rp.name || rp.identity,
+                role: 'attendee',
+                stream: tracks.length > 0 ? new MediaStream(tracks) : null,
+                connectionState: 'connected',
+                isMicOn: rp.isMicrophoneEnabled,
+                isVideoOn: rp.isCameraEnabled,
+                isHandRaised: false,
+                isScreenSharing: rp.isScreenShareEnabled,
+                onStage: true,
+              });
+            });
+            setRemotePeers(list);
+            setServerClientCount(1 + lkRoom.remoteParticipants.size);
+          };
+
+          lkRoom
+            .on(RoomEvent.ParticipantConnected, syncLkParticipants)
+            .on(RoomEvent.ParticipantDisconnected, syncLkParticipants)
+            .on(RoomEvent.TrackSubscribed, () => {
+              syncLkParticipants();
+              unlockRemoteAudio();
+            })
+            .on(RoomEvent.TrackUnsubscribed, syncLkParticipants)
+            .on(RoomEvent.TrackMuted, syncLkParticipants)
+            .on(RoomEvent.TrackUnmuted, syncLkParticipants)
+            .on(RoomEvent.LocalTrackPublished, (pub) => {
+              if (pub.track?.sender) {
+                applySenderPriority(
+                  pub.track.sender,
+                  pub.track.kind === Track.Kind.Audio ? 'audio' : 'video',
+                  videoQualityRef.current
+                );
+              }
+            })
+            .on(RoomEvent.ConnectionStateChanged, (state) => {
+              const connected = state === ConnectionState.Connected;
+              setLiveKitActive(connected);
+              if (connected) {
+                wsMediaSenderRef.current?.stop();
+                wsMediaSenderRef.current = null;
+                setWsRelayActive(false);
+                setVideoRelayForced(false);
+                setAudioRelayForced(false);
+              }
+            })
+            .on(RoomEvent.Disconnected, () => {
+              setLiveKitActive(false);
+            });
+
+          await lkRoom.connect(lkData.url, lkData.token, {
+            rtcConfig: { iceServers: extConfig.iceServers },
+          });
+          if (isCancelled) {
+            lkRoom.disconnect();
+            liveKitRoomRef.current = null;
+            return false;
+          }
+          setLiveKitActive(true);
+          setBroadcastMode('livekit-sfu');
+          wsMediaSenderRef.current?.stop();
+          wsMediaSenderRef.current = null;
+          setWsRelayActive(false);
+          setVideoRelayForced(false);
+          setAudioRelayForced(false);
+          peerConnectionsRef.current.forEach((pc) => pc.close());
+          peerConnectionsRef.current.clear();
+
+          syncLkParticipants();
+          const acquiredStream = localStreamRef.current || (await mediaPromise);
+          if (acquiredStream && !isCancelled) {
+            await publishStreamToLiveKit(lkRoom, Track, acquiredStream);
             syncLkParticipants();
           }
+          return true;
         } catch (err) {
           if (liveKitRoomRef.current) {
             try {
@@ -1095,17 +1261,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
           }
           setLiveKitActive(false);
           console.warn('LiveKit SFU fallback to built-in Relay/Stage WS:', err);
+          return false;
         }
-      }
-
-      // 3. Connect High-Scale Anti-Congestion WebSocket Signaling with Auto-Reconnect & 15s Keepalive
-      if (!wsAudioPlayerRef.current) {
-        wsAudioPlayerRef.current = new WsMediaAudioPlayer((blocked) => setAudioBlocked(blocked));
-      }
-
-      let reconnectTimer: number | null = null;
-      let keepaliveTimer: number | null = null;
-      let diagTimer: number | null = null;
+      })();
 
       const connectWebSocket = () => {
         if (isCancelled) return;
@@ -1231,7 +1389,10 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 setServerClientCount(data.clientCount);
               }
 
-              if (liveKitRoomRef.current) return;
+              const sfuActive = await sfuConnectPromise;
+              if (sfuActive || liveKitRoomRef.current) return;
+              await mediaPromise.catch(() => null);
+              await rtcConfigPromise.catch(() => null);
 
               // Close any stale peer connections before creating fresh ones for reconnected room-state
               peerConnectionsRef.current.forEach((pc) => pc.close());
@@ -1327,7 +1488,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                 ];
               });
             } else if (data.type === 'webrtc-signal' && data.signal && data.senderPeerId) {
-              if (liveKitRoomRef.current) return;
+              const sfuActive = await sfuConnectPromise;
+              if (sfuActive || liveKitRoomRef.current) return;
               const senderId = data.senderPeerId;
               if (senderId === selfPeerIdRef.current) return;
 
@@ -1586,7 +1748,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
 
-  // Keep local self-view video bound whenever viewMode switches (gallery <-> speaker)
+  // Keep local self-view video bound whenever viewMode switches (gallery <-> speaker) and auto-adapt day/night lighting
   useEffect(() => {
     const stream = screenStreamRef.current || localStreamRef.current;
     if (localVideoRef.current && stream) {
@@ -1595,7 +1757,15 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       }
       localVideoRef.current.play().catch(() => {});
     }
-  }, [viewMode, isVideoOn, isScreenSharing]);
+    if (lightMode !== 'auto' || (!isVideoOn && !isScreenSharing)) return;
+    const poll = window.setInterval(() => {
+      const luma = sampleElementBrightness(localVideoRef.current);
+      if (luma !== null) {
+        setLocalDetectedLight((prev) => classifyBrightness(luma, prev));
+      }
+    }, 1100);
+    return () => clearInterval(poll);
+  }, [viewMode, isVideoOn, isScreenSharing, lightMode]);
 
   // Global mobile touch/pointer listener so AudioContext & <audio> unlock on any screen tap
   useEffect(() => {
@@ -1636,7 +1806,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
 
     const timer = window.setTimeout(() => {
       setWsRelayActive(true);
-    }, 4500);
+    }, 1800);
     return () => clearTimeout(timer);
   }, [remotePeers, liveKitActive]);
 
@@ -1727,8 +1897,8 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       }
     };
 
-    const initialTimer = window.setTimeout(inspectMediaStats, 2500);
-    const intervalTimer = window.setInterval(inspectMediaStats, 3500);
+    const initialTimer = window.setTimeout(inspectMediaStats, 1200);
+    const intervalTimer = window.setInterval(inspectMediaStats, 2500);
 
     return () => {
       clearTimeout(initialTimer);
@@ -1807,15 +1977,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
   const handleChangeQuality = async (nextQuality: VideoQualityPreset) => {
     setVideoQuality(nextQuality);
     const spec = QUALITY_MAP[nextQuality];
-    const targetFps = nextQuality === '360p' ? 18 : 24;
+    const targetFps = nextQuality === '360p' ? 24 : 30;
     const videoTrack = localStreamRef.current?.getVideoTracks()[0];
     if (videoTrack) {
       try {
         await videoTrack.applyConstraints({
           width: { ideal: spec.width },
           height: { ideal: spec.height },
-          frameRate: { ideal: targetFps, max: 24 },
+          frameRate: { ideal: targetFps, max: 30 },
         });
+        enhanceCameraTrackHardware(videoTrack, lightModeRef.current);
       } catch {}
     }
     if (liveKitRoomRef.current?.localParticipant?.videoTrackPublications) {
@@ -1830,6 +2001,15 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
     });
   };
 
+  const handleCycleLightMode = () => {
+    const next: VideoLightMode = lightMode === 'auto' ? 'night' : lightMode === 'night' ? 'day' : 'auto';
+    setLightMode(next);
+    const videoTrack = localStreamRef.current?.getVideoTracks()[0];
+    if (videoTrack) {
+      enhanceCameraTrackHardware(videoTrack, next);
+    }
+  };
+
   const handleRequestCameraPermission = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
       setMediaWarning('ብራውዘርዎ ካሜራ አይደግፍም ወይም HTTPS ግንኙነት ያስፈልጋል።');
@@ -1842,9 +2022,9 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         {
           video: {
             facingMode,
-            width: { ideal: spec.width, min: 240 },
+            width: { ideal: spec.width, min: 320 },
             height: { ideal: spec.height, min: 180 },
-            frameRate: { ideal: videoQuality === '360p' ? 18 : 24, max: 24 },
+            frameRate: { ideal: videoQuality === '360p' ? 24 : 30, max: 30 },
           },
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48000 },
         },
@@ -1891,46 +2071,51 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       setIsVideoOn(hasVideo);
       setIsMicOn(hasAudio);
       setMediaWarning(null);
+      if (hasVideo) {
+        enhanceCameraTrackHardware(stream.getVideoTracks()[0], lightModeRef.current);
+      }
 
       // Push/replace new tracks on LiveKit if connected (without opening P2P/WS relay)
       if (liveKitRoomRef.current) {
         const { Track } = await import('livekit-client');
-        for (const t of stream.getTracks()) {
-          if (t.kind === 'audio') {
-            const existingAudioPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Microphone);
-            if (existingAudioPub?.track) {
-              await existingAudioPub.track.replaceTrack(t, true).catch(() => {});
-            } else {
-              const pub = await liveKitRoomRef.current.localParticipant
-                .publishTrack(t, {
-                  source: Track.Source.Microphone,
-                  dtx: true,
-                  red: true,
-                  audioPreset: { maxBitrate: 24_000 },
-                })
-                .catch(() => null);
-              if (pub?.track?.sender) applySenderPriority(pub.track.sender, 'audio', videoQuality);
+        await Promise.all(
+          stream.getTracks().map(async (t) => {
+            if (t.kind === 'audio') {
+              const existingAudioPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Microphone);
+              if (existingAudioPub?.track) {
+                await existingAudioPub.track.replaceTrack(t, true).catch(() => {});
+              } else {
+                const pub = await liveKitRoomRef.current.localParticipant
+                  .publishTrack(t, {
+                    source: Track.Source.Microphone,
+                    dtx: true,
+                    red: true,
+                    audioPreset: { maxBitrate: 28_000 },
+                  })
+                  .catch(() => null);
+                if (pub?.track?.sender) applySenderPriority(pub.track.sender, 'audio', videoQuality);
+              }
+            } else if (t.kind === 'video') {
+              const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
+              if (existingCamPub?.track) {
+                await existingCamPub.track.replaceTrack(t, true).catch(() => {});
+              } else {
+                const pub = await liveKitRoomRef.current.localParticipant
+                  .publishTrack(t, {
+                    source: Track.Source.Camera,
+                    simulcast: true,
+                    videoEncoding: {
+                      maxBitrate: spec.maxBitrate,
+                      maxFramerate: videoQuality === '360p' ? 24 : 30,
+                    },
+                    degradationPreference: 'maintain-framerate',
+                  })
+                  .catch(() => null);
+                if (pub?.track?.sender) applySenderPriority(pub.track.sender, 'video', videoQuality);
+              }
             }
-          } else if (t.kind === 'video') {
-            const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
-            if (existingCamPub?.track) {
-              await existingCamPub.track.replaceTrack(t, true).catch(() => {});
-            } else {
-              const pub = await liveKitRoomRef.current.localParticipant
-                .publishTrack(t, {
-                  source: Track.Source.Camera,
-                  simulcast: true,
-                  videoEncoding: {
-                    maxBitrate: spec.maxBitrate,
-                    maxFramerate: videoQuality === '360p' ? 18 : 24,
-                  },
-                  degradationPreference: 'maintain-framerate',
-                })
-                .catch(() => null);
-              if (pub?.track?.sender) applySenderPriority(pub.track.sender, 'video', videoQuality);
-            }
-          }
-        }
+          })
+        );
       } else {
         // Push/upgrade transceivers & renegotiate new tracks cleanly across all WebRTC peer connections
         for (const [peerId, pc] of peerConnectionsRef.current.entries()) {
@@ -2027,15 +2212,16 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       const newCamStream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: nextFacing,
-          width: { ideal: spec.width, min: 240 },
+          width: { ideal: spec.width, min: 320 },
           height: { ideal: spec.height, min: 180 },
-          frameRate: { ideal: videoQuality === '360p' ? 18 : 24, max: 24 },
+          frameRate: { ideal: videoQuality === '360p' ? 24 : 30, max: 30 },
         },
       });
       const newVideoTrack = newCamStream.getVideoTracks()[0];
       const oldVideoTrack = localStreamRef.current?.getVideoTracks()[0];
 
       if (localStreamRef.current && newVideoTrack) {
+        enhanceCameraTrackHardware(newVideoTrack, lightModeRef.current);
         if (oldVideoTrack) {
           localStreamRef.current.removeTrack(oldVideoTrack);
           oldVideoTrack.stop();
@@ -2264,6 +2450,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
       ref={meetingContainerRef}
       className="max-w-[1560px] mx-auto px-2 sm:px-4 lg:px-6 py-4 space-y-3 min-h-[calc(100vh-80px)] flex flex-col justify-between bg-stone-950"
     >
+      <VideoEnhancerFilters />
       {/* 1. TOP CONFERENCE HEADER */}
       <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-2xl bg-stone-950/90 border border-amber-800/40 backdrop-blur-md shadow-xl">
         <div className="flex flex-wrap items-center gap-2.5">
@@ -2287,6 +2474,37 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {/* Adaptive Day & Night Video Clarity Toggle */}
+          <button
+            type="button"
+            onClick={handleCycleLightMode}
+            title="የቀንና የሌሊት የቪዲዮ ብርሃን ማሻሻያ"
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-bold transition ${
+              lightMode === 'night' || (lightMode === 'auto' && localDetectedLight === 'dark')
+                ? 'bg-indigo-950/80 border-indigo-400/60 text-indigo-200'
+                : lightMode === 'day'
+                ? 'bg-amber-950/80 border-amber-400/60 text-amber-200'
+                : 'bg-emerald-950/70 border-emerald-600/60 text-emerald-200'
+            }`}
+          >
+            {lightMode === 'night' ? (
+              <Moon className="w-3.5 h-3.5 text-indigo-300" />
+            ) : lightMode === 'day' ? (
+              <Sun className="w-3.5 h-3.5 text-amber-300" />
+            ) : (
+              <Eye className="w-3.5 h-3.5 text-emerald-300" />
+            )}
+            <span>
+              {lightMode === 'night'
+                ? 'የሌሊት ብርሃን+'
+                : lightMode === 'day'
+                ? 'የቀን HD'
+                : localDetectedLight === 'dark'
+                ? 'ራስ-ሰር (ሌሊት+)'
+                : 'ራስ-ሰር (ቀን/ሌሊት)'}
+            </span>
+          </button>
+
           {/* HD Quality Selector */}
           <select
             value={videoQuality}
@@ -2464,10 +2682,22 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                   autoPlay
                   playsInline
                   muted
-                  className={`absolute inset-0 w-full h-full object-cover contrast-[1.03] saturate-[1.06] brightness-[1.02] ${
+                  onPlaying={() => {
+                    if (lightMode === 'auto') {
+                      const luma = sampleElementBrightness(localVideoRef.current);
+                      if (luma !== null) setLocalDetectedLight((prev) => classifyBrightness(luma, prev));
+                    }
+                  }}
+                  style={{ filter: resolveVideoFilterCss(lightMode, localDetectedLight) }}
+                  className={`absolute inset-0 w-full h-full object-cover ${
                     !isScreenSharing && facingMode === 'user' ? 'mirror' : ''
                   } ${isVideoOn || isScreenSharing ? 'block' : 'hidden'}`}
                 />
+
+                {(lightMode === 'night' || (lightMode === 'auto' && localDetectedLight === 'dark')) &&
+                  (isVideoOn || isScreenSharing) && (
+                    <div className="pointer-events-none absolute inset-0 ring-4 ring-inset ring-amber-50/20 shadow-[inset_0_0_48px_rgba(255,248,230,0.12)]" />
+                  )}
 
                 {!isVideoOn && !isScreenSharing && (
                   <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-900 text-stone-200 p-4 text-center space-y-3">
@@ -2554,6 +2784,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                     relayFrame={stageRemotePeers[0].relayFrame}
                     isVideoOn={stageRemotePeers[0].isVideoOn}
                     isMicOn={stageRemotePeers[0].isMicOn}
+                    lightMode={lightMode}
                     onClick={() => handleSwapZoomTarget(stageRemotePeers[0].peerId)}
                   />
                 )}
@@ -2567,6 +2798,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                   isGlobalAudioMuted={isGlobalAudioMuted}
                   isPinned={pinnedPeerId === peer.peerId}
                   isExpanded={expandedTileId === peer.peerId}
+                  lightMode={lightMode}
                   onPin={(id) => {
                     setPinnedPeerId(id);
                     setViewMode('speaker');
@@ -2583,6 +2815,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                           isVideoOn: isVideoOn || isScreenSharing,
                           isMicOn,
                           mirror: !isScreenSharing && facingMode === 'user',
+                          lightMode,
                           onClick: () => handleSwapZoomTarget('self'),
                         }
                       : null
@@ -2621,11 +2854,12 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
             <div className="space-y-3">
               <div className="grid grid-cols-1 gap-3">
                 {pinnedPeer ? (
-                  <RemoteVideoTile
+                    <RemoteVideoTile
                     peer={pinnedPeer}
                     isGlobalAudioMuted={isGlobalAudioMuted}
                     isPinned={true}
                     isExpanded={expandedTileId === pinnedPeer.peerId}
+                    lightMode={lightMode}
                     onPin={() => setViewMode('gallery')}
                     onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
                     onUnlockAudio={unlockRemoteAudio}
@@ -2637,6 +2871,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                       isVideoOn: isVideoOn || isScreenSharing,
                       isMicOn,
                       mirror: !isScreenSharing && facingMode === 'user',
+                      lightMode,
                       onClick: () => handleSwapZoomTarget('self'),
                     }}
                   />
@@ -2667,6 +2902,7 @@ export const AssemblyHall: React.FC<AssemblyHallProps> = ({ user, onLeaveMeeting
                         isGlobalAudioMuted={isGlobalAudioMuted}
                         isPinned={false}
                         isExpanded={expandedTileId === p.peerId}
+                        lightMode={lightMode}
                         onPin={(id) => setPinnedPeerId(id)}
                         onToggleExpand={(id) => setExpandedTileId((cur) => (cur === id ? null : id))}
                         onUnlockAudio={unlockRemoteAudio}

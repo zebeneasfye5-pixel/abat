@@ -1,10 +1,20 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Shield, Lock, Video, VideoOff, Mic, MicOff, PhoneOff, Check, Sparkles, KeyRound, Flame, Volume2, RefreshCw, Maximize2, Minimize2 } from 'lucide-react';
+import { Shield, Lock, Video, VideoOff, Mic, MicOff, PhoneOff, Check, Sparkles, KeyRound, Flame, Volume2, RefreshCw, Maximize2, Minimize2, Sun, Moon, Eye } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { UserProfile, ConfessionBooking } from '../types';
 import { fetchWebRTCConfig, fetchLiveKitToken, verifySecretRoomPasscode, getRealtimeWsUrl } from '../services/api';
 import { playChurchBell, speakBlessingPrayer } from '../utils/audio';
 import { WsMediaAudioPlayer, WsMediaSender } from '../utils/wsMediaRelay';
+import {
+  VideoEnhancerFilters,
+  VideoLightMode,
+  DetectedLighting,
+  sampleElementBrightness,
+  classifyBrightness,
+  resolveVideoFilterCss,
+  enhanceCameraTrackHardware,
+  prewarmAudioPlayback,
+} from '../utils/videoEnhancer';
 import sacredSanctuaryImg from '../assets/images/sacred_confession_sanctuary_1794468348510.jpg';
 
 function setSdpFmtpParam(line: string, key: string, value: string): string {
@@ -54,17 +64,17 @@ async function applySecretSenderPriority(sender: RTCRtpSender | undefined, kind:
     if (kind === 'video') {
       params.encodings.forEach((enc, idx) => {
         if (idx === params.encodings.length - 1) {
-          enc.maxBitrate = 400_000;
+          enc.maxBitrate = 900_000;
         } else {
-          enc.maxBitrate = Math.min(enc.maxBitrate || 400_000, 400_000);
+          enc.maxBitrate = Math.min(enc.maxBitrate || 900_000, 900_000);
         }
-        enc.maxFramerate = 20;
+        enc.maxFramerate = 30;
         (enc as any).priority = 'low';
         (enc as any).networkPriority = 'low';
       });
       (params as any).degradationPreference = 'balanced';
     } else {
-      params.encodings[0].maxBitrate = 24_000;
+      params.encodings[0].maxBitrate = 28_000;
       (params.encodings[0] as any).priority = 'high';
       (params.encodings[0] as any).networkPriority = 'high';
     }
@@ -111,6 +121,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   const [wsConnected, setWsConnected] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
   const [liveKitActive, setLiveKitActive] = useState(false);
+  const [lightMode, setLightMode] = useState<VideoLightMode>('auto');
+  const [localDetectedLight, setLocalDetectedLight] = useState<DetectedLighting>('dim');
+  const [remoteDetectedLight, setRemoteDetectedLight] = useState<DetectedLighting>('dim');
 
   // Confession Ritual Steps (1: ጸሎት, 2: መናዘዝ, 3: ቀኖና, 4: ፍትሐት)
   const [activeStep, setActiveStep] = useState<1 | 2 | 3 | 4>(1);
@@ -157,8 +170,11 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   remoteIsVideoOnRef.current = remoteIsVideoOn;
   const liveKitActiveRef = useRef(liveKitActive);
   liveKitActiveRef.current = liveKitActive;
+  const lightModeRef = useRef<VideoLightMode>(lightMode);
+  lightModeRef.current = lightMode;
 
   const unlockSecretAudio = () => {
+    prewarmAudioPlayback();
     wsAudioPlayerRef.current?.unlock().then((ok) => {
       if (ok) setAudioBlocked(false);
     });
@@ -217,7 +233,15 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       }
       localVideoRef.current.play().catch(() => {});
     }
-  }, [remoteUserConnected, swapVideoFeed, isVideoOn]);
+    if (lightMode !== 'auto' || !isVideoOn) return;
+    const poll = window.setInterval(() => {
+      const luma = sampleElementBrightness(localVideoRef.current);
+      if (luma !== null) {
+        setLocalDetectedLight((prev) => classifyBrightness(luma, prev));
+      }
+    }, 1100);
+    return () => clearInterval(poll);
+  }, [remoteUserConnected, swapVideoFeed, isVideoOn, lightMode]);
 
   useEffect(() => {
     if (!isAuthenticated || !roomId) return;
@@ -229,7 +253,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       }
       const pc = new RTCPeerConnection({
         iceServers: rtcConfig.iceServers,
-        iceCandidatePoolSize: 4,
+        iceCandidatePoolSize: 6,
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require',
       });
       pcRef.current = pc;
 
@@ -336,233 +362,328 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     };
 
     const bootSecretCall = async () => {
-      const rtcConfig = await fetchWebRTCConfig();
-
-      let stream: MediaStream | null = null;
-      if (navigator.mediaDevices?.getUserMedia) {
-        const hdAudio: MediaTrackConstraints = {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 48000,
-          channelCount: 1,
-        };
-        const candidates: MediaStreamConstraints[] = [
-          {
-            video: { facingMode: 'user', width: { ideal: 640, min: 320 }, height: { ideal: 360, min: 180 }, frameRate: { ideal: 20, max: 24 } },
-            audio: hdAudio,
-          },
-          { video: { facingMode: 'user' }, audio: true },
-          { video: true, audio: true },
-          { video: true },
-          { audio: true },
-        ];
-        for (const c of candidates) {
-          try {
-            stream = await navigator.mediaDevices.getUserMedia(c);
-            break;
-          } catch {}
-        }
-      }
-
-      if (isCancelled) {
-        stream?.getTracks().forEach((t) => t.stop());
-        return;
-      }
-
-      if (stream) {
-        streamRef.current = stream;
-        const hasVideo = stream.getVideoTracks().length > 0;
-        const hasAudio = stream.getAudioTracks().length > 0;
-        isVideoOnRef.current = hasVideo;
-        isMicOnRef.current = hasAudio;
-        setIsVideoOn(hasVideo);
-        setIsMicOn(hasAudio);
-        setMediaPermissionMsg(hasVideo ? null : 'ካሜራው አልተፈቀደም፤ ከታች «ካሜራ ፍቀድ» የሚለውን ይንኩ።');
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-          localVideoRef.current.play().catch(() => {});
-        }
-
-        if (hasAudio) {
-          try {
-            const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-            const ctx = new AudioCtx();
-            audioContextRef.current = ctx;
-            const source = ctx.createMediaStreamSource(stream);
-            const analyser = ctx.createAnalyser();
-            analyser.fftSize = 64;
-            analyserRef.current = analyser;
-            source.connect(analyser);
-
-            const dataArray = new Uint8Array(analyser.frequencyBinCount);
-            const updateVolume = () => {
-              if (isCancelled) return;
-              if (analyserRef.current && isMicOnRef.current) {
-                analyserRef.current.getByteFrequencyData(dataArray);
-                let sum = 0;
-                for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-                setMicVolumeLevel(Math.min(100, Math.round((sum / dataArray.length / 128) * 100)));
-              } else {
-                setMicVolumeLevel(0);
-              }
-              animationFrameRef.current = requestAnimationFrame(updateVolume);
-            };
-            updateVolume();
-          } catch {}
-        }
-      } else {
-        isVideoOnRef.current = false;
-        isMicOnRef.current = false;
-        setIsVideoOn(false);
-        setIsMicOn(false);
-        setMediaPermissionMsg('የቪዲዮ ካሜራ ፍቃድ አልተሰጠም፤ «ካሜራና ማይክ ፍቀድ» የሚለውን ይጫኑ።');
-      }
-
+      prewarmAudioPlayback();
       if (!wsAudioPlayerRef.current) {
         wsAudioPlayerRef.current = new WsMediaAudioPlayer((blocked) => setAudioBlocked(blocked));
       }
 
-      // Primary Transport: Connect via LiveKit SFU when configured on server
-      if (rtcConfig.sfuConfigured) {
-        try {
-          const lkData = await fetchLiveKitToken(
-            roomId,
-            selfPeerIdRef.current,
-            user.baptismalName || user.fullName || 'ተሳታፊ',
-            true
-          );
-          if (lkData.sfuConfigured && lkData.url && lkData.token && !isCancelled) {
-            const { Room, RoomEvent, Track, ConnectionState } = await import('livekit-client');
-            const lkRoom = new Room({
-              adaptiveStream: true,
-              dynacast: true,
-              publishDefaults: {
-                simulcast: true,
-                dtx: true,
-                red: true,
-                audioPreset: { maxBitrate: 24_000 },
-                videoEncoding: {
-                  maxBitrate: 400_000,
-                  maxFramerate: 20,
-                },
-                degradationPreference: 'maintain-framerate',
-              },
-            });
-            liveKitRoomRef.current = lkRoom;
+      let reconnectTimer: number | null = null;
+      let keepaliveTimer: number | null = null;
 
-            const syncSecretLkParticipants = () => {
-              const rp = Array.from(lkRoom.remoteParticipants.values())[0];
-              if (!rp) {
-                remoteStreamRef.current = null;
-                setRemoteUserConnected(false);
-                setRemoteUserName('');
-                setRemoteVideoHasFrames(false);
-                setIceState('waiting');
-                return;
-              }
-              const tracks: MediaStreamTrack[] = [];
-              rp.trackPublications.forEach((pub) => {
-                if (pub.track?.mediaStreamTrack) {
-                  tracks.push(pub.track.mediaStreamTrack);
-                }
-              });
-              const wrapped = new MediaStream(tracks);
-              remoteStreamRef.current = wrapped;
-              if (remoteVideoRef.current) {
-                remoteVideoRef.current.srcObject = wrapped;
-                remoteVideoRef.current.muted = true;
-                remoteVideoRef.current.play().catch(() => {});
-              }
-              if (remoteAudioRef.current) {
-                remoteAudioRef.current.srcObject = wrapped;
-                if (wrapped.getAudioTracks().length > 0) {
-                  remoteAudioRef.current
-                    .play()
-                    .then(() => setAudioBlocked(false))
-                    .catch(() => setAudioBlocked(true));
-                }
-              }
-              setRemoteRelayFrame(null);
-              setRemoteUserName(rp.name || rp.identity || 'ተሳታፊ');
-              setRemoteIsVideoOn(rp.isCameraEnabled);
-              setRemoteUserConnected(true);
-              setIceState('connected');
-            };
+      // Launch ICE/SFU config, LiveKit SDK/token, Camera+Mic, and Signaling WebSocket IN PARALLEL!
+      const rtcConfigPromise = fetchWebRTCConfig();
+      const lkImportPromise = import('livekit-client');
+      const lkTokenPromise = fetchLiveKitToken(
+        roomId,
+        selfPeerIdRef.current,
+        user.baptismalName || user.fullName || 'ተሳታፊ',
+        true
+      ).catch(() => ({ sfuConfigured: false } as { sfuConfigured: boolean; url?: string; token?: string }));
 
-            lkRoom
-              .on(RoomEvent.ParticipantConnected, syncSecretLkParticipants)
-              .on(RoomEvent.ParticipantDisconnected, syncSecretLkParticipants)
-              .on(RoomEvent.TrackSubscribed, () => {
-                syncSecretLkParticipants();
-                unlockSecretAudio();
-              })
-              .on(RoomEvent.TrackUnsubscribed, syncSecretLkParticipants)
-              .on(RoomEvent.TrackMuted, syncSecretLkParticipants)
-              .on(RoomEvent.TrackUnmuted, syncSecretLkParticipants)
-              .on(RoomEvent.LocalTrackPublished, (pub) => {
-                if (pub.track?.sender) {
-                  applySecretSenderPriority(pub.track.sender, pub.track.kind === Track.Kind.Audio ? 'audio' : 'video');
-                }
-              })
-              .on(RoomEvent.ConnectionStateChanged, (state) => {
-                const connected = state === ConnectionState.Connected;
-                setLiveKitActive(connected);
-                if (connected) {
-                  wsMediaSenderRef.current?.stop();
-                  wsMediaSenderRef.current = null;
-                  setWsRelayActive(false);
-                  setVideoRelayForced(false);
-                  setAudioRelayForced(false);
-                }
-              })
-              .on(RoomEvent.Disconnected, () => {
-                setLiveKitActive(false);
-              });
-
-            await lkRoom.connect(lkData.url, lkData.token);
-            if (isCancelled) {
-              lkRoom.disconnect();
-              liveKitRoomRef.current = null;
-              return;
-            }
-            setLiveKitActive(true);
-            wsMediaSenderRef.current?.stop();
-            wsMediaSenderRef.current = null;
-            setWsRelayActive(false);
-            setVideoRelayForced(false);
-            setAudioRelayForced(false);
-            if (pcRef.current) {
-              pcRef.current.close();
-              pcRef.current = null;
-            }
-
-            if (stream) {
-              for (const t of stream.getTracks()) {
-                if (t.kind === 'audio') {
+      const publishSecretStreamToLiveKit = async (lkRoom: any, Track: any, mediaStream: MediaStream) => {
+        await Promise.all(
+          mediaStream.getTracks().map(async (t) => {
+            try {
+              if (t.kind === 'audio') {
+                const existing = lkRoom.localParticipant.getTrackPublication(Track.Source.Microphone);
+                if (existing?.track) {
+                  await existing.track.replaceTrack(t, true);
+                } else {
                   const pub = await lkRoom.localParticipant.publishTrack(t, {
                     source: Track.Source.Microphone,
                     dtx: true,
                     red: true,
-                    audioPreset: { maxBitrate: 24_000 },
+                    audioPreset: { maxBitrate: 28_000 },
                   });
                   if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'audio');
-                } else if (t.kind === 'video') {
+                }
+              } else if (t.kind === 'video') {
+                const existing = lkRoom.localParticipant.getTrackPublication(Track.Source.Camera);
+                if (existing?.track) {
+                  await existing.track.replaceTrack(t, true);
+                } else {
                   const pub = await lkRoom.localParticipant.publishTrack(t, {
                     source: Track.Source.Camera,
                     simulcast: true,
                     videoEncoding: {
-                      maxBitrate: 400_000,
-                      maxFramerate: 20,
+                      maxBitrate: 900_000,
+                      maxFramerate: 30,
                     },
                     degradationPreference: 'maintain-framerate',
                   });
                   if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'video');
                 }
               }
+            } catch {}
+          })
+        );
+      };
+
+      const acquireSecretMedia = async (): Promise<MediaStream | null> => {
+        let stream: MediaStream | null = null;
+        if (navigator.mediaDevices?.getUserMedia) {
+          const hdAudio: MediaTrackConstraints = {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 48000,
+            channelCount: 1,
+          };
+          const candidates: MediaStreamConstraints[] = [
+            {
+              video: { facingMode: 'user', width: { ideal: 1280, min: 320 }, height: { ideal: 720, min: 180 }, frameRate: { ideal: 30, max: 30 } },
+              audio: hdAudio,
+            },
+            { video: { facingMode: 'user' }, audio: true },
+            { video: true, audio: true },
+            { video: true },
+            { audio: true },
+          ];
+          for (const c of candidates) {
+            try {
+              stream = await navigator.mediaDevices.getUserMedia(c);
+              break;
+            } catch {}
+          }
+        }
+
+        if (isCancelled) {
+          stream?.getTracks().forEach((t) => t.stop());
+          return null;
+        }
+
+        if (stream) {
+          streamRef.current = stream;
+          const hasVideo = stream.getVideoTracks().length > 0;
+          const hasAudio = stream.getAudioTracks().length > 0;
+          isVideoOnRef.current = hasVideo;
+          isMicOnRef.current = hasAudio;
+          setIsVideoOn(hasVideo);
+          setIsMicOn(hasAudio);
+          setMediaPermissionMsg(hasVideo ? null : 'ካሜራው አልተፈቀደም፤ ከታች «ካሜራ ፍቀድ» የሚለውን ይንኩ።');
+          if (hasVideo) {
+            enhanceCameraTrackHardware(stream.getVideoTracks()[0], lightModeRef.current);
+          }
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = stream;
+            localVideoRef.current.play().catch(() => {});
+          }
+
+          if (hasAudio) {
+            try {
+              const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+              const ctx = new AudioCtx();
+              audioContextRef.current = ctx;
+              if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+              const source = ctx.createMediaStreamSource(stream);
+              const analyser = ctx.createAnalyser();
+              analyser.fftSize = 64;
+              analyserRef.current = analyser;
+              source.connect(analyser);
+
+              const dataArray = new Uint8Array(analyser.frequencyBinCount);
+              const updateVolume = () => {
+                if (isCancelled) return;
+                if (analyserRef.current && isMicOnRef.current) {
+                  analyserRef.current.getByteFrequencyData(dataArray);
+                  let sum = 0;
+                  for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+                  setMicVolumeLevel(Math.min(100, Math.round((sum / dataArray.length / 128) * 100)));
+                } else {
+                  setMicVolumeLevel(0);
+                }
+                animationFrameRef.current = requestAnimationFrame(updateVolume);
+              };
+              updateVolume();
+            } catch {}
+          }
+
+          if (liveKitRoomRef.current) {
+            try {
+              const { Track } = await lkImportPromise;
+              await publishSecretStreamToLiveKit(liveKitRoomRef.current, Track, stream);
+            } catch {}
+          } else if (pcRef.current) {
+            for (const track of stream.getTracks()) {
+              const matching = pcRef.current.getTransceivers().find(
+                (tr) => tr.sender?.track?.kind === track.kind || tr.receiver?.track?.kind === track.kind
+              );
+              if (matching) {
+                try {
+                  matching.direction = 'sendrecv';
+                  await matching.sender.replaceTrack(track);
+                } catch {}
+              } else {
+                pcRef.current.addTrack(track, stream);
+              }
             }
+            if (pcRef.current.signalingState === 'stable' && wsRef.current?.readyState === WebSocket.OPEN) {
+              try {
+                const offer = await pcRef.current.createOffer();
+                const tunedSdp = preferRobustOpusSdp(offer.sdp);
+                const tunedOffer = tunedSdp ? { type: offer.type, sdp: tunedSdp } : offer;
+                await pcRef.current.setLocalDescription(tunedOffer);
+                wsRef.current.send(
+                  JSON.stringify({
+                    type: 'webrtc-signal',
+                    roomId,
+                    targetPeerId: remotePeerIdRef.current,
+                    signal: { sdp: tunedOffer },
+                  })
+                );
+              } catch {}
+            }
+          }
+
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({
+                type: 'room-media-state',
+                isMicOn: hasAudio && isMicOnRef.current,
+                isVideoOn: hasVideo && isVideoOnRef.current,
+              })
+            );
+          }
+          return stream;
+        } else {
+          isVideoOnRef.current = false;
+          isMicOnRef.current = false;
+          setIsVideoOn(false);
+          setIsMicOn(false);
+          setMediaPermissionMsg('የቪዲዮ ካሜራ ፍቃድ አልተሰጠም፤ «ካሜራና ማይክ ፍቀድ» የሚለውን ይጫኑ።');
+          return null;
+        }
+      };
+
+      const mediaPromise = acquireSecretMedia();
+
+      // Primary Transport: Connect via LiveKit SFU in parallel when configured on server
+      const sfuConnectPromise = (async (): Promise<boolean> => {
+        try {
+          const [rtcConfig, lkData, lkSdk] = await Promise.all([
+            rtcConfigPromise,
+            lkTokenPromise,
+            lkImportPromise,
+          ]);
+          if (isCancelled) return false;
+          if (!rtcConfig.sfuConfigured || !lkData.sfuConfigured || !lkData.url || !lkData.token) {
+            return false;
+          }
+
+          const { Room, RoomEvent, Track, ConnectionState } = lkSdk;
+          const lkRoom = new Room({
+            adaptiveStream: { pixelDensity: 'screen' },
+            dynacast: true,
+            stopLocalTrackOnUnpublish: false,
+            publishDefaults: {
+              simulcast: true,
+              dtx: true,
+              red: true,
+              audioPreset: { maxBitrate: 28_000 },
+              videoEncoding: {
+                maxBitrate: 900_000,
+                maxFramerate: 30,
+              },
+              degradationPreference: 'maintain-framerate',
+            },
+          });
+          liveKitRoomRef.current = lkRoom;
+
+          const syncSecretLkParticipants = () => {
+            const rp = Array.from(lkRoom.remoteParticipants.values())[0];
+            if (!rp) {
+              remoteStreamRef.current = null;
+              setRemoteUserConnected(false);
+              setRemoteUserName('');
+              setRemoteVideoHasFrames(false);
+              setIceState('waiting');
+              return;
+            }
+            const tracks: MediaStreamTrack[] = [];
+            rp.trackPublications.forEach((pub) => {
+              if (pub.track?.mediaStreamTrack) {
+                tracks.push(pub.track.mediaStreamTrack);
+              }
+            });
+            const wrapped = new MediaStream(tracks);
+            remoteStreamRef.current = wrapped;
+            if (remoteVideoRef.current) {
+              remoteVideoRef.current.srcObject = wrapped;
+              remoteVideoRef.current.muted = true;
+              remoteVideoRef.current.play().catch(() => {});
+            }
+            if (remoteAudioRef.current) {
+              remoteAudioRef.current.srcObject = wrapped;
+              if (wrapped.getAudioTracks().length > 0) {
+                remoteAudioRef.current
+                  .play()
+                  .then(() => setAudioBlocked(false))
+                  .catch(() => setAudioBlocked(true));
+              }
+            }
+            setRemoteRelayFrame(null);
+            setRemoteUserName(rp.name || rp.identity || 'ተሳታፊ');
+            setRemoteIsVideoOn(rp.isCameraEnabled);
+            setRemoteUserConnected(true);
+            setIceState('connected');
+          };
+
+          lkRoom
+            .on(RoomEvent.ParticipantConnected, syncSecretLkParticipants)
+            .on(RoomEvent.ParticipantDisconnected, syncSecretLkParticipants)
+            .on(RoomEvent.TrackSubscribed, () => {
+              syncSecretLkParticipants();
+              unlockSecretAudio();
+            })
+            .on(RoomEvent.TrackUnsubscribed, syncSecretLkParticipants)
+            .on(RoomEvent.TrackMuted, syncSecretLkParticipants)
+            .on(RoomEvent.TrackUnmuted, syncSecretLkParticipants)
+            .on(RoomEvent.LocalTrackPublished, (pub) => {
+              if (pub.track?.sender) {
+                applySecretSenderPriority(pub.track.sender, pub.track.kind === Track.Kind.Audio ? 'audio' : 'video');
+              }
+            })
+            .on(RoomEvent.ConnectionStateChanged, (state) => {
+              const connected = state === ConnectionState.Connected;
+              setLiveKitActive(connected);
+              if (connected) {
+                wsMediaSenderRef.current?.stop();
+                wsMediaSenderRef.current = null;
+                setWsRelayActive(false);
+                setVideoRelayForced(false);
+                setAudioRelayForced(false);
+              }
+            })
+            .on(RoomEvent.Disconnected, () => {
+              setLiveKitActive(false);
+            });
+
+          await lkRoom.connect(lkData.url, lkData.token, {
+            rtcConfig: { iceServers: rtcConfig.iceServers },
+          });
+          if (isCancelled) {
+            lkRoom.disconnect();
+            liveKitRoomRef.current = null;
+            return false;
+          }
+          setLiveKitActive(true);
+          wsMediaSenderRef.current?.stop();
+          wsMediaSenderRef.current = null;
+          setWsRelayActive(false);
+          setVideoRelayForced(false);
+          setAudioRelayForced(false);
+          if (pcRef.current) {
+            pcRef.current.close();
+            pcRef.current = null;
+          }
+
+          syncSecretLkParticipants();
+          const stream = streamRef.current || (await mediaPromise);
+          if (stream && !isCancelled) {
+            await publishSecretStreamToLiveKit(lkRoom, Track, stream);
             syncSecretLkParticipants();
           }
+          return true;
         } catch (err) {
           if (liveKitRoomRef.current) {
             try {
@@ -572,11 +693,9 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
           }
           setLiveKitActive(false);
           console.warn('Secret Room LiveKit fallback to WebRTC/WS:', err);
+          return false;
         }
-      }
-
-      let reconnectTimer: number | null = null;
-      let keepaliveTimer: number | null = null;
+      })();
 
       const connectSecretWs = () => {
         if (isCancelled) return;
@@ -655,6 +774,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
             }
 
             if (data.type === 'room-state' && Array.isArray(data.existingPeers) && data.existingPeers.length > 0) {
+              const sfuActive = await sfuConnectPromise;
+              if (sfuActive || liveKitRoomRef.current) return;
+              const rtcConfig = await rtcConfigPromise;
+              await mediaPromise.catch(() => null);
               const target = data.existingPeers[0];
               if (target.peerId === selfPeerIdRef.current) return;
               remotePeerIdRef.current = target.peerId;
@@ -676,6 +799,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                 })
               );
             } else if (data.type === 'peer-joined' && data.peer) {
+              if (liveKitRoomRef.current) return;
               if (data.peer.peerId === selfPeerIdRef.current) return;
               remotePeerIdRef.current = data.peer.peerId;
               webrtcAudioFlowingRef.current = false;
@@ -688,6 +812,10 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                 setRemoteRelayFrame(null);
               }
             } else if (data.type === 'webrtc-signal' && data.signal) {
+              const sfuActive = await sfuConnectPromise;
+              if (sfuActive || liveKitRoomRef.current) return;
+              const rtcConfig = await rtcConfigPromise;
+              await mediaPromise.catch(() => null);
               if (data.senderPeerId === selfPeerIdRef.current) return;
               if (data.senderPeerId) {
                 remotePeerIdRef.current = data.senderPeerId;
@@ -827,7 +955,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     }
     const timer = window.setTimeout(() => {
       setWsRelayActive(true);
-    }, 4500);
+    }, 1800);
     return () => clearTimeout(timer);
   }, [isAuthenticated, wsConnected, iceState, liveKitActive]);
 
@@ -845,7 +973,15 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       if (remoteAudioRef.current && remoteAudioRef.current.paused && remoteStreamRef.current?.getAudioTracks().length) {
         remoteAudioRef.current.play().then(() => setAudioBlocked(false)).catch(() => {});
       }
-    }, 600);
+    }, 300);
+
+    const lightPoll = window.setInterval(() => {
+      if (lightMode !== 'auto') return;
+      const remoteLuma = sampleElementBrightness(remoteVideoRef.current);
+      if (remoteLuma !== null) setRemoteDetectedLight((prev) => classifyBrightness(remoteLuma, prev));
+      const localLuma = sampleElementBrightness(localVideoRef.current);
+      if (localLuma !== null) setLocalDetectedLight((prev) => classifyBrightness(localLuma, prev));
+    }, 1100);
 
     const checkMediaStats = async () => {
       if (liveKitRoomRef.current || liveKitActiveRef.current || !wsConnected) return;
@@ -926,15 +1062,16 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       }
     };
 
-    const initialStatsTimer = window.setTimeout(checkMediaStats, 2500);
-    const intervalStatsTimer = window.setInterval(checkMediaStats, 3500);
+    const initialStatsTimer = window.setTimeout(checkMediaStats, 1200);
+    const intervalStatsTimer = window.setInterval(checkMediaStats, 2500);
 
     return () => {
       clearInterval(healthCheck);
+      clearInterval(lightPoll);
       clearTimeout(initialStatsTimer);
       clearInterval(intervalStatsTimer);
     };
-  }, [isAuthenticated, wsConnected, remoteUserConnected, roomId, liveKitActive]);
+  }, [isAuthenticated, wsConnected, remoteUserConnected, roomId, liveKitActive, lightMode]);
 
   useEffect(() => {
     const needsSender =
@@ -976,6 +1113,13 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     };
   }, [wsRelayActive, videoRelayForced, audioRelayForced, wsConnected, roomId, liveKitActive]);
 
+  const handleCycleLightMode = () => {
+    const next: VideoLightMode = lightMode === 'auto' ? 'night' : lightMode === 'night' ? 'day' : 'auto';
+    setLightMode(next);
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (track) enhanceCameraTrackHardware(track, next);
+  };
+
   const handleRequestSecretMedia = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
       setMediaPermissionMsg('ካሜራ ለመክፈት HTTPS ደህንነቱ የተጠበቀ ግንኙነት ያስፈልጋል።');
@@ -985,7 +1129,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
     try {
       const candidates: MediaStreamConstraints[] = [
         {
-          video: { facingMode, width: { ideal: 640, min: 320 }, height: { ideal: 360, min: 180 }, frameRate: { ideal: 20, max: 24 } },
+          video: { facingMode, width: { ideal: 1280, min: 320 }, height: { ideal: 720, min: 180 }, frameRate: { ideal: 30, max: 30 } },
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48000 },
         },
         { video: { facingMode }, audio: true },
@@ -1025,42 +1169,47 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       setIsVideoOn(hasVideo);
       setIsMicOn(hasAudio);
       setMediaPermissionMsg(null);
+      if (hasVideo) {
+        enhanceCameraTrackHardware(stream.getVideoTracks()[0], lightModeRef.current);
+      }
 
       if (liveKitRoomRef.current) {
         const { Track } = await import('livekit-client');
-        for (const t of stream.getTracks()) {
-          if (t.kind === 'audio') {
-            const existingAudioPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Microphone);
-            if (existingAudioPub?.track) {
-              await existingAudioPub.track.replaceTrack(t, true).catch(() => {});
-            } else {
-              const pub = await liveKitRoomRef.current.localParticipant
-                .publishTrack(t, {
-                  source: Track.Source.Microphone,
-                  dtx: true,
-                  red: true,
-                  audioPreset: { maxBitrate: 24_000 },
-                })
-                .catch(() => null);
-              if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'audio');
+        await Promise.all(
+          stream.getTracks().map(async (t) => {
+            if (t.kind === 'audio') {
+              const existingAudioPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Microphone);
+              if (existingAudioPub?.track) {
+                await existingAudioPub.track.replaceTrack(t, true).catch(() => {});
+              } else {
+                const pub = await liveKitRoomRef.current.localParticipant
+                  .publishTrack(t, {
+                    source: Track.Source.Microphone,
+                    dtx: true,
+                    red: true,
+                    audioPreset: { maxBitrate: 28_000 },
+                  })
+                  .catch(() => null);
+                if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'audio');
+              }
+            } else if (t.kind === 'video') {
+              const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
+              if (existingCamPub?.track) {
+                await existingCamPub.track.replaceTrack(t, true).catch(() => {});
+              } else {
+                const pub = await liveKitRoomRef.current.localParticipant
+                  .publishTrack(t, {
+                    source: Track.Source.Camera,
+                    simulcast: true,
+                    videoEncoding: { maxBitrate: 900_000, maxFramerate: 30 },
+                    degradationPreference: 'maintain-framerate',
+                  })
+                  .catch(() => null);
+                if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'video');
+              }
             }
-          } else if (t.kind === 'video') {
-            const existingCamPub = liveKitRoomRef.current.localParticipant.getTrackPublication(Track.Source.Camera);
-            if (existingCamPub?.track) {
-              await existingCamPub.track.replaceTrack(t, true).catch(() => {});
-            } else {
-              const pub = await liveKitRoomRef.current.localParticipant
-                .publishTrack(t, {
-                  source: Track.Source.Camera,
-                  simulcast: true,
-                  videoEncoding: { maxBitrate: 400_000, maxFramerate: 20 },
-                  degradationPreference: 'maintain-framerate',
-                })
-                .catch(() => null);
-              if (pub?.track?.sender) applySecretSenderPriority(pub.track.sender, 'video');
-            }
-          }
-        }
+          })
+        );
       } else {
         if (pcRef.current) {
           for (const track of stream.getTracks()) {
@@ -1183,14 +1332,15 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
       const newCamStream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: nextFacing,
-          width: { ideal: 640, min: 320 },
-          height: { ideal: 360, min: 180 },
-          frameRate: { ideal: 20, max: 24 },
+          width: { ideal: 1280, min: 320 },
+          height: { ideal: 720, min: 180 },
+          frameRate: { ideal: 30, max: 30 },
         },
       });
       const newTrack = newCamStream.getVideoTracks()[0];
       const oldTrack = streamRef.current?.getVideoTracks()[0];
       if (streamRef.current && newTrack) {
+        enhanceCameraTrackHardware(newTrack, lightModeRef.current);
         if (oldTrack) {
           streamRef.current.removeTrack(oldTrack);
           oldTrack.stop();
@@ -1235,6 +1385,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
 
   const handleUnlockRoom = async (e: React.FormEvent) => {
     e.preventDefault();
+    prewarmAudioPlayback();
     setErrorMsg('');
     try {
       const result = await verifySecretRoomPasscode(passcode);
@@ -1336,6 +1487,7 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
   // Active Inside Sanctuary Screen
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+      <VideoEnhancerFilters />
       
       {/* Top Security Banner */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 p-3.5 sm:p-4 rounded-xl bg-stone-950 border border-red-900/40">
@@ -1433,11 +1585,20 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                   Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0)
                 )
               }
-              onPlaying={() =>
+              onCanPlay={() =>
                 setRemoteVideoHasFrames(
                   Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0)
                 )
               }
+              onPlaying={() => {
+                setRemoteVideoHasFrames(
+                  Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0)
+                );
+                if (lightMode === 'auto') {
+                  const luma = sampleElementBrightness(remoteVideoRef.current);
+                  if (luma !== null) setRemoteDetectedLight((prev) => classifyBrightness(luma, prev));
+                }
+              }}
               onResize={() =>
                 setRemoteVideoHasFrames(
                   Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0)
@@ -1446,7 +1607,8 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
               onClick={() => {
                 if (remoteUserConnected && swapVideoFeed) setSwapVideoFeed(false);
               }}
-              className={`object-cover contrast-[1.03] saturate-[1.06] ${
+              style={{ filter: resolveVideoFilterCss(lightMode, remoteDetectedLight) }}
+              className={`object-cover transition-opacity duration-75 ${
                 !remoteUserConnected || !remoteVideoHasFrames
                   ? 'opacity-0 pointer-events-none absolute inset-0 w-full h-full'
                   : swapVideoFeed
@@ -1463,7 +1625,8 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                 onClick={() => {
                   if (swapVideoFeed) setSwapVideoFeed(false);
                 }}
-                className={`object-cover contrast-[1.03] saturate-[1.06] ${
+                style={{ filter: resolveVideoFilterCss(lightMode, remoteDetectedLight) }}
+                className={`object-cover ${
                   swapVideoFeed
                     ? 'absolute bottom-3 right-3 w-32 sm:w-44 h-44 sm:h-52 rounded-2xl border-2 border-amber-400 shadow-2xl z-20 cursor-pointer'
                     : 'w-full h-full block'
@@ -1504,10 +1667,17 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                 autoPlay
                 playsInline
                 muted
+                onPlaying={() => {
+                  if (lightMode === 'auto') {
+                    const luma = sampleElementBrightness(localVideoRef.current);
+                    if (luma !== null) setLocalDetectedLight((prev) => classifyBrightness(luma, prev));
+                  }
+                }}
                 onClick={() => {
                   if (remoteUserConnected && !swapVideoFeed) setSwapVideoFeed(true);
                 }}
-                className={`object-cover contrast-[1.03] saturate-[1.05] mirror ${
+                style={{ filter: resolveVideoFilterCss(lightMode, localDetectedLight) }}
+                className={`object-cover mirror ${
                   !remoteUserConnected || swapVideoFeed
                     ? 'w-full h-full block'
                     : 'absolute bottom-3 right-3 w-32 sm:w-44 h-44 sm:h-52 rounded-2xl border-2 border-amber-400/90 shadow-2xl z-20 cursor-pointer'
@@ -1651,6 +1821,30 @@ export const SecretConfessionRoom: React.FC<SecretConfessionRoomProps> = ({
                 title="ካሜራ ቀይር (Flip Camera)"
               >
                 <RefreshCw className="w-4 h-4" />
+              </button>
+
+              <button
+                type="button"
+                onClick={handleCycleLightMode}
+                title="የቀንና የሌሊት የቪዲዮ ብርሃን ማሻሻያ"
+                className={`px-2.5 py-2 rounded-xl border text-xs font-bold transition flex items-center gap-1.5 ${
+                  lightMode === 'night' || (lightMode === 'auto' && localDetectedLight === 'dark')
+                    ? 'bg-indigo-950/80 border-indigo-400/60 text-indigo-200'
+                    : lightMode === 'day'
+                    ? 'bg-amber-950/80 border-amber-400/60 text-amber-200'
+                    : 'bg-emerald-950/70 border-emerald-600/60 text-emerald-200'
+                }`}
+              >
+                {lightMode === 'night' ? (
+                  <Moon className="w-3.5 h-3.5 text-indigo-300" />
+                ) : lightMode === 'day' ? (
+                  <Sun className="w-3.5 h-3.5 text-amber-300" />
+                ) : (
+                  <Eye className="w-3.5 h-3.5 text-emerald-300" />
+                )}
+                <span className="hidden sm:inline">
+                  {lightMode === 'night' ? 'የሌሊት ብርሃን+' : lightMode === 'day' ? 'የቀን HD' : 'ቀን/ሌሊት Auto'}
+                </span>
               </button>
 
               <button
